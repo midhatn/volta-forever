@@ -10,7 +10,9 @@ Tesla V100) run on V100s with the 580 driver.
 - **OS**: Linux x86_64, glibc 2.34 or later. The installation was run in fresh systems of
   Ubuntu 22.04, 24.04 and 26.04 and of Debian 12 and 13 (2026-11-21; no GPU in them: what was
   seen is that everything installs, that the binaries start, and that the downloads are
-  made). RHEL 9 and Fedora 36 or later have the C library it takes; not tried.
+  made). An outside tester ran it with a V100 on Rocky Linux 9.9, Ubuntu 26.04, Debian 13 and
+  Fedora 45 (`docs/reports/`); RHEL 9 and the other versions of Fedora from 36 have the C library
+  it takes, and were not tried.
 - **On a fresh Debian or Ubuntu**, what the commands below use and the system does not have
   yet: `curl` (for the installer), `python3` and `xz-utils` (for `vf fetch`), `python3-venv`
   (for `vf venv`). The installer and the launcher say which one is missing; they install

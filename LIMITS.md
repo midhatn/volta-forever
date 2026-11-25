@@ -29,7 +29,10 @@ where it is not from the build of this release. `docs/` says how each figure was
   makes for other programs, shapes and settings were not looked at (`docs/validation.md`,
   sections 4, 6 and 8).
 - **The translation of sm_80 machine code is not independently validated**: the validator reads
-  sm_75 code only ("Cubins for sm_80 and later", below; `docs/validation.md`, section 8).
+  sm_75 code only ("Cubins for sm_80 and later", below; `docs/validation.md`, section 8). (After
+  0.1.5, on main: told 8.0, a kernel that only the sm_80 machine code of its image has is given
+  from that code, translated, where its lookup failed; `VF_TOLD_CODE=0` turns that off: [The
+  capability told with `VF_CAPABILITY`](#the-capability-told-with-vf_capability).)
 - **`VF_CAPABILITY_ALL=1` no longer reaches the libraries that ask for themselves.** It tells the
   value asked for to a CUDA runtime and to the code that uses it (PyTorch's library) only; cuDNN,
   cuFFT and cuSOLVER, which ask the driver without that runtime, are told what their own code
@@ -71,8 +74,18 @@ where it is not from the build of this release. `docs/` says how each figure was
   cuBLAS, cuBLASLt, cuSPARSE, cuSOLVER, cuFFT, cuRAND and cuDNN 9.10 start under it, as on
   NVIDIA's driver, but every image that a runtime registered is adapted and compiled at the start:
   with the layer's cache off, cuBLAS 12.9 started in 30 s (2 s without the layer), and the start
-  of PyTorch 2.14 had not ended after ten minutes; a later start, from the caches, was not
-  measured ([Kernels refused](#kernels-refused), "Eager loading").
+  of PyTorch 2.14 had not ended after ten minutes (2026-11-23); a later start, from the caches, was
+  not measured ([Kernels refused](#kernels-refused), "Eager loading").
+- **The CUDA 13 build of NCCL cannot run a collective on V100s.** The layer refuses the kernels
+  that may reach an instruction of multicast memory (`multimem.*`), which most kernels of its
+  collectives may, behind tests that only its NVLink-SHARP transport passes (41 of the 53 kernels
+  of its device-linked image are refused); NCCL's CUDA 12 build runs in its place
+  (`vf fetch --only libnccl`). (After 0.1.5, on main: where no GPU of the
+  process can take part in multicast, as with V100s, each such instruction is replaced by a
+  reported trap and the kernels are given, and the CUDA 13 build's collectives gave the CPU's
+  values on two V100s; its first start compiles its code for about 15 minutes in each process; a
+  reported trap that a kernel reaches all the same stops it with `CUDA_ERROR_ASSERT` (710) and
+  ends its context: [Several GPUs and NCCL](#several-gpus-and-nccl).)
 - **A lookup table asked for by name can be refused** (error 801), where NVIDIA's driver gives
   it, once a kernel that the layer compiled alone holds a copy of it ([Kernels
   refused](#kernels-refused), "A variable asked for by name can be refused too").
@@ -931,7 +944,18 @@ What that does not cover:
   default such a program is told 8.0) is answered the capability told, never more: CUB then finds
   none of its architectures and answers "invalid device function" (`cub_sort.cu`, 2026-11-24),
   where a GPU of that capability has no image of its code at all and fails at the first call with
-  "no kernel image is available"; the program's other kernels run through the layer.
+  "no kernel image is available"; the program's other kernels run through the layer. Until 0.1.5
+  the layer answered 7.0 for all the code that it retargeted from PTX, the PTX that it gave the
+  driver, so that CUB's device-wide algorithms failed with "invalid device function" in a program
+  whose code is PTX only for a later architecture: in an outside run on 0.1.5, llama.cpp v1.0.0
+  built as PTX for compute_75 only (as Ollama's `cuda_v13` runner is) stopped in `top_k_cub` with
+  `-bs`, and with `draft-mtp` and its default backend sampling of drafts;
+  `--no-spec-draft-backend-sampling` avoided it, and `draft-simple` was not affected
+  (`docs/reports/`). That is fixed after 0.1.5 (`CHANGELOG.md`, "Unreleased"): CUB's sort, sum and
+  scan from such a build give the right results (`tests/gpu/run.sh`, the `cub-*` cases), and so
+  did the ARGSORT (up to 1,048,576 columns), TOP_K, CUMSUM, SUM and MEAN cases of llama.cpp
+  b11521's `test-backend-ops` built so (2026-11-24); the runs of llama.cpp v1.0.0 were not made
+  again.
 
 ## CUDA graphs
 
@@ -1191,9 +1215,12 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,2 vf /tmp/vf-peer-copy
 
 ## What was not tried
 
-- A suite of `tests/` with several GPUs in one process. The review of 2026-11-22 ran PyTorch on
-  four V100s in one process, and the driver API from four threads on four devices, with no wrong
-  result; no script of the repository does.
+- A program on several GPUs in one process, beyond the test kernels. `tests/gpu/multi-gpu.sh`
+  (pull request #6) runs a test kernel on two GPUs at once from two threads of one process (native,
+  retargeted from PTX and translated from machine code, under lazy and eager loading, with CUDA
+  graphs and copies between the GPUs); the review of 2026-11-22 ran PyTorch on four V100s in one
+  process, and the driver API from four threads on four devices, with no wrong result. No script of
+  the repository runs a program on several GPUs in one process.
 - A machine with a V100 and a later GPU. Modules loaded into a context on the later card are
   given to the driver as the program gave them; this is tested with a stand-in for the driver
   only. A library (`cuLibraryLoadData`) is loaded for every card: its fat binary keeps the entries
@@ -1203,15 +1230,25 @@ CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0,2 vf /tmp/vf-peer-copy
   which is for every card); a handle to it that the program holds all the same is launched in a
   context on the later card and refused on the V100. A library whose PTX is compiled kernel by
   kernel (deferred) gives the later card the V100's PTX.
-- MPS (the Multi-Process Service). Several processes on one V100 without it were reported by an
-  outside tester, not run by the project: the two runner processes of one Ollama 0.40.4 through
-  the layer, adapting, compiling and writing the layer's and the driver's caches at once, each
-  reply the same text as alone (`docs/reports/`).
+- MPS (the Multi-Process Service), and several processes on one V100, by the project. An outside
+  tester ran the two runner processes of one Ollama 0.40.4 through the layer, adapting, compiling
+  and writing the layer's and the driver's caches at once, each reply the same text as alone; and
+  the same two runners as clients of one MPS server, with the same text and the same
+  log-probabilities as without MPS, with both caches empty and with them warm (`docs/reports/`).
+- Long runs: one was tried, for one model on one card. An outside tester ran Ollama 0.40.4's CUDA
+  13 runner through the layer for 4 h 10 min, 4,000 requests to Qwen3.5-35B-A3B, and nothing
+  drifted from the first hour to the last (the runner's memory, the layer's and the driver's
+  caches, the speed; no Xid line) (`docs/reports/`).
 - Drivers of the 580 branch other than 580.178.04, with which the project ran everything. Outside
   reports (`docs/reports/`) have `tests/gpu/run.sh` pass its 200 cases of 0.1.5, at the default
   and at `VF_CAPABILITY=8.0`, on 580.173.02, 580.178.04 and 580.196.07, with the V100 passed through
   to a virtual machine (Proxmox VFIO), and its 165 cases of 0.1.4 on 580.196.07, where an engine
   also ran until a bug of its own, on long prompts. The drivers after 580.196.07 were not tried.
+- Distributions other than Ubuntu 24.04 with a GPU, by the project. Outside reports have the
+  release's installer, `vf doctor`, the build from source and `tests/gpu/run.sh` (its 200 cases of
+  0.1.5, both ways) on Rocky Linux 9.9 (glibc 2.34, the oldest that the layer takes), Ubuntu 26.04,
+  Debian 13 and Fedora 45, with driver 580.178.04, SELinux enforcing on Rocky Linux and Fedora
+  (`docs/reports/`).
 - Ollama, by the project. An outside tester ran Ollama 0.40.4's stock CUDA 13 runner through the
   layer (told 7.5) against its stock CUDA 12 runner (sm_70), on four models: no kernel refused, no
   Xid line, each runner's text the same from one run to the next (`docs/reports/`; its speed:
@@ -1322,6 +1359,11 @@ same everywhere:
   (Q4_K_M), over 2,048 tokens, at a mean KL divergence of 0.0083 from the native build, where the
   native build with its MMQ kernels forced is at 0.0079, and with that scan forced at 0.0017
   (2026-11-24).
+- **With greedy decoding, a near tie can end in a loop.** A near tie that the PTX build resolves
+  the other way can send a text into a repetition loop that Ollama's repeat limit ends with HTTP
+  500: 2 of the 4,000 requests of an outside long run of Ollama 0.40.4's CUDA 13 runner through the
+  layer, both again on a new server, where its CUDA 12 runner completes them; a third request
+  loops with both runners (`docs/reports/`).
 - **Conversions of the 4-bit and 8-bit formats**: identical to an RTX 5090's on every value of
   the formats.
 - **Block-scaled products**: see the table above.

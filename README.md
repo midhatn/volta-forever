@@ -80,6 +80,8 @@ All eight engines ran **Qwen3.5-35B-A3B** on a Tesla V100-SXM2-32GB with **MTP a
 
 Compatibility applies to the listed checkpoint and upstream engine on a native V100. [Checkpoint revisions and per-request results](docs/guides/benchmarks/README.md)
 
+[Ollama](docs/guides/ollama.md): its stock CUDA 13 runner through `vf`, measured by an outside tester (TheWeakShall) on four models, not by the protocol above. Against Ollama's stock CUDA 12 runner, prompts ran at 1.3 to 1.9 times its speed on two mixture-of-experts models and at 0.40 to 0.67 times on two dense ones, generation at 0.92 to 1.02 times.
+
 ## Validation
 
 On V100 with driver 580.178.04, PyTorch matched the CPU on all 924 operations with a CPU reference and all 32 small models, also with `VF_CAPABILITY=8.0`. vLLM and SGLang matched the CPU reference token for token on greedy Qwen2.5-0.5B tests. Selected low-precision operations were also checked against an RTX 5090. Coverage depends on the kernel. [Validation results](docs/validation.md) · [Performance measurements](docs/performance.md) · [Known limits](LIMITS.md)
@@ -96,7 +98,11 @@ scripts/vf doctor
 cargo test --workspace
 ```
 
-The scripts and tests that compile CUDA sources with the toolkits of `toolkits/` go through `scripts/nvcc-host.sh`. It compiles a probe first and changes nothing when that works. On a system newer than CUDA 12.9.2, such as Ubuntu 26.04 (glibc 2.43, GCC 15), it adds what the compiler needs there, and says so: a `g++-N` that the toolkit accepts, and a header of ours that hides the C library's declarations that contradict CUDA 12's (the toolkit is not edited). Install `g++-14` there; CUDA 12.9 accepts GCC 14 at the newest.
+The scripts and tests that compile CUDA sources with the toolkits of `toolkits/` go through `scripts/nvcc-host.sh`. It compiles a probe first and changes nothing when that works. On a system newer than CUDA 12.9.2, such as Ubuntu 26.04 (glibc 2.43, GCC 15), it adds what the compiler needs there, and says so: a `g++-N` that the toolkit accepts, and a header of ours that hides the C library's declarations that contradict CUDA 12's (the toolkit is not edited). Install `g++-14` there; CUDA 12.9 accepts GCC 14 at the newest. Fedora 44 and 45 have no `gcc14` package; an outside tester installed Fedora 43's, with which the GPU suite passed on Fedora 45 (TheWeakShall, [issue #4](https://github.com/nbald/volta-forever/issues/4#issuecomment-7141685965)):
+
+```sh
+sudo dnf --releasever=43 --repo=fedora --repo=updates install gcc14 gcc14-c++
+```
 
 Run `tests/gpu/run.sh` for the physical V100 suite. Use `scripts/package.sh` to create a release archive. [Test suites](tests/README.md) · [Contributing](CONTRIBUTING.md) · [Machine-code translator](docs/translator.md)
 
