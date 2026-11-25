@@ -954,8 +954,11 @@ What that does not cover:
   (`docs/reports/`). That is fixed after 0.1.5 (`CHANGELOG.md`, "Unreleased"): CUB's sort, sum and
   scan from such a build give the right results (`tests/gpu/run.sh`, the `cub-*` cases), and so
   did the ARGSORT (up to 1,048,576 columns), TOP_K, CUMSUM, SUM and MEAN cases of llama.cpp
-  b11521's `test-backend-ops` built so (2026-11-24); the runs of llama.cpp v1.0.0 were not made
-  again.
+  b11521's `test-backend-ops` built so (2026-11-24). In the same outside tester's run with the fix
+  (`e3c870b`, 2026-11-25), the same llama.cpp v1.0.0 build ran with `-bs` and with `draft-mtp` and
+  its default backend sampling of drafts to the end, and its other runs gave the tokens of 0.1.5,
+  with the same log-probabilities of the five first candidates at every position where they were
+  read (`docs/reports/`).
 
 ## CUDA graphs
 
@@ -1362,8 +1365,8 @@ same everywhere:
 - **With greedy decoding, a near tie can end in a loop.** A near tie that the PTX build resolves
   the other way can send a text into a repetition loop that Ollama's repeat limit ends with HTTP
   500: 2 of the 4,000 requests of an outside long run of Ollama 0.40.4's CUDA 13 runner through the
-  layer, both again on a new server, where its CUDA 12 runner completes them; a third request
-  loops with both runners (`docs/reports/`).
+  layer, both again on a new server and after 0.1.5 (`e3c870b`), where its CUDA 12 runner
+  completes them; a third request loops with both runners (`docs/reports/`).
 - **Conversions of the 4-bit and 8-bit formats**: identical to an RTX 5090's on every value of
   the formats.
 - **Block-scaled products**: see the table above.
