@@ -10,8 +10,8 @@ Run unmodified CUDA 13 applications on a Tesla V100 with a simple two-letter com
 
 > **A young project.** volta-forever runs the engines listed below and a large part of PyTorch,
 > but not every CUDA 13 program works out of the box yet: a kernel may be refused, a library may
-> need a CUDA 12 counterpart, a program may need a setting. Read [the limits of 0.1.5 to know
-> first](LIMITS.md#the-limits-of-015-to-know-first). The recommended way to get a program
+> need a CUDA 12 counterpart, a program may need a setting. Read [the limits of 0.1.6 to know
+> first](LIMITS.md#the-limits-of-016-to-know-first). The recommended way to get a program
 > running is to hand the job to your AI coding agent: point it at this repository, tell it which
 > program you want on your V100, and ask it to follow [AGENTS.md](AGENTS.md). When the layer
 > itself is what is missing, ask the agent to fix it here and to send a pull request: that is
@@ -27,9 +27,11 @@ Run unmodified CUDA 13 applications on a Tesla V100 with a simple two-letter com
 > was checked by neither: compare results with a reference and
 > [report differences](CONTRIBUTING.md#reporting-a-wrong-result). Told 7.5, Triton 3.8 uses no
 > tensor cores for `tl.dot`: its float16 and bf16 products ran 3 to 150 times slower than told
-> 8.0 ([speed](LIMITS.md#speed)). In a program with PyTorch, only
-> `VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1` changes that in 0.1.5, and PyTorch's own attention is
-> then refused ([capability](LIMITS.md#the-capability-told-with-vf_capability)).
+> 8.0 ([speed](LIMITS.md#speed)). `VF_TRITON_TC=1` (opt-in, since 0.1.6) has Triton compile
+> those products for sm_80 while the program is still told 7.5
+> ([Triton's matrix products](LIMITS.md#tritons-matrix-products)); otherwise, in a program with
+> PyTorch, only `VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1` changes that, and PyTorch's own attention
+> is then refused ([capability](LIMITS.md#the-capability-told-with-vf_capability)).
 
 ## Quick start
 

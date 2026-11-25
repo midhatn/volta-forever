@@ -6,17 +6,19 @@ where it is not from the build of this release. `docs/` says how each figure was
 `docs/validation.md` for what was compared with what, `docs/performance.md` for the timings,
 `docs/emulations.md` for what is computed in place of the instructions that a V100 lacks.
 
-## The limits of 0.1.5 to know first
+## The limits of 0.1.6 to know first
 
-- **Triton's `tl.dot` uses no tensor cores at the default capability.** Told 7.5, which is what
-  Triton is told by default in a program with PyTorch, Triton 3.8 multiplies with float32 `fma`:
-  its float16 and bf16 matrix products ran 3 to 150 times slower than the same kernels told 8.0
-  ([Speed](#speed)). In a program with PyTorch, `VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1` is the
-  only way to the tensor cores in this release, and PyTorch's own attention is then refused
-  ([The capability told with `VF_CAPABILITY`](#the-capability-told-with-vf_capability)). After
-  0.1.5 (`CHANGELOG.md`, "Unreleased"), `VF_TRITON_TC=1` (opt-in, through the launcher) compiles
-  Triton's float16, bfloat16 and int8 products for sm_80 while everyone is still told 7.5
-  ([Triton's matrix products](#tritons-matrix-products)).
+- **Triton's `tl.dot` uses no tensor cores at the default capability, unless asked.** Told 7.5,
+  which is what Triton is told by default in a program with PyTorch, Triton 3.8 multiplies with
+  float32 `fma`: its float16 and bf16 matrix products ran 3 to 150 times slower than the same
+  kernels told 8.0 ([Speed](#speed)). `VF_TRITON_TC=1` (opt-in, through the launcher) compiles
+  Triton's float16, bfloat16 and int8 products for sm_80 while everyone is still told 7.5, at the
+  default capability only: its float16 products are then summed by Volta's tensor cores, which
+  truncate, and its bfloat16 and int8 products are the layer's emulated ones ([Triton's matrix
+  products](#tritons-matrix-products)). Otherwise, in a program with PyTorch,
+  `VF_CAPABILITY=8.0 VF_CAPABILITY_ALL=1` is the way to the tensor cores, and PyTorch's own
+  attention is then refused ([The capability told with
+  `VF_CAPABILITY`](#the-capability-told-with-vf_capability)).
 - **Triton's machine code is validated on a corpus, not kernel by kernel.** Kernels that Triton
   makes while a program runs, and that run from their sm_75 machine code (the default for a
   program told 7.5), were run on a V100 in 3,516 configurations of 20 kernels and 241 cases of
@@ -29,10 +31,11 @@ where it is not from the build of this release. `docs/` says how each figure was
   makes for other programs, shapes and settings were not looked at (`docs/validation.md`,
   sections 4, 6 and 8).
 - **The translation of sm_80 machine code is not independently validated**: the validator reads
-  sm_75 code only ("Cubins for sm_80 and later", below; `docs/validation.md`, section 8). (After
-  0.1.5, on main: told 8.0, a kernel that only the sm_80 machine code of its image has is given
-  from that code, translated, where its lookup failed; `VF_TOLD_CODE=0` turns that off: [The
-  capability told with `VF_CAPABILITY`](#the-capability-told-with-vf_capability).)
+  sm_75 code only ("Cubins for sm_80 and later", below; `docs/validation.md`, section 8). Told 8.0,
+  a kernel that only the sm_80 machine code of its image has is now given from that code,
+  translated, where its lookup failed in 0.1.5: compare its results; `VF_TOLD_CODE=0` makes the
+  lookup fail again ([The capability told with
+  `VF_CAPABILITY`](#the-capability-told-with-vf_capability)).
 - **`VF_CAPABILITY_ALL=1` no longer reaches the libraries that ask for themselves.** It tells the
   value asked for to a CUDA runtime and to the code that uses it (PyTorch's library) only; cuDNN,
   cuFFT and cuSOLVER, which ask the driver without that runtime, are told what their own code
@@ -60,32 +63,30 @@ where it is not from the build of this release. `docs/` says how each figure was
   launched, it does nothing and returns no error, as without the layer; `VF_LOG_LEVEL=2` counts
   them in each image adapted ([Kernels refused](#kernels-refused)).
 - **The bf16 cuBLAS variants are opt-in.** `VF_CUBLAS_BF16_SKINNY=1` and `VF_CUBLAS_BF16_TC=1`
-  are off by default. The tensor-core path's results are not cuBLAS 12.9's bits, it makes bf16
-  training slower, and it takes products with k from 1024 to 16384 only: a model whose layers
-  have fewer than 1024 in-features gets it only on its wider layers, and the gains measured on
-  real programs were measured before that gate. `VF_SAFE=1` turns it off ([The bf16 cuBLAS
-  variants](#the-bf16-cublas-variants)). (Since 0.1.5, on main: the tensor-core path takes TN
+  are off by default. The tensor-core path's results are not cuBLAS 12.9's bits. It takes TN
   products with k from 768 to 16384 only, but for the classes of shapes that its rules of speed
-  leave to 12.9, so that the products of a training step's backward pass go to 12.9, and a bf16
-  fine-tuning step ran at 1.12 to 1.24 times its speed without it; a model whose layers have
-  fewer than 768 in-features gets it only on its wider layers; the gains on real programs were
-  measured again with the gate of 768 and the rules.)
+  leave to 12.9, so that the products of a training step's backward pass go to 12.9 (a bf16
+  fine-tuning step ran at 1.12 to 1.24 times its speed without it), and a model whose layers have
+  fewer than 768 in-features gets it only on its wider layers. A product whose input has many
+  columns that do not convert exactly to fp16 can run slower than with 12.9 (about half its speed
+  at the slowest point measured). `VF_SAFE=1` turns the path off, and `VF_CUBLAS_BF16_VERIFY=1`
+  checks the skinny path's calls against 12.9's own ([The bf16 cuBLAS
+  variants](#the-bf16-cublas-variants)).
 - **Under eager loading (`CUDA_MODULE_LOADING=EAGER`), PyTorch takes very long to start.**
   cuBLAS, cuBLASLt, cuSPARSE, cuSOLVER, cuFFT, cuRAND and cuDNN 9.10 start under it, as on
   NVIDIA's driver, but every image that a runtime registered is adapted and compiled at the start:
   with the layer's cache off, cuBLAS 12.9 started in 30 s (2 s without the layer), and the start
   of PyTorch 2.14 had not ended after ten minutes (2026-11-23); a later start, from the caches, was
   not measured ([Kernels refused](#kernels-refused), "Eager loading").
-- **The CUDA 13 build of NCCL cannot run a collective on V100s.** The layer refuses the kernels
-  that may reach an instruction of multicast memory (`multimem.*`), which most kernels of its
-  collectives may, behind tests that only its NVLink-SHARP transport passes (41 of the 53 kernels
-  of its device-linked image are refused); NCCL's CUDA 12 build runs in its place
-  (`vf fetch --only libnccl`). (After 0.1.5, on main: where no GPU of the
-  process can take part in multicast, as with V100s, each such instruction is replaced by a
-  reported trap and the kernels are given, and the CUDA 13 build's collectives gave the CPU's
-  values on two V100s; its first start compiles its code for about 15 minutes in each process; a
-  reported trap that a kernel reaches all the same stops it with `CUDA_ERROR_ASSERT` (710) and
-  ends its context: [Several GPUs and NCCL](#several-gpus-and-nccl).)
+- **The CUDA 13 build of NCCL runs, but its first start takes about 15 minutes.** Where no GPU of
+  the process can take part in multicast, as with V100s, the layer replaces each instruction of
+  multicast memory (`multimem.*`) by a reported trap and gives the kernels that hold one, which it
+  refused in 0.1.5: the wheel's NCCL then runs its collectives (the CPU's values on two V100s), but
+  its first start compiles its adapted code for about 15 minutes in each process, and the later
+  ones take about half a minute more than with NCCL's CUDA 12 build (`vf fetch --only libnccl`),
+  which stays the one to use. A reported trap that a kernel reaches all the same stops it with
+  `CUDA_ERROR_ASSERT` (710) and ends its context; `VF_REPORTED_TRAPS=0` refuses those kernels
+  again ([Several GPUs and NCCL](#several-gpus-and-nccl)).
 - **A lookup table asked for by name can be refused** (error 801), where NVIDIA's driver gives
   it, once a kernel that the layer compiled alone holds a copy of it ([Kernels
   refused](#kernels-refused), "A variable asked for by name can be refused too").
@@ -951,14 +952,14 @@ What that does not cover:
   built as PTX for compute_75 only (as Ollama's `cuda_v13` runner is) stopped in `top_k_cub` with
   `-bs`, and with `draft-mtp` and its default backend sampling of drafts;
   `--no-spec-draft-backend-sampling` avoided it, and `draft-simple` was not affected
-  (`docs/reports/`). That is fixed after 0.1.5 (`CHANGELOG.md`, "Unreleased"): CUB's sort, sum and
-  scan from such a build give the right results (`tests/gpu/run.sh`, the `cub-*` cases), and so
-  did the ARGSORT (up to 1,048,576 columns), TOP_K, CUMSUM, SUM and MEAN cases of llama.cpp
-  b11521's `test-backend-ops` built so (2026-11-24). In the same outside tester's run with the fix
-  (`e3c870b`, 2026-11-25), the same llama.cpp v1.0.0 build ran with `-bs` and with `draft-mtp` and
-  its default backend sampling of drafts to the end, and its other runs gave the tokens of 0.1.5,
-  with the same log-probabilities of the five first candidates at every position where they were
-  read (`docs/reports/`).
+  (`docs/reports/`). That is fixed in 0.1.6: CUB's sort, sum and scan from such a build give the
+  right results (`tests/gpu/run.sh`, the `cub-*` cases), and so did the ARGSORT (up to 1,048,576
+  columns), TOP_K, CUMSUM, SUM and MEAN cases of llama.cpp b11521's `test-backend-ops` built so
+  (2026-11-24). In the same outside tester's run with the fix (`e3c870b`, the code of 0.1.6,
+  2026-11-25), the same llama.cpp v1.0.0 build ran with `-bs` and with `draft-mtp` and its default
+  backend sampling of drafts to the end, and its other runs gave the tokens of 0.1.5, with the same
+  log-probabilities of the five first candidates at every position where they were read
+  (`docs/reports/`).
 
 ## CUDA graphs
 
@@ -1365,8 +1366,8 @@ same everywhere:
 - **With greedy decoding, a near tie can end in a loop.** A near tie that the PTX build resolves
   the other way can send a text into a repetition loop that Ollama's repeat limit ends with HTTP
   500: 2 of the 4,000 requests of an outside long run of Ollama 0.40.4's CUDA 13 runner through the
-  layer, both again on a new server and after 0.1.5 (`e3c870b`), where its CUDA 12 runner
-  completes them; a third request loops with both runners (`docs/reports/`).
+  layer, both again on a new server and with the code of 0.1.6 (`e3c870b`), where its CUDA 12
+  runner completes them; a third request loops with both runners (`docs/reports/`).
 - **Conversions of the 4-bit and 8-bit formats**: identical to an RTX 5090's on every value of
   the formats.
 - **Block-scaled products**: see the table above.

@@ -16,7 +16,7 @@ Strata ships the CUDA runtime and cuBLAS with its engine. The host can run this 
 
 ## 2. VF
 
-Build VF 0.1.5 for the benchmark below. The build fetches its CUDA libraries into the checkout.
+Build VF 0.1.6 for the benchmark below. The build fetches its CUDA libraries into the checkout.
 
 ```sh
 sudo apt update && sudo apt install -y build-essential ca-certificates curl git python3 xz-utils

@@ -85,7 +85,7 @@ Where the GPU scripts write:
 - `run.sh`: the test kernels, loaded as PTX and as machine code through the proxy (retargeting,
   translation, refusal, the cache, the second translation at launch, the CUDA runtime), give
   what the native sm_70 build of the same source, the host models or the reference vectors of
-  an RTX 5090 say. 229 cases (200 at 0.1.5, 165 at 0.1.4), including nonconsecutive MMA fragments, a
+  an RTX 5090 say. 229 cases at 0.1.6 (200 at 0.1.5, 165 at 0.1.4), including nonconsecutive MMA fragments, a
   partial warp reduction, a zero-filled asynchronous copy, sm_80 machine code translated, refused lookups
   (error 218 and a NULL handle, through a module, a library and the driver's linker), a program
   with a refused kernel under the CUDA 12 and 13 runtimes in both loading modes
@@ -251,7 +251,8 @@ Where the GPU scripts write:
   cubin is `PASS-PTX`.
 - `compare.sh`: the Rust translator and the Python reference give the same bytes, the same
   instruction map, the same `MAP.lives` and the same refusals for every cubin, sm_80 test
-  cubins included (at 0.1.4 and 0.1.5: 491 of 491, the 16 test cubins and PyTorch's 475).
+  cubins included (at 0.1.6: 492 of 492, the 17 test cubins and PyTorch's 475; 491 of 491 at 0.1.4
+  and 0.1.5).
 - `python3 -I reference/ampere_check.py DIR...` (not a step of the release check: it needs sm_80
   cubins, `vf extract FILE DIR 80`, and NVIDIA's disassembler): every distinct word of sm_80 code
   that the translator passes as it is reads the same to nvdisasm as sm_80 and as sm_75, and is of
@@ -728,7 +729,7 @@ No GPU needed.
 ### What the CI runs
 
 On every push and pull request, `.github/workflows/ci.yml` runs the formatting and lint
-checks and the unit tests (`cargo test`, 538, in an empty home of their own that they must
+checks and the unit tests (`cargo test`, 538 at 0.1.6, in an empty home of their own that they must
 leave empty: `tests/scripts/untouched-home.sh`); `scripts/build.sh`; `fit_api.sh`, `marker.sh`,
 `graph_fit.sh`, `lifecycle.sh`, `library_entries.py`, `readonly_tables.py`, `driver_capability.py`,
 `link_refusals.py`, `nccl_remedy.py`, `launch_guard.py`, `fault.py`, `driver_calls.py`, `guard_stress.sh`, `jitlink_fork.py`, `safe_mode.py`,

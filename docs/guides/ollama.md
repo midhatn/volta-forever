@@ -2,9 +2,9 @@
 
 Every measurement on this page is from an outside tester, TheWeakShall, in
 [issue #4](https://github.com/nbald/volta-forever/issues/4): Ollama 0.40.4 and VF 0.1.5 on a
-V100-SXM2-32GB, with drivers 580.173.02 and 580.178.04; the end of section 6 is a run after 0.1.5
-(`e3c870b`). The project did not run Ollama itself; [docs/reports/](../reports/README.md) has a
-row for each report, with its host and its link.
+V100-SXM2-32GB, with drivers 580.173.02 and 580.178.04; the end of section 6 is a run with the
+code of 0.1.6 (`e3c870b`). The project did not run Ollama itself;
+[docs/reports/](../reports/README.md) has a row for each report, with its host and its link.
 
 ## 1. What stock Ollama ships
 
@@ -137,9 +137,9 @@ CPU's result (`test-backend-ops`). It is an upstream bug (llama.cpp issue 31555)
   | 2,048 to 6,000 | 887 / 1,573 | 95.2 / 94.5 |
   | 6,000 to 13,000 | 901 / 1,548 | 94.1 / 91.7 |
 
-  After 0.1.5 (`e3c870b`), on a new server, the three fixed prompts gave the same bytes as with
-  0.1.5 and as in the long run's first round, and the three requests that loop (section 5) ended
-  with HTTP 500 again.
+  With the code of 0.1.6 (`e3c870b`), on a new server, the three fixed prompts gave the same bytes
+  as with 0.1.5 and as in the long run's first round, and the three requests that loop (section 5)
+  ended with HTTP 500 again.
 
 On four more systems with driver 580.178.04 (Rocky Linux 9.9, Ubuntu 26.04, Debian 13, Fedora
 45), `qwen3:0.6b` through `vf` gave the CUDA 12 runner's text, and the server said
