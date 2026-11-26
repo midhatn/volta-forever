@@ -85,9 +85,11 @@ Where the GPU scripts write:
 - `run.sh`: the test kernels, loaded as PTX and as machine code through the proxy (retargeting,
   translation, refusal, the cache, the second translation at launch, the CUDA runtime), give
   what the native sm_70 build of the same source, the host models or the reference vectors of
-  an RTX 5090 say. 229 cases at 0.1.6 (200 at 0.1.5, 165 at 0.1.4), including nonconsecutive MMA fragments, a
+  an RTX 5090 say. 232 cases (229 at 0.1.6, 200 at 0.1.5, 165 at 0.1.4), including nonconsecutive MMA fragments, a
   partial warp reduction, a zero-filled asynchronous copy, sm_80 machine code translated, refused lookups
-  (error 218 and a NULL handle, through a module, a library and the driver's linker), a program
+  (error 218 and a NULL handle, through a module, a library and the driver's linker), files of PTX,
+  relocatable sm_75 machine code and a fat binary given to the driver's linker with `cuLinkAddFile`
+  and `cuLinkAddFile_v2`, adapted, linked and run (`link-file-*`, `DRVRUN_LINK` of `drvrun.c`), a program
   with a refused kernel under the CUDA 12 and 13 runtimes in both loading modes
   (`CUDA_MODULE_LOADING`), a refused kernel launched with a handle taken from NVIDIA's driver
   itself (218 from every launch function and graph node, and no line more with "Xid" in the
@@ -506,7 +508,12 @@ without the launcher's marker and `VF_CAPABILITY`; it needs gcc and objcopy. The
 the capability that NVML gives through the audit library, by `ctypes` (as `pynvml` asks) and
 to a library linked against it; it needs gcc. The fourth checks, with another stand-in, that
 a kernel refused in an input of the driver's linker is refused in the image the link makes,
-and in a copy of it, that a kernel that the note of a cubin names (as the layer's nvJitLink
+and in a copy of it, that a file of PTX, a cubin or a fat binary given with `cuLinkAddFile` or
+`cuLinkAddFile_v2` reaches the linker as what the layer makes of the same bytes in memory, its
+refused kernel refused in that image with the line of a refused kernel, while a file of another
+type (a host object, a library of them), one that cannot be read, a null path and a file of which
+the driver refuses what the layer made go to the driver's call (and the program gets its answer),
+that a kernel that the note of a cubin names (as the layer's nvJitLink
 writes it) is refused wherever the cubin is loaded (each loading function, a file, a fat binary,
 a wrapper, an input of the driver's linker), and that what is known of a link or a module made
 with a handle that the driver gives again, while the destruction or unload of the one before
