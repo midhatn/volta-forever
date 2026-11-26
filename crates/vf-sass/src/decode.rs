@@ -4,12 +4,15 @@
 //! word belongs to, then extracts its operands, computes what it reads and writes, and
 //! determines its scheduling kind. This mirrors `md.py`'s Decoder and `machine.py`'s decode.
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::fast::FastMap;
 use crate::field;
 use crate::generated::classes::*;
-use crate::generated::fields::OP_NAMES;
+use crate::generated::fields::{OP_NAMES, OP_PG, OP_UPG};
 use crate::generated::special::*;
+
+const WAIT_MASK: u128 = 63u128 << WAIT;
 
 /// The scheduling kind of an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -140,21 +143,28 @@ pub fn span_of(span: u16, ops: &[(u16, u32)]) -> u32 {
     SPAN_VALUES[values as usize + index] as u32
 }
 
-/// The uniform registers that an sm_75 instruction reads or writes: for each of its operands, the
-/// first register and how many it takes as one value.
-pub fn uniform_operands(d: &Decoded) -> Vec<(u32, u32)> {
+/// Calls `f(first_register, register_count)` for each uniform register operand (`U`), skipping
+/// `UZ` (register 63).
+pub(crate) fn for_each_uniform_operand<F: FnMut(u32, u32)>(d: &Decoded, mut f: F) {
     let cls = &SM75_CLASSES[d.class_id as usize];
     let reads = &SM75_READS[cls.12 as usize..(cls.12 + cls.13) as usize];
     let writes = &SM75_WRITES[cls.14 as usize..(cls.14 + cls.15) as usize];
-    reads
-        .iter()
-        .chain(writes)
-        .filter(|&&(letter, _, _)| letter == LETTER_U)
-        .filter_map(|&(_, name_id, span)| {
-            let first = d.op(name_id)?;
-            (first != ZERO_U).then(|| (first, span_of(span, &d.ops)))
-        })
-        .collect()
+    for &(letter, name_id, span) in reads.iter().chain(writes) {
+        if letter == LETTER_U
+            && let Some(first) = d.op(name_id)
+            && first != ZERO_U
+        {
+            f(first, span_of(span, &d.ops));
+        }
+    }
+}
+
+/// The uniform registers that an sm_75 instruction reads or writes: for each of its operands, the
+/// first register and how many it takes as one value.
+pub fn uniform_operands(d: &Decoded) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for_each_uniform_operand(d, |first, count| out.push((first, count)));
+    out
 }
 
 pub fn zero_of(letter: u8) -> u32 {
@@ -191,31 +201,55 @@ type ClassTuple = (
 
 pub struct Decoder {
     sm: u32,
-    cache: HashMap<u128, Option<Decoded>>,
+    cache: FastMap<u128, Option<Arc<Decoded>>>,
+    class_cache: FastMap<u128, Option<u16>>,
 }
 
 impl Decoder {
     pub fn new(sm: u32) -> Self {
         Self {
             sm,
-            cache: HashMap::new(),
+            cache: FastMap::default(),
+            class_cache: FastMap::default(),
         }
     }
 
     pub fn decode(&mut self, word: u128) -> Option<Decoded> {
+        self.decode_arc(word).map(|d| (*d).clone())
+    }
+
+    pub(crate) fn decode_arc(&mut self, word: u128) -> Option<Arc<Decoded>> {
         if let Some(cached) = self.cache.get(&word) {
             return cached.clone();
         }
-        let result = if self.sm == 75 {
-            self.decode_sm(word, true)
-        } else {
-            self.decode_sm(word, false)
-        };
+        let is_75 = self.sm == 75;
+        let result = self
+            .match_class_cached(word, is_75)
+            .map(|class_id| Arc::new(self.build_decoded(word, is_75, class_id)));
         self.cache.insert(word, result.clone());
         result
     }
 
-    fn decode_sm(&self, word: u128, is_75: bool) -> Option<Decoded> {
+    pub(crate) fn is_valid(&mut self, word: u128) -> bool {
+        if let Some(cached) = self.cache.get(&word) {
+            return cached.is_some();
+        }
+        self.match_class_cached(word, self.sm == 75).is_some()
+    }
+
+    #[inline]
+    fn match_class_cached(&mut self, word: u128, is_75: bool) -> Option<u16> {
+        // WAIT (bits 116..121) has zero opcode/const/domain/unused checks on both sm_70 and sm_75.
+        let key = word & !WAIT_MASK;
+        if let Some(&cached) = self.class_cache.get(&key) {
+            return cached;
+        }
+        let class_id = self.match_class(word, is_75);
+        self.class_cache.insert(key, class_id);
+        class_id
+    }
+
+    fn match_class(&self, word: u128, is_75: bool) -> Option<u16> {
         let classes: &[ClassTuple] = if is_75 { &SM75_CLASSES } else { &VF_CLASSES };
         let const_checks = if is_75 {
             &SM75_CONST_CHECKS[..]
@@ -238,7 +272,8 @@ impl Decoder {
             &VF_DOMAIN_OFFSETS[..]
         };
 
-        let mut matches: Vec<u16> = Vec::new();
+        let mut matched: Option<u16> = None;
+        let mut match_count: u32 = 0;
 
         // Try opcode fields; sm_75 has fields 0 (13-bit) and 34 (12-bit), sm_70 has field 34 only
         if is_75 {
@@ -253,21 +288,25 @@ impl Decoder {
                 domain_values,
                 domain_offsets,
                 false,
-                &mut matches,
+                &mut matched,
+                &mut match_count,
             );
-            self.check_opcode(
-                word,
-                34,
-                &SM75_OPCODE_34_OFFSETS,
-                &SM75_OPCODE_34_CANDIDATES,
-                classes,
-                const_checks,
-                domain_checks,
-                domain_values,
-                domain_offsets,
-                false,
-                &mut matches,
-            );
+            if match_count < 2 {
+                self.check_opcode(
+                    word,
+                    34,
+                    &SM75_OPCODE_34_OFFSETS,
+                    &SM75_OPCODE_34_CANDIDATES,
+                    classes,
+                    const_checks,
+                    domain_checks,
+                    domain_values,
+                    domain_offsets,
+                    false,
+                    &mut matched,
+                    &mut match_count,
+                );
+            }
         } else {
             self.check_opcode(
                 word,
@@ -280,15 +319,19 @@ impl Decoder {
                 domain_values,
                 domain_offsets,
                 true,
-                &mut matches,
+                &mut matched,
+                &mut match_count,
             );
         }
 
-        if matches.len() != 1 {
+        if match_count != 1 {
             return None;
         }
+        matched
+    }
 
-        let class_id = matches[0];
+    fn build_decoded(&self, word: u128, is_75: bool, class_id: u16) -> Decoded {
+        let classes: &[ClassTuple] = if is_75 { &SM75_CLASSES } else { &VF_CLASSES };
         let cls = &classes[class_id as usize];
         let operands = if is_75 { &SM75_OPERANDS[..] } else { &VF_OPERANDS[..] };
         let reads_desc = if is_75 { &SM75_READS[..] } else { &VF_READS[..] };
@@ -298,7 +341,7 @@ impl Decoder {
         let reads = self.compute_reads(&ops, &reads_desc[cls.12 as usize..(cls.12 + cls.13) as usize]);
         let writes = self.compute_writes(&ops, &writes_desc[cls.14 as usize..(cls.14 + cls.15) as usize]);
 
-        Some(Decoded {
+        Decoded {
             word,
             class_id,
             kind: Kind::from_id(cls.3),
@@ -307,7 +350,7 @@ impl Decoder {
             ops,
             reads,
             writes,
-        })
+        }
     }
 
     /// The mnemonics of the classes of sm_75 whose opcode `word` has, whatever its other fields:
@@ -346,7 +389,8 @@ impl Decoder {
         domain_values: &[u32],
         domain_offsets: &[(u32, u16)],
         check_unused: bool,
-        matches: &mut Vec<u16>,
+        matched: &mut Option<u16>,
+        match_count: &mut u32,
     ) {
         let opcode_val = field::get(opcode_fid, word) as usize;
         if opcode_val >= offsets.len() {
@@ -392,7 +436,13 @@ impl Decoder {
                     continue;
                 }
             }
-            matches.push(class_id);
+            if *match_count == 0 {
+                *matched = Some(class_id);
+            }
+            *match_count += 1;
+            if *match_count > 1 {
+                return;
+            }
         }
     }
 
@@ -411,13 +461,16 @@ impl Decoder {
     }
 
     fn compute_reads(&self, ops: &[(u16, u32)], reads_desc: &[(u8, u16, u16)]) -> Vec<(u8, u32, u8)> {
-        let mut reads = Vec::new();
+        let mut reads = Vec::with_capacity(reads_desc.len());
         for &(letter, name_id, span) in reads_desc {
             if let Some(&(_, val)) = ops.iter().find(|&&(n, _)| n == name_id)
                 && val != zero_of(letter)
             {
-                let name = OP_NAMES[name_id as usize];
-                let role = if name == "Pg" || name == "UPg" { 1u8 } else { 0u8 };
+                let role = if name_id == OP_PG || name_id == OP_UPG {
+                    1u8
+                } else {
+                    0u8
+                };
                 for i in 0..span_of(span, ops) {
                     reads.push((letter, val + i, role));
                 }
@@ -427,7 +480,7 @@ impl Decoder {
     }
 
     fn compute_writes(&self, ops: &[(u16, u32)], writes_desc: &[(u8, u16, u16)]) -> Vec<(u8, u32)> {
-        let mut writes = Vec::new();
+        let mut writes = Vec::with_capacity(writes_desc.len());
         for &(letter, name_id, span) in writes_desc {
             if let Some(&(_, val)) = ops.iter().find(|&&(n, _)| n == name_id)
                 && val != zero_of(letter)

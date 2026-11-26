@@ -1,5 +1,7 @@
 //! Tests for the translator: scheduling, placement, borrowed registers, predicate
 //! assignment, and assembly of the instructions the translation builds.
+use std::collections::HashSet;
+
 use super::borrowed::Borrowed;
 use super::context::pick;
 use super::parse::{FuncData, placement};
@@ -78,7 +80,7 @@ fn items_of(list: &[Given]) -> Vec<Item> {
             };
             let mut item = Item::new(word, i, what, changed);
             item.first = true;
-            item.d = Some(dec70.decode(word).expect(name));
+            item.d = Some(dec70.decode_arc(word).expect(name));
             if what == "restore" {
                 let mask = item.d.as_ref().unwrap().op_or(OP_SB, 0);
                 item.more_writes
@@ -635,9 +637,9 @@ fn free_at_skips_given() {
     let b = Borrowed {
         top: 10,
         highest: 10,
-        busy: vec![regset_empty()],
+        busy: std::sync::Arc::new(vec![regset_empty()]),
         taken: vec![regset_empty()],
-        touch: vec![regset_empty()],
+        touch: std::sync::Arc::new(vec![regset_empty()]),
         never: regset_empty(),
         homes: HashMap::new(),
         spans: HashMap::new(),
@@ -646,7 +648,7 @@ fn free_at_skips_given() {
         slots: HashMap::new(),
         predicate_slots: HashMap::new(),
         frame_bytes: 0,
-        depth: vec![None],
+        depth: std::sync::Arc::new(vec![None]),
         r1_fixed: true,
         room: false,
         from_r1: false,
@@ -679,9 +681,9 @@ fn free_at_returns_none_when_full() {
     let b = Borrowed {
         top: 20,
         highest: 20,
-        busy: vec![busy],
+        busy: std::sync::Arc::new(vec![busy]),
         taken: vec![regset_empty()],
-        touch: vec![regset_empty()],
+        touch: std::sync::Arc::new(vec![regset_empty()]),
         never: regset_empty(),
         homes: HashMap::new(),
         spans: HashMap::new(),
@@ -690,7 +692,7 @@ fn free_at_returns_none_when_full() {
         slots: HashMap::new(),
         predicate_slots: HashMap::new(),
         frame_bytes: 0,
-        depth: vec![None],
+        depth: std::sync::Arc::new(vec![None]),
         r1_fixed: true,
         room: false,
         from_r1: false,
@@ -1360,7 +1362,7 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
             .map(|(i, word)| {
                 let mut item = Item::new(word, i, "same", changed);
                 item.first = true;
-                item.d = Some(decoder.decode(word).unwrap());
+                item.d = Some(decoder.decode_arc(word).unwrap());
                 item
             })
             .collect();
@@ -1387,7 +1389,7 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
             .map(|(i, word)| {
                 let mut item = Item::new(word, i, "same", true);
                 item.first = true;
-                item.d = Some(decoder.decode(word).unwrap());
+                item.d = Some(decoder.decode_arc(word).unwrap());
                 item
             })
             .collect();
@@ -1412,7 +1414,7 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
                 let mut item = Item::new(word, i, "same", true);
                 item.anew = anew;
                 item.first = true;
-                item.d = Some(decoder.decode(word).unwrap());
+                item.d = Some(decoder.decode_arc(word).unwrap());
                 item
             })
             .collect();
@@ -1431,4 +1433,29 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
     // A writer earlier in the code that goes on to that place.
     let through = ends(&[with_stall(board(DSETP, 0), 2, false), nop, nop], &[32], true);
     assert_eq!(through[0] + through[1], 15, "{through:?}");
+}
+
+#[test]
+fn parallel_cubin_translation_matches_single_threaded() {
+    let cubins: [(&str, &[u8]); 2] = [
+        (
+            "k_pairs",
+            include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin"),
+        ),
+        (
+            "k_groups",
+            include_bytes!("../../../../tests/kernels/k_groups.135.sm75.cubin"),
+        ),
+    ];
+    let opts = Options::default();
+    for (label, bytes) in cubins {
+        let single = super::cubin::translate_with_threads(bytes, true, &opts, Some(1))
+            .unwrap_or_else(|e| panic!("{label} T=1 failed: {e}"));
+        let multi = super::cubin::translate_with_threads(bytes, true, &opts, Some(4))
+            .unwrap_or_else(|e| panic!("{label} T=4 failed: {e}"));
+        assert_eq!(multi.bytes, single.bytes, "{label}: cubin bytes differ");
+        assert_eq!(multi.map, single.map, "{label}: map differs");
+        assert_eq!(multi.lives, single.lives, "{label}: lives differ");
+        assert_eq!(multi.report, single.report, "{label}: report differs");
+    }
 }

@@ -4,23 +4,41 @@
 //! (some with register/predicate conversion), a fixed base word for the sm_70 side, and
 //! constraints on which values are valid. This is a port of `remap.py`'s `Rule.apply`.
 
+use std::sync::OnceLock;
+
+use crate::fast::FastMap;
 use crate::field;
 use crate::generated::rules::*;
 use crate::generated::special::SCHEDULING;
 
+static RULE_INDEX: OnceLock<FastMap<(&'static str, &'static str, &'static str), usize>> = OnceLock::new();
+static RULE_OF_INDEX: OnceLock<Vec<Option<&'static str>>> = OnceLock::new();
+
 /// Find a pre-computed rule by sm_75 class name, sm_70 class name, and drop key.
 pub fn find_rule(sm75_name: &str, sm70_name: &str, drop_key: &str) -> Option<usize> {
-    RULES
-        .iter()
-        .position(|r| r.0 == sm75_name && r.1 == sm70_name && r.10 == drop_key)
+    let map = RULE_INDEX.get_or_init(|| {
+        let mut m = FastMap::default();
+        m.reserve(RULES.len());
+        for (idx, r) in RULES.iter().enumerate() {
+            m.entry((r.0, r.1, r.10)).or_insert(idx);
+        }
+        m
+    });
+    map.get(&(sm75_name, sm70_name, drop_key)).copied()
 }
 
 /// Find the rule_of target for an sm_75 class (by class ID).
+#[inline]
 pub fn rule_of_target(sm75_class_id: u16) -> Option<&'static str> {
-    RULE_OF
-        .iter()
-        .find(|&&(id, _)| id == sm75_class_id)
-        .map(|&(_, target)| target)
+    let table = RULE_OF_INDEX.get_or_init(|| {
+        let max_id = RULE_OF.iter().map(|&(id, _)| id as usize).max().unwrap_or(0);
+        let mut v = vec![None; max_id + 1];
+        for &(id, target) in RULE_OF.iter() {
+            v[id as usize] = Some(target);
+        }
+        v
+    });
+    table.get(sm75_class_id as usize).copied().flatten()
 }
 
 /// What applying a rule to an instruction word gave.
