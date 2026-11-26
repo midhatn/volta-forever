@@ -648,6 +648,26 @@ VF_LAZY=0 refuse refuse-library-lazy-off library "${told[@]}"
 refuse refuse-link link "ALL CHECKS PASSED" \
     "kernel refused_by_layer cannot run on this GPU and is not given to the program: barrier.cluster.arrive: no Volta sequence" \
     "emulated in soft: 1 tanh" "1 kernel with emulated instructions was given to the program: 1 tanh"
+# Files given to the driver's linker (cuLinkAddFile, cuLinkAddFile_v2) are adapted as the same bytes
+# in memory are, and the image that the link makes runs: PTX for sm_75; relocatable sm_75 machine
+# code (built here: the driver's linker takes no other), of which the translator refuses three
+# kernels (a relocation in their code), refused at the lookup; a fat binary of sm_75 machine code
+# and PTX. NVIDIA's driver alone refuses the first (222, the PTX's version) and the second (209),
+# and links the third into an image without these kernels. (Until 2026-11-26 the layer gave the
+# driver such files as they are.)
+rdc_cubin=$out/bin/k_basic.135.sm75.rdc.cubin
+[ "$rdc_cubin" -nt "$G/k_basic.cu" ] || nvcc_host "$T/cuda-13.5.0/bin/nvcc" -arch=sm_75 -O3 -rdc=true -cubin \
+    -o "$rdc_cubin" "$G/k_basic.cu" || exit 2
+DRVRUN_LINK=cuLinkAddFile drv link-file-ptx "$G/k_basic.135.sm75.ptx" \
+    "cuLinkAddFile of .*: PTX text without sm_70 code: PTX for sm_75 retargeted" "link: complete -> 0 " "${all7[@]}"
+DRVRUN_LINK=cuLinkAddFile_v2 drv link-file-cubin "$rdc_cubin" \
+    "cuLinkAddFile of .*: cubin without sm_70 code: machine code for sm_75 translated \(10 functions\)" \
+    "link: complete -> 0 " "saxpy +ok" "warp_sum +ok" "histo +ok" "half_dot +ok" \
+    "kernel mathk cannot run on this GPU and is not given to the program: its machine code for sm_75 is not translated" \
+    "kernel block_sum cannot run on this GPU and is not given to the program: its machine code for sm_75 is not translated" \
+    "kernel dbl cannot run on this GPU and is not given to the program: its machine code for sm_75 is not translated"
+DRVRUN_LINK=cuLinkAddFile drv link-file-fatbin "$W/crates/vf-fatbin/tests/data/elf75-ptx75-zstd.fatbin" \
+    "cuLinkAddFile of .*: fat binary without sm_70 code: PTX for sm_75 retargeted \(1 module\)" "link: complete -> 0 " "${all7[@]}"
 
 # A fat binary whose machine code for sm_80 has a kernel that its code for sm_75 has not
 # (tests/kernels/k_sections.cu; vLLM 0.34's library has its bf16 norm so). The layer gives it its

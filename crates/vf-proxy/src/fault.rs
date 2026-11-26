@@ -1317,20 +1317,36 @@ fn identify(handle: usize, epoch: Option<u64>) -> Identity {
             gone: false,
         };
     }
+    type GetCurrent = unsafe extern "C" fn(*mut *mut c_void) -> CUresult;
+    type GetHandle = unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> CUresult;
+    type GetName = unsafe extern "C" fn(*mut *const c_char, *mut c_void) -> CUresult;
+    let get_ctx: GetCurrent = unsafe { std::mem::transmute(REALS[idx::cuCtxGetCurrent].load(Relaxed)) };
+    let get_library: GetHandle = unsafe { std::mem::transmute(REALS[idx::cuKernelGetLibrary].load(Relaxed)) };
+    let get_name: GetName = unsafe { std::mem::transmute(REALS[idx::cuKernelGetName].load(Relaxed)) };
+    unsafe { identify_from_driver(handle, get_ctx, get_library, get_name) }
+}
+
+unsafe fn identify_from_driver(
+    handle: usize,
+    get_ctx: unsafe extern "C" fn(*mut *mut c_void) -> CUresult,
+    get_library: unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> CUresult,
+    get_name: unsafe extern "C" fn(*mut *const c_char, *mut c_void) -> CUresult,
+) -> Identity {
     let unknown = Identity {
         handle,
         ..Identity::default()
     };
-    type GetHandle = unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> CUresult;
-    type GetName = unsafe extern "C" fn(*mut *const c_char, *mut c_void) -> CUresult;
-    // SAFETY: NVIDIA's functions of these C types, or stubs; the handle is one the program launched.
-    let get_library: GetHandle = unsafe { std::mem::transmute(REALS[idx::cuKernelGetLibrary].load(Relaxed)) };
+    // Do not hand handles to the driver's lookup entry points before the driver is initialized
+    // (driver 580 segfaults inside cuKernelGetLibrary on unvalidated handles before cuInit).
+    let mut ctx = std::ptr::null_mut();
+    if unsafe { get_ctx(&mut ctx) } != CUDA_SUCCESS {
+        return unknown;
+    }
     let mut library = std::ptr::null_mut();
     if unsafe { get_library(&mut library, handle as *mut c_void) } != CUDA_SUCCESS || library.is_null() {
         return unknown;
     }
     let owner = Some(crate::lazy::kernel_library(handle).unwrap_or(library as usize));
-    let get_name: GetName = unsafe { std::mem::transmute(REALS[idx::cuKernelGetName].load(Relaxed)) };
     let mut name: *const c_char = std::ptr::null();
     if unsafe { get_name(&mut name, handle as *mut c_void) } != CUDA_SUCCESS || name.is_null() {
         return Identity { owner, ..unknown };
@@ -2486,6 +2502,23 @@ mod tests {
             lines[0].contains("in a CUDA context that the layer cannot tell (why)"),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn identify_guards_driver_lookup_when_uninitialized() {
+        unsafe extern "C" fn uninit_ctx(_: *mut *mut c_void) -> CUresult {
+            3 // CUDA_ERROR_NOT_INITIALIZED
+        }
+        unsafe extern "C" fn must_not_call_lib(_: *mut *mut c_void, _: *mut c_void) -> CUresult {
+            panic!("cuKernelGetLibrary must not be called before driver initialization");
+        }
+        unsafe extern "C" fn must_not_call_name(_: *mut *const c_char, _: *mut c_void) -> CUresult {
+            panic!("cuKernelGetName must not be called before driver initialization");
+        }
+        let id = unsafe { identify_from_driver(1, uninit_ctx, must_not_call_lib, must_not_call_name) };
+        assert_eq!(id.handle, 1);
+        assert!(id.owner.is_none());
+        assert!(id.name.is_none());
     }
 
     #[test]
