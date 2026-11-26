@@ -90,6 +90,16 @@ impl<'a> Body<'a> {
     /// overflow: UE8M0 scales go up to 2^127, and their product can reach 2^254, which overflows
     /// f32 but not f64.
     pub(super) fn scale_byte_f64(&mut self, register: &str, byte_offset: u32, ue4m3: bool) -> String {
+        self.scale_byte_f64_biased(register, byte_offset, ue4m3, 0)
+    }
+
+    pub(super) fn scale_byte_f64_biased(
+        &mut self,
+        register: &str,
+        byte_offset: u32,
+        ue4m3: bool,
+        exp_boost: u32,
+    ) -> String {
         let byte = self.fresh();
         match byte_offset {
             0 => emit!(self, "and.b32 {byte}, {register}, 0xff;"),
@@ -141,7 +151,7 @@ impl<'a> Body<'a> {
             let [exp, hi, lo]: [String; 3] = self.fresh_n();
             let result = self.fresh_wide();
             self.scratch_predicate = true;
-            emit!(self, "add.u32 {exp}, {byte}, 896;");
+            emit!(self, "add.u32 {exp}, {byte}, {};", 896 + exp_boost);
             emit!(self, "shl.b32 {hi}, {exp}, 20;"); // bits 30:20 of hi word = exponent bits 10:0
             emit!(self, "mov.b32 {lo}, 0;");
             emit!(self, "mov.b64 {result}, {{{lo}, {hi}}};");
@@ -277,12 +287,32 @@ impl<'a> Body<'a> {
                     .collect(),
             )
         } else {
-            // Decode scale bytes to f64.
+            let e4m3_exp_boost = match kind {
+                ScaledKind::Mxf8f6f4(a_type, b_type) => {
+                    8 * u32::from(a_type == Fp8::E4m3) + 8 * u32::from(b_type == Fp8::E4m3)
+                }
+                _ => 0,
+            };
+            // Decode scale bytes to f64 (absorbing 2^8 per unscaled E4M3 operand for MXF8F6F4).
             let scale_a_lower_f64: Vec<String> = (0..n_blocks as u32)
-                .map(|block| self.scale_byte_f64(&sa_lower_reg, byte_offset(n_blocks, byte_id_a, block), false))
+                .map(|block| {
+                    self.scale_byte_f64_biased(
+                        &sa_lower_reg,
+                        byte_offset(n_blocks, byte_id_a, block),
+                        false,
+                        e4m3_exp_boost,
+                    )
+                })
                 .collect();
             let scale_a_upper_f64: Vec<String> = (0..n_blocks as u32)
-                .map(|block| self.scale_byte_f64(&sa_upper_reg, byte_offset(n_blocks, byte_id_a, block), false))
+                .map(|block| {
+                    self.scale_byte_f64_biased(
+                        &sa_upper_reg,
+                        byte_offset(n_blocks, byte_id_a, block),
+                        false,
+                        e4m3_exp_boost,
+                    )
+                })
                 .collect();
             let scale_b_col0_f64: Vec<String> = (0..n_blocks as u32)
                 .map(|block| self.scale_byte_f64(&sb_col0_reg, byte_offset(n_blocks, byte_id_b, block), false))
@@ -458,22 +488,28 @@ impl<'a> Body<'a> {
                     CombinedScale::F64(v) => v,
                     _ => unreachable!("Mxf8f6f4 always uses UE8M0 (f64 scales)"),
                 };
-                let block_sums: Vec<String> = (0..4).map(|_| self.fresh()).collect();
+                let block_sums: [String; 4] = self.fresh_n();
                 for sum in &block_sums {
-                    emit!(self, "mov.b32 {sum}, 0f00000000;");
+                    self.zeros.insert(sum.clone());
                 }
                 let block_sum_names: Vec<&str> = block_sums.iter().map(String::as_str).collect();
                 let mut of_a = Vec::new();
                 for rows in a.chunks(2) {
-                    let (upper, lower) = (self.fp8_halves(a_type, rows[0]), self.fp8_halves(a_type, rows[1]));
+                    let (upper, lower) = (
+                        self.fp8_halves_scaled(a_type, rows[0], false),
+                        self.fp8_halves_scaled(a_type, rows[1], false),
+                    );
                     of_a.extend([upper[0].clone(), lower[0].clone(), upper[1].clone(), lower[1].clone()]);
                 }
-                let of_b: Vec<String> = b.iter().flat_map(|b_reg| self.fp8_halves(b_type, b_reg)).collect();
-                let (of_a_refs, of_b_refs): (Vec<&str>, Vec<&str>) = (
-                    of_a.iter().map(String::as_str).collect(),
-                    of_b.iter().map(String::as_str).collect(),
-                );
-                self.mma_f32(&block_sum_names, &of_a_refs, &of_b_refs, &block_sum_names);
+                let of_b: Vec<String> = b
+                    .iter()
+                    .flat_map(|b_reg| self.fp8_halves_scaled(b_type, b_reg, false))
+                    .collect();
+                for (a_pair, b_reg) in of_a.chunks(2).zip(&of_b) {
+                    let a_refs: Vec<&str> = a_pair.iter().map(String::as_str).collect();
+                    self.mma_f32_chain(&block_sum_names, &a_refs, b_reg, &block_sum_names);
+                }
+                self.chain_end_one(block_sums.clone());
                 // Convert the f32 block sums to f64, multiply by the combined scale, and add.
                 for i in 0..4 {
                     let f64_sum = self.fresh_wide();

@@ -323,13 +323,16 @@ scaled_forms() {
     # The other forms: no worse than today.
     scaled_form s_mxf4_2x 36352 36242 4 106 || bad=1
     scaled_form s_mxf4_2x_large 394112 371635 841 21636 || bad=1
-    scaled_form s_mxf8_e4m3_1x 36352 24272 4021 8059 || bad=1
-    scaled_form s_mxf8_e4m3_1x_large 387712 308475 26699 52538 || bad=1
+    # Chained row.col MXF8 lowers >1-ULP error (further drops 4021->3252, 26699->21802, 578->483)
+    # while increasing exact matches (24272->25043, 308475->312091, 36359->36389), moving former
+    # >1-ULP cases into 1-ULP and exact. Total non-identical (one+further) strictly decreases.
+    scaled_form s_mxf8_e4m3_1x 36352 25043 3252 8057 || bad=1
+    scaled_form s_mxf8_e4m3_1x_large 387712 312091 21802 53819 || bad=1
     # Other thread_id and byte_id values, E5M2 operands.
     scaled_form s_mxf4_tid_a1 38400 36488 143 1769 || bad=1
     scaled_form s_mxf4_tid_b1 38400 36365 186 1849 || bad=1
     scaled_form s_mxf4_bid_a2 38400 36429 164 1807 || bad=1
-    scaled_form s_mxf8_e5m2_1x 38400 36359 578 1463 || bad=1
+    scaled_form s_mxf8_e5m2_1x 38400 36389 483 1528 || bad=1
     return $bad
 }
 if scaled_forms >"$log.forms"; then ok=PASS; else ok=FAIL; failed=1; fi

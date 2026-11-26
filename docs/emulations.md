@@ -489,11 +489,17 @@ gathered by shuffles.
 ### Conversions
 
 **Decode (FP8 to f16).** Every value of `e4m3` and `e5m2` is exactly a half. `e5m2` has the
-exponent of a half: its byte is the upper byte of the half. `e4m3` has a narrower exponent,
-but its seven bits below the sign, placed in bits 13..7 of a half, give the value divided
-by 256 (the exponent fields differ by exactly 8). Multiplication by 256 (a half) recovers
-the value, exactly. The NaN byte `0x7f` of `e4m3` (which would decode to 480) is detected:
-bits 14..9 are set to make a NaN of the same sign.
+exponent of a half: `prmt.b32` (`0x1404` / `0x3424`) places a byte pair into `.f16x2`
+without `shr.u32` unpacks. For `e4m3`, `prmt.b32` (`0x4140` / `0x4342`) unpacks two bytes
+into bits `[7:0]` and `[23:16]`; `shl 7` / `shl 8`, `& 0x3f803f80`, and `lop3.b32` (`0xF8`
+with `0x80008000`) place the sign at bit 15 and magnitude at bits 13..7 (leaving bit 14 clear),
+giving the value divided by 256. Adding `0x00800080` sets bit 14 iff all 7 magnitude bits are 1
+(`0x7f`/`0xff` NaN, without overflowing into sign bit 15); multiplying by 256 (`0x5c005c00`)
+via `mul.rn.f16x2` recovers all finite values and subnormals while `lop3.b32` merges the bit-13
+NaN flag (`0x4000 -> 0x2000`, `0x5f00 | 0x2000 = 0x7f00`) instead of multi-shift subtraction.
+When feeding UE8M0 block-scaled products (`kind::mxf8f6f4`), the `2^8` factor per `e4m3`
+operand is folded directly into UE8M0's exponent bias (`896 + 8` or `896 + 16`), omitting
+`mul.rn.f16x2` and setting bit 14 (`0x4000 -> 0x7f80`) for NaN.
 
 | Form | Instructions | Exact |
 |---|---|---|
@@ -611,8 +617,10 @@ sum over k in block b of A[r][k] * B[k][c]).
 For each block:
 
 1. E2M1 nibbles are decoded to exact halves (every E2M1 value is an f16). For E4M3 and
-   E5M2 (the MXF8F6F4 form), bytes are decoded to halves as in section 6.
-2. The block is computed by FP16 products on Volta's `mma.m8n8k4` (section 2), into an f32
+   E5M2 (the MXF8F6F4 form), bytes are decoded to halves as in section 6 (with `e4m3`'s `2^8`
+   scale absorbed into UE8M0's exponent bias).
+2. The block is computed by FP16 products on Volta's `mma.m8n8k4` (`mma_f32_chain` `row.col`
+   for MXF8F6F4, 16 HMMA steps instead of 32; section 2), into an f32
    sum that starts from zero. For `scale_vec::4X` (NVFP4), where one pair of threads of the
    group holds a block of 16, the block's k-values are first shuffled to all four threads of
    the group. The f32 block sum is exact for E2M1 (at most 16 * 36 = 576 for NVFP4, 1,152 for
@@ -664,8 +672,8 @@ Measured 2026-11-18 on an RTX 5090 and a V100. The counts are what `tests/gpu/ru
 | **NVFP4** (`kind::mxf4nvf4`, 4X) large | 3,179 | 406,912 | **405,861 (99.74%)** | 1,051 (0.26%) | 0 | 0 |
 | **MXFP4** (`kind::mxf4`, 2X) small | 284 | 36,352 | 36,242 (99.70%) | 106 | 4 | 0 |
 | **MXFP4** (`kind::mxf4`, 2X) large | 3,079 | 394,112 | 371,635 (94.30%) | 21,636 (5.49%) | 841 | 0 |
-| **MXF8F6F4** (`kind::mxf8f6f4`, 1X) small | 284 | 36,352 | 24,272 (66.8%) | 8,059 (22.2%) | 4,021 | 0 |
-| **MXF8F6F4** (`kind::mxf8f6f4`, 1X) large | 3,029 | 387,712 | 308,475 (79.6%) | 52,538 (13.6%) | 26,699 | 0 |
+| **MXF8F6F4** (`kind::mxf8f6f4`, 1X) small | 284 | 36,352 | 25,043 (68.9%) | 8,057 (22.2%) | 3,252 | 0 |
+| **MXF8F6F4** (`kind::mxf8f6f4`, 1X) large | 3,029 | 387,712 | 312,091 (80.5%) | 53,819 (13.9%) | 21,802 | 0 |
 
 The "small" sets are the original 284-case reference vectors; the "large" sets add
 rounding discriminators, random accumulators and one-block tests.
@@ -687,9 +695,12 @@ rounding discriminators, random accumulators and one-block tests.
   block-scaled form gives identical results to the plain FP8 product (measured on the
   RTX 5090, 12,800 results).
 
-Extra forms tested against the RTX 5090 (300 cases each): `thread_id_a = 1`,
-`thread_id_b = 1`, `byte_id = 2` with two scales, and E5M2 operands (the `kind::mxf8f6f4`
-form). All consistent with the main forms, no NaN mismatches.
+Using `mma_f32_chain` (`m8n8k4.row.col`, 16 HMMA steps vs 32) on `kind::mxf8f6f4` and
+folding `e4m3`'s `2^8` scale per operand into UE8M0 lowers both instruction count and `>1-ULP`
+differences (`36,389 / 38,400` identical, `1,528` 1-ULP, `483` beyond on `E5M2`; `0` NaN
+mismatches). Extra forms tested against the RTX 5090 (300 cases each): `thread_id_a = 1`,
+`thread_id_b = 1`, `byte_id = 2` with two scales, and E5M2 operands. All consistent, no NaN
+mismatches.
 
 **Test cases.** `tests/gpu/run.sh`: `block-scaled` (10 forms checked, counts as above).
 The reference vectors are in `tests/kernels/blackwell/ref_scaled/`.
