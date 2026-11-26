@@ -378,25 +378,58 @@ impl BorrowedPrepared {
     }
 }
 
-/// Registers of the program that hold nothing where the translation needs registers.
+/// Registers of the program that hold nothing where the translation needs registers: a home
+/// for each uniform register through its whole life, and an even register and the next at an
+/// instruction whose sequence computes into two (the pool). `docs/translator.md`, "Registers".
+///
+/// A register is free at an instruction when it is dead before it, dead after it, and neither
+/// read nor written by it (an instruction may write a register that nothing reads).
+/// The lives follow the ways of `pairing::Flow`; a write
+/// under a predicate ends no life; a call within the section reads and writes what the code
+/// it calls does; a call elsewhere reads every register the function names; at a return every
+/// one of them is alive. R0 and R1 are never taken (R1 is the stack).
 pub(super) struct Borrowed {
+    /// The highest register the program uses.
     pub(super) top: u32,
+    /// The function's own highest register (before any budget override).
     pub(super) highest: u32,
+    /// At each instruction: a bit set of registers that are alive, read or written there.
     pub(super) busy: Arc<Vec<RegSet>>,
+    /// At each instruction: a bit set of registers taken by homes of uniform registers.
     pub(super) taken: Vec<RegSet>,
+    /// At each instruction: a bit set of registers read or written by the instruction itself
+    /// (for `victims_at`: registers the instruction does not touch can be put in the frame).
     pub(super) touch: Arc<Vec<RegSet>>,
+    /// A bit set of registers that some instruction writes late without saying when
+    /// (never borrowed as victims either).
     pub(super) never: RegSet,
+    /// {uniform register: ordinary register it lives in through its whole life}.
     pub(super) homes: HashMap<u32, u32>,
+    /// {uniform register with a home: the instructions of its life}.
     pub(super) spans: HashMap<u32, Vec<usize>>,
+    /// The ordinary registers taken for homes or for the pool.
     pub(super) used: HashSet<u32>,
+    /// Level 3: everything at the instruction.
     pub(super) everything: bool,
+    /// {uniform register: its word in the frame}.
     pub(super) slots: HashMap<u32, u32>,
+    /// Held uniform predicates whose value must survive an interval with every register busy.
     pub(super) predicate_slots: HashMap<u32, u32>,
+    /// The frame size in bytes (a multiple of 16).
     pub(super) frame_bytes: u32,
+    /// Where the stack pointer is at each instruction: `depth[i]` is how far R1 is, before
+    /// instruction i, under where the first instruction puts it. None when the depth is not
+    /// known at that instruction. The program moves R1 by `IADD3 R1, R1, imm` only.
     pub(super) depth: Arc<Vec<Option<i32>>>,
+    /// Whether the depth of R1 is known everywhere the first instruction leads.
     pub(super) r1_fixed: bool,
+    /// Whether room is made where no register holds nothing (VF_BORROW >= 5): registers
+    /// the instruction does not touch are put in the frame and brought back.
     pub(super) room: bool,
+    /// Whether the frame is addressed from R1 itself (the stack pointer), not from a base
+    /// register loaded from c[0x0][0x28].
     pub(super) from_r1: bool,
+    /// The most registers any single instruction put away at once (for the final frame size).
     pub(super) spill: u32,
 }
 
@@ -409,6 +442,9 @@ impl Borrowed {
         Ok(prep.instantiate(fd, all_in_memory, top_override))
     }
 
+    /// The lowest register that holds nothing at instruction `i`, or the lowest run of `width`
+    /// registers from an even one: no home of a uniform register alive there, and not among
+    /// `given` (a bit set: what the same instruction was given already). None when there is none.
     pub(super) fn free_at(&self, i: usize, width: u32, given: &RegSet) -> Option<u32> {
         let held = regset_or(&regset_or(&self.busy[i], &self.taken[i]), given);
         let upper = self.top + 2 - width;
@@ -426,6 +462,11 @@ impl Borrowed {
         }
     }
 
+    /// Where no register holds nothing: the lowest register, or run of `width` from an even
+    /// one, that instruction `i` neither reads nor writes itself, that is no home there, was
+    /// not given already, and receives no result that nothing announces: registers that hold
+    /// something for the program, to be put in the frame for the time of the sequence and
+    /// brought back after it (`Ctx::make_room`). None when there is none.
     pub(super) fn victims_at(&self, i: usize, width: u32, given: &RegSet) -> Option<u32> {
         let mut held = regset_or(&regset_or(&self.touch[i], &self.taken[i]), given);
         held = regset_or(&held, &self.never);
@@ -446,6 +487,9 @@ impl Borrowed {
         }
     }
 
+    /// A register that holds nothing at any instruction of `span` and is no home there:
+    /// taken through all of it. For a uniform predicate held in a register between the
+    /// instructions that name it, at level 3. None when there is none.
     pub(super) fn kept(&mut self, span: &[usize]) -> Option<u32> {
         let mut union = regset_empty();
         for &i in span {
@@ -464,6 +508,8 @@ impl Borrowed {
         None
     }
 
+    /// A word of the frame for each uniform register that has no home (the two of a pair
+    /// side by side, the lower one first). Returns the size of the frame in bytes.
     pub(super) fn assign_slots(&mut self, uniform: &[u32], pairs: &HashSet<u32>) -> u32 {
         let mut slot = 0u32;
         for &u in uniform {
@@ -486,6 +532,8 @@ impl Borrowed {
         self.frame_bytes
     }
 
+    /// Where frame word `word` is, from the top of the thread's local memory (what the stack
+    /// pointer starts at): the frame is right under it.
     pub(super) fn slot_offset(&self, word: u32) -> i64 {
         4 * i64::from(word) - i64::from(self.frame_bytes)
     }

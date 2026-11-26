@@ -37,7 +37,6 @@ pub(super) fn effective_threads(work_items: usize, large_enough: bool) -> usize 
 /// up to `num_threads - 1` workers named `vf-sass-N`). Each thread creates its own `S` once via
 /// `init` and reuses it across work items. Returns results in `0..items.len()` order, and the
 /// earliest-index error if any item fails.
-#[allow(dead_code)]
 pub(super) fn par_map_init<T, S, R, E, Init, F>(items: &[T], num_threads: usize, init: Init, f: F) -> Result<Vec<R>, E>
 where
     T: Sync,

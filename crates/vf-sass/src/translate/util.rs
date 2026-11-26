@@ -1,8 +1,6 @@
 //! Utility functions for operand manipulation: find, read and write the operands
 //! of a decoded instruction by name, class or field.
 
-use std::sync::OnceLock;
-
 use crate::decode::Decoded;
 use crate::field;
 use crate::generated::classes::{SM75_CLASSES, SM75_OPERANDS, VF_CLASSES, VF_OPERANDS};
@@ -13,23 +11,36 @@ use super::{Item, Refused};
 
 // ---- Utility functions ----
 
-struct RelativeTables {
-    sm75: Vec<Option<(u16, u32)>>,
-    sm70: Vec<Option<(u16, u32)>>,
+/// (field_id, scale) of the operand of a decoded instruction that is a distance in the code, or None.
+pub fn find_relative_decoded(d: &Decoded, sm: u32) -> Option<(u16, u32)> {
+    find_relative(d, sm)
 }
 
-static RELATIVE_TABLES: OnceLock<RelativeTables> = OnceLock::new();
-
-fn compute_relative_for_class(
-    class_id: usize,
-    name: &str,
-    op_types: &[(u16, u8)],
-    op_type_offsets: &[(u32, u16)],
-    op_start: usize,
-    op_len: usize,
-    operands: &[(u16, u16, u16, u8)],
-) -> Option<(u16, u32)> {
-    let (off, len) = op_type_offsets[class_id];
+#[inline]
+pub(super) fn find_relative(d: &Decoded, sm: u32) -> Option<(u16, u32)> {
+    let cid = d.class_id as usize;
+    let (name, op_types, op_type_offsets, op_start, op_len, operands) = if sm == 75 {
+        let cls = &SM75_CLASSES[cid];
+        (
+            cls.0,
+            &SM75_OP_TYPES[..],
+            &SM75_OP_TYPE_OFFSETS[..],
+            cls.10 as usize,
+            cls.11 as usize,
+            &SM75_OPERANDS[..],
+        )
+    } else {
+        let cls = &VF_CLASSES[cid];
+        (
+            cls.0,
+            &VF_OP_TYPES[..],
+            &VF_OP_TYPE_OFFSETS[..],
+            cls.10 as usize,
+            cls.11 as usize,
+            &VF_OPERANDS[..],
+        )
+    };
+    let (off, len) = op_type_offsets[cid];
     let types = &op_types[off as usize..(off as usize + len as usize)];
     // A branch through a register goes to the instruction after it, plus the register, plus a
     // number: minus where that next instruction is, a distance in the code too (to offset 0).
@@ -45,54 +56,6 @@ fn compute_relative_for_class(
         }
     }
     None
-}
-
-fn relative_tables() -> &'static RelativeTables {
-    RELATIVE_TABLES.get_or_init(|| {
-        let sm75 = SM75_CLASSES
-            .iter()
-            .enumerate()
-            .map(|(id, cls)| {
-                compute_relative_for_class(
-                    id,
-                    cls.0,
-                    &SM75_OP_TYPES,
-                    &SM75_OP_TYPE_OFFSETS,
-                    cls.10 as usize,
-                    cls.11 as usize,
-                    &SM75_OPERANDS,
-                )
-            })
-            .collect();
-        let sm70 = VF_CLASSES
-            .iter()
-            .enumerate()
-            .map(|(id, cls)| {
-                compute_relative_for_class(
-                    id,
-                    cls.0,
-                    &VF_OP_TYPES,
-                    &VF_OP_TYPE_OFFSETS,
-                    cls.10 as usize,
-                    cls.11 as usize,
-                    &VF_OPERANDS,
-                )
-            })
-            .collect();
-        RelativeTables { sm75, sm70 }
-    })
-}
-
-/// (field_id, scale) of the operand of a decoded instruction that is a distance in the code, or None.
-pub fn find_relative_decoded(d: &Decoded, sm: u32) -> Option<(u16, u32)> {
-    find_relative(d, sm)
-}
-
-#[inline]
-pub(super) fn find_relative(d: &Decoded, sm: u32) -> Option<(u16, u32)> {
-    let tables = relative_tables();
-    let slice = if sm == 75 { &tables.sm75 } else { &tables.sm70 };
-    slice.get(d.class_id as usize).copied().flatten()
 }
 
 pub(super) fn put_operand(d: &Decoded, name_id: u16, value: u64, sm: u32) -> Result<u128, Refused> {

@@ -10,6 +10,7 @@ use crate::generated::distances::{DISTANCES, LONGEST_KINDS};
 
 const NUM_KINDS: usize = 12;
 
+#[cfg(test)]
 const ALL_KINDS: [Kind; NUM_KINDS] = [
     Kind::FXU,
     Kind::IMAD,
@@ -67,6 +68,7 @@ fn longest_kind_of(kind_str: &str) -> Option<Kind> {
     }
 }
 
+#[cfg(test)]
 fn ref_least_in_tables(letter: u8, role: u8, writer_kind: Kind, writer_mnem: &str, reader_kind: Kind) -> u32 {
     let letter_str = if letter == 2 { "P" } else { "R" };
     let role_str = if role == 1 { "guard" } else { "data" };
@@ -96,17 +98,32 @@ fn ref_least_in_tables(letter: u8, role: u8, writer_kind: Kind, writer_mnem: &st
     if found { max_d } else { 15 }
 }
 
+#[cfg(test)]
 #[inline]
 fn ref_least(letter: u8, role: u8, writer_kind: Kind, writer_mnem: &str, reader_kind: Kind) -> u32 {
     let d = ref_least_in_tables(letter, role, writer_kind, writer_mnem, reader_kind);
     if letter == 2 && writer_mnem == "R2P" {
-        // Predicates given back from a register (the tables do not say which R2P writes: its mask
-        // is a number). In native sm_70 code a plain instruction reads one as an operand 5 cycles
-        // later or more; the others seen (guards of memory instructions) 12 or more: 12 for
-        // everything else.
         return d.max(if reader_kind == Kind::FXU && role == 0 { 5 } else { 12 });
     }
     d
+}
+
+fn parse_kind(s: &str) -> Option<usize> {
+    match s {
+        "FXU" => Some(0),
+        "IMAD" => Some(1),
+        "FMAI" => Some(2),
+        "FMALITE" => Some(3),
+        "FMA64HEAVY" => Some(4),
+        "MIO_FAST" => Some(5),
+        "MIO_SLOW" => Some(6),
+        "BRU" => Some(7),
+        "HMMA" => Some(8),
+        "IMMA" => Some(9),
+        "UDP" => Some(10),
+        "OTHER" => Some(11),
+        _ => None,
+    }
 }
 
 fn tables() -> &'static DistanceTables {
@@ -129,20 +146,68 @@ fn tables() -> &'static DistanceTables {
             }
         }
         let stride_s = spec_mnems.len() + 1;
+
+        let mut kind_max = [[0u8; NUM_KINDS]; 2];
+        let mut has_kind = [[false; NUM_KINDS]; 2];
+        for &(l, _r, w, _rk, d) in DISTANCES.iter() {
+            let l_idx = usize::from(l == "P");
+            if let Some(wk) = parse_kind(w)
+                && (!has_kind[l_idx][wk] || d > kind_max[l_idx][wk])
+            {
+                kind_max[l_idx][wk] = d;
+                has_kind[l_idx][wk] = true;
+            }
+        }
+
+        let mut base = vec![0u8; 2 * 2 * NUM_KINDS * NUM_KINDS];
+        for l_idx in 0..2 {
+            for r_idx in 0..2 {
+                for wk in 0..NUM_KINDS {
+                    let def = if has_kind[l_idx][wk] { kind_max[l_idx][wk] } else { 15 };
+                    let off = ((l_idx * 2 + r_idx) * NUM_KINDS + wk) * NUM_KINDS;
+                    base[off..off + NUM_KINDS].fill(def);
+                }
+            }
+        }
+        for &(l, r, w, rk, d) in DISTANCES.iter() {
+            if let (Some(wk), Some(rki)) = (parse_kind(w), parse_kind(rk)) {
+                let l_idx = usize::from(l == "P");
+                let r_idx = usize::from(r == "guard");
+                base[(((l_idx * 2 + r_idx) * NUM_KINDS + wk) * NUM_KINDS) + rki] = d;
+            }
+        }
+
         let mut least_flat = vec![0u8; 2 * 2 * NUM_KINDS * stride_s * NUM_KINDS];
         for l_idx in 0..2 {
-            let letter = if l_idx == 1 { 2 } else { 0 };
             for r_idx in 0..2 {
-                let role = r_idx as u8;
-                for (wk, &writer_kind) in ALL_KINDS.iter().enumerate() {
+                for wk in 0..NUM_KINDS {
+                    let b_off = ((l_idx * 2 + r_idx) * NUM_KINDS + wk) * NUM_KINDS;
                     for s_idx in 0..stride_s {
-                        let mnem = if s_idx == 0 { "" } else { spec_mnems[s_idx - 1] };
-                        for (rk, &reader_kind) in ALL_KINDS.iter().enumerate() {
-                            let val = ref_least(letter, role, writer_kind, mnem, reader_kind) as u8;
-                            let flat_idx =
-                                ((((l_idx * 2 + r_idx) * NUM_KINDS + wk) * stride_s + s_idx) * NUM_KINDS) + rk;
-                            least_flat[flat_idx] = val;
-                        }
+                        let d_off = (((l_idx * 2 + r_idx) * NUM_KINDS + wk) * stride_s + s_idx) * NUM_KINDS;
+                        least_flat[d_off..d_off + NUM_KINDS].copy_from_slice(&base[b_off..b_off + NUM_KINDS]);
+                    }
+                }
+            }
+        }
+        for &(l, r, w, rk, d) in DISTANCES.iter() {
+            if let (Some(mnem), Some(rki)) = (w.strip_prefix('='), parse_kind(rk)) {
+                let s_idx = spec_mnems.iter().position(|&m| m == mnem).unwrap() + 1;
+                let l_idx = usize::from(l == "P");
+                let r_idx = usize::from(r == "guard");
+                for wk in 0..NUM_KINDS {
+                    let idx = ((((l_idx * 2 + r_idx) * NUM_KINDS + wk) * stride_s + s_idx) * NUM_KINDS) + rki;
+                    least_flat[idx] = d;
+                }
+            }
+        }
+        let r2p_s_idx = spec_mnems.iter().position(|&m| m == "R2P").unwrap() + 1;
+        for r_idx in 0..2 {
+            for wk in 0..NUM_KINDS {
+                for rk in 0..NUM_KINDS {
+                    let min_r2p = if rk == 0 && r_idx == 0 { 5 } else { 12 };
+                    let idx = (((2 + r_idx) * NUM_KINDS + wk) * stride_s + r2p_s_idx) * NUM_KINDS + rk;
+                    if least_flat[idx] < min_r2p {
+                        least_flat[idx] = min_r2p;
                     }
                 }
             }

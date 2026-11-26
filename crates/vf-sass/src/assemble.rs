@@ -4,13 +4,8 @@
 //! constants, defaults, and given operand values. The generated ASM_TEMPLATES table holds the
 //! pre-computed base word (all defaults/constants) and the operand setters.
 
-use std::sync::OnceLock;
-
-use crate::fast::FastMap;
 use crate::field;
 use crate::generated::assembly::*;
-
-static TEMPLATE_INDEX: OnceLock<FastMap<&'static str, usize>> = OnceLock::new();
 
 /// An operand value: either an integer or a string (enum symbol name).
 #[derive(Clone)]
@@ -22,15 +17,7 @@ pub enum OpVal<'a> {
 /// Find an assembly template by class name.
 #[inline]
 fn find_template(name: &str) -> Option<usize> {
-    let map = TEMPLATE_INDEX.get_or_init(|| {
-        let mut m = FastMap::default();
-        m.reserve(ASM_TEMPLATES.len());
-        for (idx, t) in ASM_TEMPLATES.iter().enumerate() {
-            m.entry(t.0).or_insert(idx);
-        }
-        m
-    });
-    map.get(name).copied()
+    ASM_TEMPLATES.iter().position(|t| t.0 == name)
 }
 
 /// Assemble an sm_70 instruction word from a class name and operand values.
