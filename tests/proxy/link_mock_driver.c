@@ -37,6 +37,30 @@ int cuLinkAddData_v2(void *state, int type, void *data, size_t size, const char 
     for (size_t n = 0; line && n < sizeof seen_target - 1 && line[n] != '\n'; ++n) seen_target[n] = line[n];
     return 0;
 }
+int cuLinkAddData(void *state, int type, void *data, size_t size, const char *name, unsigned count,
+                  int *options, void **values) {
+    return cuLinkAddData_v2(state, type, data, size, name, count, options, values);
+}
+unsigned file_inputs;
+int cuLinkAddFile_v2(void *state, int type, const char *path, unsigned count, int *options, void **values) {
+    ++file_inputs;
+    memset(seen_target, 0, sizeof seen_target);
+    if (type == 1 && path) {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            char buf[512];
+            size_t n = fread(buf, 1, sizeof buf, f);
+            fclose(f);
+            const char *line = memmem(buf, n, ".target", 7);
+            for (size_t i = 0; line && i < sizeof seen_target - 1 && (size_t)(line - buf) + i < n && line[i] != '\n'; ++i)
+                seen_target[i] = line[i];
+        }
+    }
+    return 0;
+}
+int cuLinkAddFile(void *state, int type, const char *path, unsigned count, int *options, void **values) {
+    return cuLinkAddFile_v2(state, type, path, count, options, values);
+}
 int cuLinkComplete(void *state, void **image, size_t *size) {
     const char *slow = getenv("MOCK_LOAD_SLEEP");
     if (slow) {
