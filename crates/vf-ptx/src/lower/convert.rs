@@ -272,46 +272,35 @@ impl<'a> Body<'a> {
     /// halves in a fresh `.b32`: the lower nibble gives the lower half. Exact: every E2M1 value is
     /// a half.
     ///
-    /// A nibble is a sign, two bits of exponent (bias 1) and one of mantissa. Its three low bits
-    /// at bits 11:9 of a half (exponent bias 15) are the same number divided by 2^14, subnormals
-    /// included; the half times 2^14, both halves in one multiplication, is the value (as for
-    /// FP8: `fp8_pair`). (An RTX 5090 gives these halves
-    /// for all 256 bytes: `tests/kernels/blackwell/ref/decode_e2m1.bin`.) With `relu`, a negative
-    /// value, minus zero included, gives +0 (`decode_e2m1_relu.bin`).
+    /// Every E2M1 magnitude `0..7` has low byte `0x00` and high byte in
+    /// `{0x00, 0x38, 0x3C, 0x3E, 0x40, 0x42, 0x44, 0x46}` (all with bit 7 clear), looked up by
+    /// `prmt.b32` without `HMUL2`. Because generic `prmt` sign-extends bit 7 of the selected byte
+    /// when selector bit 3 is set (`8..15`), `.relu` automatically clamps all negative nibbles
+    /// (including `-0.0`) to `+0.0` (`0x0000`). Without `.relu`, the magnitudes are looked up on
+    /// `bits & 0x77` and the sign bits are inserted via `prmt.b32` + `lop3.b32` (`tests/kernels/blackwell/ref/decode_e2m1{,_relu}.bin`).
     pub(super) fn e2m1_pair(&mut self, a: &str, relu: bool) -> String {
-        let [bits, sign, placed, halves, scale]: [String; 5] = self.fresh_n();
-        let widen = if self.declarations.width(a).unwrap_or(16) <= 8 {
-            "cvt.u32.u8"
+        let width = self.declarations.width(a).unwrap_or(16);
+        let bits = if width >= 32 && crate::scan::register(a).is_some() {
+            a.to_string()
         } else {
-            "cvt.u32.u16"
+            let widened = self.fresh();
+            let widen = if width <= 8 { "cvt.u32.u8" } else { "cvt.u32.u16" };
+            emit!(self, "{widen} {widened}, {a};");
+            widened
         };
-        emit!(self, "{widen} {bits}, {a};");
         if relu {
-            // A nibble whose sign is set is cleared: its sign, at bit 0 or 4, times 15.
-            let negative = self.fresh();
-            emit!(self, "shr.u32 {negative}, {bits}, 3;");
-            emit!(self, "and.b32 {negative}, {negative}, 0x11;");
-            emit!(self, "mul.lo.u32 {negative}, {negative}, 15;");
-            emit!(self, "not.b32 {negative}, {negative};");
-            emit!(self, "and.b32 {bits}, {bits}, {negative};");
+            let [m, halves]: [String; 2] = self.fresh_n();
+            emit!(self, "prmt.b32 {m}, 0x3E3C3800, 0x46444240, {bits};");
+            emit!(self, "prmt.b32 {halves}, {m}, 0, 0x1404;");
+            return halves;
         }
-        // The signs: bit 3 to bit 15 of the lower half, bit 7 to bit 15 of the upper one.
-        let [lower, upper]: [String; 2] = self.fresh_n();
-        emit!(self, "and.b32 {lower}, {bits}, 0x08;");
-        emit!(self, "shl.b32 {lower}, {lower}, 12;");
-        emit!(self, "and.b32 {upper}, {bits}, 0x80;");
-        emit!(self, "shl.b32 {upper}, {upper}, 24;");
-        emit!(self, "or.b32 {sign}, {lower}, {upper};");
-        // Exponent and mantissa: bits 2:0 to bits 11:9 of the lower half, bits 6:4 of the upper.
-        let [lower, upper]: [String; 2] = self.fresh_n();
-        emit!(self, "and.b32 {lower}, {bits}, 0x07;");
-        emit!(self, "shl.b32 {lower}, {lower}, 9;");
-        emit!(self, "and.b32 {upper}, {bits}, 0x70;");
-        emit!(self, "shl.b32 {upper}, {upper}, 21;");
-        emit!(self, "or.b32 {placed}, {lower}, {upper};");
-        emit!(self, "or.b32 {placed}, {placed}, {sign};");
-        emit!(self, "mov.b32 {scale}, 0x74007400;"); // 2^14, twice
-        emit!(self, "mul.rn.f16x2 {halves}, {placed}, {scale};");
+        let [mag, m, p, sign_even, signs, halves]: [String; 6] = self.fresh_n();
+        emit!(self, "and.b32 {mag}, {bits}, 0x77;");
+        emit!(self, "prmt.b32 {m}, 0x3E3C3800, 0x46444240, {mag};");
+        emit!(self, "prmt.b32 {p}, {m}, 0, 0x1404;");
+        emit!(self, "shl.b32 {sign_even}, {bits}, 4;");
+        emit!(self, "prmt.b32 {signs}, {sign_even}, {bits}, 0xC080;");
+        emit!(self, "lop3.b32 {halves}, {p}, {signs}, 0x80008000, 0xF8;");
         halves
     }
 

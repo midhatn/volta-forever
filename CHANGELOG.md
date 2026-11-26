@@ -1,5 +1,21 @@
 # Changes
 
+## Unreleased
+
+### Fixed
+
+- PTX, cubins and fat binaries given to the driver's linker in files (`cuLinkAddFile`, `cuLinkAddFile_v2`) went to the driver as they were, where the same bytes given in memory (`cuLinkAddData`) are adapted: on a V100, NVIDIA's driver refuses a file of PTX for sm_75 made by CUDA 13.5 (222, `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) and one of relocatable sm_75 machine code (209, `CUDA_ERROR_NO_BINARY_FOR_GPU`), and links a fat binary of sm_75 machine code and PTX into an image without its kernels. The layer now reads such a file and gives the driver's `cuLinkAddData` what it makes of it, as of the same bytes in memory; its kernels that cannot run are refused at their lookup in the image that the link makes, with their line. The driver is given the file itself when nothing in it is adapted, when it cannot be read, and when the driver refuses what the layer made of it; a file of another type (a host object, a library of them) is not read, as such an input in memory is not (pull request #18, by midhatn). What is still not carried through a link, in memory or in a file, is in `LIMITS.md` ("Kernels refused"): a kernel whose code is a trap and nothing else, and a call into a function of another input that cannot run.
+
+### Changed
+
+- FP8 `e4m3` decode and `kind::mxf8f6f4` block-scaled products lower with fewer instructions: `e4m3` pairs and quads unpack with `prmt.b32` and merge sign/NaN with `lop3.b32` (removing bit-mask shifts and `sub.u32` NaN masks, and unpacking upper `e5m2` bytes directly via `prmt.b32`), while `kind::mxf8f6f4` chains `mma.m8n8k4.row.col` (16 HMMA steps instead of 32) and folds `e4m3`'s `2^8` factor into UE8M0's exponent bias (removing `HMUL2` completely and reducing `>1-ULP` differences against the RTX 5090 vectors).
+
+### Tests
+
+- The unit tests of `vf-proxy` open no driver unless `VF_REAL_LIBCUDA` names one (they opened the machine's `libcuda.so.1`), and the report of a fault asks the driver for the library and the name of a kernel only once `cuCtxGetCurrent` succeeds: on the contributor's machine, with driver 580.196.07, a unit test ended with SIGSEGV in `cuKernelGetLibrary`, given a handle of its own before `cuInit`; `fault.rs` has a test of the guard (pull request #14, by midhatn). A program whose kernel faulted has initialized the driver: what the report says of it is the same.
+- `tests/proxy/link_refusals.py`: files given with `cuLinkAddFile` and `cuLinkAddFile_v2` (PTX, from pull request #18; a cubin and a fat binary of sm_75 machine code) reach the stand-in's linker as what the layer makes of the same bytes in memory, and their refused kernel is refused at its lookup in the image that the link makes, with its line; a file of another type, one that cannot be read, a null path and a file of which the driver refuses what the layer made go to the driver's call, and the program gets its answer. Nine changes of the hook were each seen to fail it (no check of the path, of the input type, cubins or fat binaries not adapted, an input not adapted or refused by the driver not given as a file, what was found not kept for the link, either entry point not hooked).
+- `tests/gpu/run.sh` (`link-file-*`, 232 cases): a file of PTX for sm_75, one of relocatable sm_75 machine code (built by the suite) and a fat binary, given to the driver's linker with `cuLinkAddFile` and `cuLinkAddFile_v2` (`DRVRUN_LINK` of `tests/kernels/drvrun.c`), are linked by the driver and their kernels give the host's results; the three kernels of the cubin that the translator refuses are refused at the lookup, with their line.
+
 ## 0.1.6 (2026-11-25)
 
 ### Fixed

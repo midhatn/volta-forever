@@ -554,10 +554,15 @@ products of the three type combinations, and operands from `ldmatrix`.
 A 4-bit float with 2 exponent bits (bias 1) and 1 mantissa bit. The 16 values: 0, 0.5, 1,
 1.5, 2, 3, 4, 6, and their negatives. Every value is an exact f16 half.
 
-**Conversions.** `cvt.rn.f16x2.e2m1x2` (decode): exact. The upper nibble gives the upper
-half, the lower nibble the lower half. `cvt.rn.satfinite.e2m1x2.f32` (encode): round to
-nearest, ties to even. NaN becomes +6 (the format has no NaN); values beyond +-6 become
-+-6. The `.relu` variant sets negative inputs to +0.
+**Conversions.** `cvt.rn.f16x2.e2m1x2` (decode): exact, lowered with `prmt.b32` byte
+lookup (`0x3E3C3800`, `0x46444240` for the high bytes of magnitudes `0..7`, zero low bytes)
+and `prmt.b32` + `lop3.b32` sign placement (without `HMUL2`). Because generic `prmt`
+sign-extends bit 7 (0) of those LUT bytes whenever selector bit 3 is set (`8..15`), the
+`.relu` variant clamps negative inputs including `-0.0` to `+0.0` in two `prmt.b32`
+instructions. The upper nibble gives the upper half, the lower nibble the lower half.
+`cvt.rn.satfinite.e2m1x2.f32` (encode): round to nearest, ties to even. NaN becomes +6
+(the format has no NaN); values beyond +-6 become +-6. The `.relu` variant sets negative
+inputs to +0.
 
 ### UE8M0 (unsigned 8-bit exponent)
 
@@ -616,21 +621,26 @@ sum over k in block b of A[r][k] * B[k][c]).
 
 For each block:
 
-1. E2M1 nibbles are decoded to exact halves (every E2M1 value is an f16). For E4M3 and
-   E5M2 (the MXF8F6F4 form), bytes are decoded to halves as in section 6 (with `e4m3`'s `2^8`
-   scale absorbed into UE8M0's exponent bias).
-2. The block is computed by FP16 products on Volta's `mma.m8n8k4` (`mma_f32_chain` `row.col`
-   for MXF8F6F4, 16 HMMA steps instead of 32; section 2), into an f32
-   sum that starts from zero. For `scale_vec::4X` (NVFP4), where one pair of threads of the
-   group holds a block of 16, the block's k-values are first shuffled to all four threads of
-   the group. The f32 block sum is exact for E2M1 (at most 16 * 36 = 576 for NVFP4, 1,152 for
-   the blocks of 32 of MXFP4).
-3. The block sum is multiplied by the product of the two scales, and the scaled sums of the
-   blocks are added in f64. (For NVFP4 the scales are combined and applied in f32, where
-   every such product is exact: a UE4M3 scale has few significant bits and the block sum is a
-   small integer of quarters. The sum over the blocks is in f64 for every form.)
-4. The final f64 sum is converted to f32: by truncation toward zero for `scale_vec::4X`
-   (NVFP4), by round-to-nearest-even for `scale_vec::2X` and `1X`.
+1. For FP4 (`kind::mxf4` and `kind::mxf4nvf4`), packed 32-bit E2M1 operand registers are
+   first shuffled to the split-octet `mma.m8n8k4.row.col` arrangement and then decoded in
+   place to exact f16x2 halves via the `prmt`/`lop3` lookup (8 nibbles per `.b32` word,
+   zero `HMUL2`). For E4M3 and E5M2 (`kind::mxf8f6f4`), bytes are decoded to halves as in
+   section 6 (with `e4m3`'s `2^8` scale absorbed into UE8M0's exponent bias).
+2. Each block is computed on Volta's `mma.m8n8k4` (section 2) into a zero-initialized f32
+   accumulator. Both FP4 forms use the single-instruction `mma.m8n8k4.row.col` split-octet
+   layout (8 Volta `mma.m8n8k4` instructions = 32 HMMA steps total for K=64, reducing across
+   octets with four `bfly 8` exchanges per block), and `kind::mxf8f6f4` uses `mma_f32_chain`
+   (`m8n8k4.row.col`, 16 HMMA steps instead of 32). The f32 block sum is exact for E2M1
+   (every term is a quarter, and sums reach at most 576 for NVFP4 or 1,152 for MXFP4).
+3. Each block sum is multiplied by `scale_A * scale_B` and added to the `f64` accumulator
+   (kept in split-octet layout across blocks for FP4). For NVFP4, UE4M3 scales are decoded
+   to `value * 2^-8` in f32 (exact normal values) with `* 2^16` folded once onto `scale_A` per
+   block, then combined and applied in f32 before widening to f64 (exact for the small
+   integer-of-quarters block sums); MXFP4 and MXF8F6F4 keep UE8M0 scales in f64 (with `+8`
+   per `e4m3` operand folded into UE8M0's exponent bias for MXF8F6F4).
+4. The final f64 sum is converted to f32 (truncation toward zero for `scale_vec::4X`,
+   round-to-nearest-even for `scale_vec::2X` and `1X`, `0x7fffffff` on NaN) and, for FP4,
+   gathered back to Turing's `D` layout once at the end.
 
 ### Scale distribution
 
