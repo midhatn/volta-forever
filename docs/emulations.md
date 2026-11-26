@@ -422,7 +422,8 @@ gathered from other lanes with shuffles. The B columns (eight registers, four fo
 the two columns) come from eight lanes, one shuffle each. Each sum is four `dp4a.s32.s32`
 instructions, one for each group of 4 consecutive k-elements. The two sums are interleaved: three steps of the first,
 three of the second, then the last step of each (which writes the destination register).
-The accumulator is passed through.
+The accumulator is passed through; when `d[0]` does not alias `c[1]` or `d[1]`, `.satfinite`-free
+products accumulate straight into `d` without intermediate temporary registers.
 
 Signed, unsigned and mixed forms are all supported (`dp4a.s32.s32` for signed, `.u32.u32`
 for unsigned, `.u32.s32` or `.s32.u32` for mixed). Products on 4-bit integers (`.s4`, `.u4`)
@@ -464,22 +465,23 @@ last with `add.sat.s32`.
 ### Ampere shapes: m16n8k16, m16n8k32
 
 Each is a composition of Turing products. `m16n8k16` is two Turing products (rows 0-7 and
-8-15) with the same B. `m16n8k32` is four: for each half of the rows, the first 16 columns
-then the last 16, the second accumulating on the first. The decomposition follows from the
-fragment layouts of the PTX manual.
+8-15) with the same B. `m16n8k32` is four, scheduled `(a[0], b[0])`, `(a[1], b[0])`,
+`(a[2], b[1])`, `(a[3], b[1])` (and the same order inside `.satfinite`) so all 8 shuffled
+registers of `b[0]` finish and retire before `b[1]` is gathered. The decomposition follows
+from the fragment layouts of the PTX manual.
 
 ### A operands loaded from shared memory
 
 Kernels keep many A operands in registers through long unrolled loops, four registers for
 each. When the A operand was loaded by `ldmatrix` and nothing between the load and the
 product can change the memory (no label, no store to shared memory, no call, no barrier),
-the layer keeps only the address of the row and loads the 16 bytes at each product with
-`ld.volatile.shared.v4.u32` (marked `volatile` so the compiler does not keep the result).
-This frees the four gathered registers and eliminates stack spills: the integer kernels of
-llama.cpp's q6_K format dropped from 3.95 times the native `dp4a` kernel's time to 1.88
-(measured 2026-11-16 with llama.cpp's `test-backend-ops perf`, `tests/gpu/llamacpp-ops.sh`).
-It takes `VF_ALIGNED_ROWS` on (the default, section 3); with `VF_ALIGNED_ROWS=0` the row is
-gathered by shuffles.
+the layer keeps only the address of the row. Within each immutable shared-memory segment,
+reused A registers (`>= 2` products) are promoted to cached non-volatile `ld.shared.v4.u32`
+(remembered as `Form::Row`) up to 8 concurrently live row fragments per segment (`32`
+registers), so dense MMA tiles reload each reused A fragment once while single-use or
+higher-concurrency unrolled loops (such as `q6_K`) remain `ld.volatile.shared.v4.u32` to
+avoid local-memory spills. It takes `VF_ALIGNED_ROWS` on (the default, section 3); with
+`VF_ALIGNED_ROWS=0` the row is gathered by shuffles.
 
 **Test cases.** `tests/gpu/run.sh`: `tensor-core` (integer kernels among the 37),
 `ampere` (31 kernels, 0 wrong).

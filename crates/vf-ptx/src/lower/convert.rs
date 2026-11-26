@@ -13,9 +13,20 @@ use super::types::{Element, Form, Fp8};
 impl<'a> Body<'a> {
     /// The row of A and the columns of B for one integer `mma.m8n8k16` sub-product.
     pub(super) fn byte_operands(&mut self, a: &str, b: &str) -> Result<(Vec<String>, Vec<String>), Unsupported> {
-        let row = if self.plan.row.contains(a) {
-            // The row of the thread's group, from where the `ldmatrix` found it. Volatile: the
-            // compiler must not keep the four registers from one product to the next.
+        let row = if self.plan.cached_row.contains(a) {
+            if let Some(found) = self.recall(Form::Row, &[a]) {
+                found
+            } else {
+                let address = self.row_at.get(a).cloned().ok_or_else(|| not_loaded(a))?;
+                let row: [String; 4] = self.fresh_n();
+                emit!(self, "ld.shared.v4.u32 {{{}}}, [{address}];", row.join(", "));
+                let vec = row.to_vec();
+                self.remember(Form::Row, &[a], &vec);
+                vec
+            }
+        } else if self.plan.row.contains(a) {
+            // Single-use or over-budget row: keep volatile so the compiler drops the 4 registers
+            // immediately after this product.
             let address = self.row_at.get(a).cloned().ok_or_else(|| not_loaded(a))?;
             let row: [String; 4] = self.fresh_n();
             emit!(self, "ld.volatile.shared.v4.u32 {{{}}}, [{address}];", row.join(", "));

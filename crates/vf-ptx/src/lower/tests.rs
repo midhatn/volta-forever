@@ -4149,3 +4149,116 @@ fn a_product_with_b_by_ldmatrix_trans_is_summed_on_even_and_odd_k() {
     assert_eq!(count(&paired, HALVES_F32), 4);
     assert_eq!(count(&paired, VOLTA_F32), 4);
 }
+
+#[test]
+fn ampere_m16n8k32_retires_b0_before_b1_and_accumulates_without_temps() {
+    let text = format!(
+        "{{\n\t{A_S8_K32} {{%d0, %d1, %d2, %d3}}, {{%a0, %a1, %a2, %a3}}, {{%b0, %b1}}, {{%d0, %d1, %d2, %d3}};\n\tret;\n}}"
+    );
+    let lowered = lower(&text);
+    let last_b0 = lowered.rfind(", %b0,").expect("b0 gather");
+    let first_b1 = lowered.find(", %b1,").expect("b1 gather");
+    assert!(
+        last_b0 < first_b1,
+        "b0 shuffles should finish before b1 starts:\n{lowered}"
+    );
+    let last_a1 = lowered.rfind(", %a1,").expect("a1 gather");
+    let first_a2 = lowered.find(", %a2,").expect("a2 gather");
+    assert!(last_a1 < first_a2, "a1 should finish before a2 starts:\n{lowered}");
+    for line in lowered
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("dp4a.s32.s32 "))
+    {
+        let dst = scan::split_operands(line.strip_prefix("dp4a.s32.s32 ").unwrap())[0];
+        assert!(dst.starts_with("%d"), "expected direct dp4a write to %d*, got `{line}`");
+    }
+    assert_eq!(undeclared(&lowered), Vec::<String>::new());
+
+    let sat = lower(&format!(
+        "{{\n\t{A_S8_K32}.satfinite {{%d0, %d1, %d2, %d3}}, {{%a0, %a1, %a2, %a3}}, {{%b0, %b1}}, {{%c0, %c1, %c2, %c3}};\n\tret;\n}}"
+    ));
+    let sat_last_b0 = sat.rfind(", %b0,").unwrap();
+    let sat_first_b1 = sat.find(", %b1,").unwrap();
+    assert!(
+        sat_last_b0 < sat_first_b1,
+        "satfinite should retire b0 before b1:\n{sat}"
+    );
+}
+
+#[test]
+fn reused_integer_ldmatrix_rows_are_cached_non_volatile_within_budget() {
+    let text = format!(
+        "{{\n{DECLARED}\t.reg .b32 %b<4>;\n\t{LD}.x4.b16 {{%r1, %r2, %r3, %r4}}, [%rd1];\n\
+         \t{A_S8_K32} {{%d0, %d1, %d2, %d3}}, {{%r1, %r2, %r3, %r4}}, {{%b0, %b1}}, {{%d0, %d1, %d2, %d3}};\n\
+         \t{A_S8_K32} {{%d4, %d5, %d6, %d7}}, {{%r1, %r2, %r3, %r4}}, {{%b2, %b3}}, {{%d4, %d5, %d6, %d7}};\n\tret;\n}}"
+    );
+    let lowered = lower_aligned(&text);
+    assert_eq!(count(&lowered, "ld.volatile.shared.v4.u32 "), 0, "{lowered}");
+    assert_eq!(count(&lowered, "ld.shared.v4.u32 "), 4, "{lowered}");
+    assert_eq!(count(&lowered, "dp4a.s32.s32 "), 64);
+    assert_eq!(undeclared(&lowered), Vec::<String>::new());
+
+    // Exceeding the per-segment row cache budget (e.g. 12 reused row registers > 8) caps
+    // non-volatile loads so long unrolled loops do not spill to local memory.
+    let mut many = String::from("{\n\t.reg .b32 %a<12>, %b<2>, %d<24>;\n\t.reg .b64 %rd1;\n");
+    for i in 0..3 {
+        let base = 4 * i;
+        many.push_str(&format!(
+            "\t{LD}.x4.b16 {{%a{}, %a{}, %a{}, %a{}}}, [%rd1+{}];\n",
+            base,
+            base + 1,
+            base + 2,
+            base + 3,
+            i * 64
+        ));
+    }
+    for j in 0..2 {
+        for i in 0..3 {
+            let a = 4 * i;
+            let d = 4 * (3 * j + i);
+            many.push_str(&format!(
+                "\t{A_S8_K32} {{%d{}, %d{}, %d{}, %d{}}}, {{%a{}, %a{}, %a{}, %a{}}}, {{%b0, %b1}}, {{%d{}, %d{}, %d{}, %d{}}};\n",
+                d, d + 1, d + 2, d + 3, a, a + 1, a + 2, a + 3, d, d + 1, d + 2, d + 3
+            ));
+        }
+    }
+    many.push_str("\tret;\n}");
+    let capped = lower_aligned(&many);
+    let cached = count(&capped, "ld.shared.v4.u32 ");
+    let volatile = count(&capped, "ld.volatile.shared.v4.u32 ");
+    assert!(cached > 0 && cached <= 8, "cached={cached} volatile={volatile}");
+    assert!(volatile > 0, "expected volatile fallback beyond cache budget");
+    assert_eq!(undeclared(&capped), Vec::<String>::new());
+
+    // Sequential 4x4 tile (16 reused rows across 4 non-overlapping A-fragments, peak live = 4):
+    // interval budgeting caches all 16 non-volatile loads with zero volatile reloads.
+    let mut seq = String::from("{\n\t.reg .b32 %a<16>, %b<8>, %d<64>;\n\t.reg .b64 %rd1;\n");
+    for m in 0..4 {
+        let base = 4 * m;
+        seq.push_str(&format!(
+            "\t{LD}.x4.b16 {{%a{}, %a{}, %a{}, %a{}}}, [%rd1+{}];\n",
+            base,
+            base + 1,
+            base + 2,
+            base + 3,
+            m * 64
+        ));
+    }
+    for m in 0..4 {
+        let a = 4 * m;
+        for n in 0..4 {
+            let b = 2 * n;
+            let d = 4 * (4 * m + n);
+            seq.push_str(&format!(
+                "\t{A_S8_K32} {{%d{}, %d{}, %d{}, %d{}}}, {{%a{}, %a{}, %a{}, %a{}}}, {{%b{}, %b{}}}, {{%d{}, %d{}, %d{}, %d{}}};\n",
+                d, d + 1, d + 2, d + 3, a, a + 1, a + 2, a + 3, b, b + 1, d, d + 1, d + 2, d + 3
+            ));
+        }
+    }
+    seq.push_str("\tret;\n}");
+    let seq_lowered = lower_aligned(&seq);
+    assert_eq!(count(&seq_lowered, "ld.shared.v4.u32 "), 16, "{seq_lowered}");
+    assert_eq!(count(&seq_lowered, "ld.volatile.shared.v4.u32 "), 0, "{seq_lowered}");
+    assert_eq!(undeclared(&seq_lowered), Vec::<String>::new());
+}
