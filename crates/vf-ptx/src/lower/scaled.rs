@@ -28,59 +28,56 @@ impl<'a> Body<'a> {
         self.mma_f32(d, &of_a, &of_b, c);
     }
 
-    /// The eight E2M1 nibbles of a `.b32` register as four f16x2 halves, one per byte (nibble pair).
-    /// Exact: every E2M1 value is a half. Used for the block-scaled products on E2M1.
+    /// The eight E2M1 nibbles of a `.b32` register as four f16x2 halves, one per byte (nibble pair),
+    /// using the PRMT/LOP3 LUT (`0x3E3C3800`, `0x46444240`, zero `HMUL2`).
+    /// Halves `[0]` has nibbles 0,1 (`bits 7:0`), `[1]` has 2,3 (`bits 15:8`), `[2]` has 4,5
+    /// (`bits 23:16`), `[3]` has 6,7 (`bits 31:24`).
     pub(super) fn e2m1_all_halves(&mut self, register: &str) -> Vec<String> {
+        let [mag, mag_hi, m0, m1, sign_even]: [String; 5] = self.fresh_n();
+        emit!(self, "and.b32 {mag}, {register}, 0x77777777;");
+        emit!(self, "shr.u32 {mag_hi}, {mag}, 16;");
+        emit!(self, "prmt.b32 {m0}, 0x3E3C3800, 0x46444240, {mag};");
+        emit!(self, "prmt.b32 {m1}, 0x3E3C3800, 0x46444240, {mag_hi};");
+        emit!(self, "shl.b32 {sign_even}, {register}, 4;");
         let mut halves = Vec::with_capacity(4);
-        // Extract each byte and convert its two nibbles to two halves.
-        let [byte1, byte2, byte3]: [String; 3] = self.fresh_n();
-        emit!(self, "shr.u32 {byte1}, {register}, 8;");
-        emit!(self, "shr.u32 {byte2}, {register}, 16;");
-        emit!(self, "shr.u32 {byte3}, {register}, 24;");
-        // Byte 0 (nibbles 0,1): low byte of the register.
-        halves.push(self.e2m1_pair(register, false));
-        // Byte 1 (nibbles 2,3).
-        halves.push(self.e2m1_pair(&byte1, false));
-        // Byte 2 (nibbles 4,5).
-        halves.push(self.e2m1_pair(&byte2, false));
-        // Byte 3 (nibbles 6,7).
-        halves.push(self.e2m1_pair(&byte3, false));
+        for ((m, unpack), sign_sel) in [(&m0, "0x1404"), (&m0, "0x3424"), (&m1, "0x1404"), (&m1, "0x3424")]
+            .into_iter()
+            .zip(["0xC080", "0xD090", "0xE0A0", "0xF0B0"])
+        {
+            let [p, s, h]: [String; 3] = self.fresh_n();
+            emit!(self, "prmt.b32 {p}, {m}, 0, {unpack};");
+            emit!(self, "prmt.b32 {s}, {sign_even}, {register}, {sign_sel};");
+            emit!(self, "lop3.b32 {h}, {p}, {s}, 0x80008000, 0xF8;");
+            halves.push(h);
+        }
         halves
     }
 
-    /// A UE4M3 scale byte decoded to an f32. Every UE4M3 value (at most 448) is exact in f32.
-    /// Byte 0x7f is NaN; the result is then a quiet NaN (0x7fc00000). Used for the NVFP4 path
-    /// where f64 is not needed: scale_A * scale_B * block_sum fits exactly in f32 (at most
-    /// 196 * 2304 ≈ 4.5 × 10^5 significant bits, well within f32's 2^24), and the product of
-    /// two UE4M3 scales is at most 448 * 448 = 200,704, also exact in f32 (8 significant bits).
-    pub(super) fn ue4m3_byte_f32(&mut self, register: &str, byte_offset: u32) -> String {
-        let byte = self.fresh();
-        match byte_offset {
-            0 => emit!(self, "and.b32 {byte}, {register}, 0xff;"),
-            1 => {
-                emit!(self, "shr.u32 {byte}, {register}, 8;");
-                emit!(self, "and.b32 {byte}, {byte}, 0xff;");
-            }
-            2 => {
-                emit!(self, "shr.u32 {byte}, {register}, 16;");
-                emit!(self, "and.b32 {byte}, {byte}, 0xff;");
-            }
-            3 => emit!(self, "shr.u32 {byte}, {register}, 24;"),
-            _ => unreachable!(),
-        }
+    /// A UE4M3 scale byte decoded to `value * 2^-8` (or `value` if `mul256`) as f32.
+    /// Every UE4M3 value (0 to 448) and `value * 2^-8` (`2^-17` to `1.75`) is exact and normal
+    /// (or zero) in f32; byte `0x7f` produces canonical quiet NaN (`0x7fc00000`). Keeping the
+    /// `2^-8` factor lets callers fold `2^16` once into row scale `scale_A` instead of multiplying
+    /// both `scale_A` and four `scale_B` columns by `256` per block.
+    pub(super) fn ue4m3_byte_f32(&mut self, register: &str, byte_offset: u32, mul256: bool) -> String {
         let placed = self.fresh();
         let half = self.fresh_half();
         let f32_val = self.fresh();
         self.scratch_predicate = true;
-        emit!(self, "shl.b32 {placed}, {byte}, 7;");
+        match byte_offset {
+            0 => emit!(self, "shl.b32 {placed}, {register}, 7;"),
+            1 => emit!(self, "shr.u32 {placed}, {register}, 1;"),
+            2 => emit!(self, "shr.u32 {placed}, {register}, 9;"),
+            3 => emit!(self, "shr.u32 {placed}, {register}, 17;"),
+            _ => unreachable!(),
+        }
         emit!(self, "and.b32 {placed}, {placed}, 0x3f80;"); // keep bits 13:7
         emit!(self, "cvt.u16.u32 {half}, {placed};");
         emit!(self, "cvt.f32.f16 {f32_val}, {half};");
-        emit!(self, "mul.f32 {f32_val}, {f32_val}, 0f43800000;"); // * 256
-        // Byte 0x7f (all seven bits set) is NaN: make the f32 a NaN (0x7fc00000).
-        let nan_check = self.fresh();
-        emit!(self, "and.b32 {nan_check}, {byte}, 0x7f;");
-        emit!(self, "setp.eq.u32 %vf_n, {nan_check}, 0x7f;");
+        if mul256 {
+            emit!(self, "mul.f32 {f32_val}, {f32_val}, 0f43800000;"); // * 256
+        }
+        // Byte 0x7f (all seven bits set) is NaN: placed == 0x3f80 iff low 7 bits of the byte are 1.
+        emit!(self, "setp.eq.u32 %vf_n, {placed}, 0x3f80;");
         emit!(self, "selp.b32 {f32_val}, 0x7fc00000, {f32_val}, %vf_n;");
         f32_val
     }
@@ -195,356 +192,293 @@ impl<'a> Body<'a> {
         byte_id_b: u32,
         thread_id_b: u32,
     ) {
-        let ue4m3 = kind.ue4m3_scale();
-        let n_blocks = kind.blocks();
+        if matches!(kind, ScaledKind::Mxf4 | ScaledKind::Nvf4Ue4m3x4) {
+            self.mma_block_scaled_fp4(
+                kind,
+                d,
+                a,
+                b,
+                c,
+                scale_a,
+                byte_id_a,
+                thread_id_a,
+                scale_b,
+                byte_id_b,
+                thread_id_b,
+            );
+            return;
+        }
+        let ScaledKind::Mxf8f6f4(a_type, b_type) = kind else {
+            unreachable!();
+        };
 
-        // Get the scale registers from the designated threads.
-        //
-        // scale_A: the PTX manual says thread_id_a selects one thread-pair in the quad.
-        // thread_id_a=0 -> lanes with lane%4 in {0,1}; thread_id_a=1 -> {2,3}.
-        // The first thread of the pair provides the scale for rows 0..7 (the lower half of
-        // the M=16 matrix), the second for rows 8..15 (measured on an RTX 5090).
-        // The D registers d0,d1 correspond to the lower rows, d2,d3 to the upper.
         let sa_lower_thread = if thread_id_a == 0 { 0 } else { 2 };
         let sa_upper_thread = sa_lower_thread + 1;
         let sa_lower_reg = self.shuffle(scale_a, Lane::InGroup(sa_lower_thread));
         let sa_upper_reg = self.shuffle(scale_a, Lane::InGroup(sa_upper_thread));
-
-        // scale_B: thread_id_b selects one thread in each quad. A thread at position t in its
-        // group holds D[row][2t] and D[row][2t+1]. The scale_B for column c comes from lane
-        // c*4+thread_id_b (group c's designated thread). For the two columns this thread serves:
-        //   column 2t: group 2t, lane 8t+thread_id_b = InPair(thread_id_b)
-        //   column 2t+1: group 2t+1, lane 8t+4+thread_id_b = InPair(4+thread_id_b)
         let sb_col0_reg = self.shuffle(scale_b, Lane::InPair(thread_id_b));
         let sb_col1_reg = self.shuffle(scale_b, Lane::InPair(4 + thread_id_b));
 
-        let byte_offset = |n_blocks: usize, byte_id: u32, block: u32| -> u32 {
-            match n_blocks {
-                1 => byte_id,         // scale_vec::1X
-                2 => byte_id + block, // scale_vec::2X: byte pair starting at byte_id
-                4 => block,           // scale_vec::4X: all four bytes
-                _ => unreachable!(),
-            }
-        };
-
-        // For UE4M3 (NVFP4): decode scales to f32 and combine in f32 (exact: the product of
-        // two UE4M3 values has at most 8 significant bits, within f32's 24). The f32 combined
-        // scale multiplied by the block sum (at most 2^19 significant bits) is also exact.
-        // The result is converted to f64 for the accumulation across blocks.
-        //
-        // For UE8M0: scales stay in f64 (products can reach 2^254, which overflows f32).
-        //
-        // `combined` holds f64 values for UE8M0 and f32 values for UE4M3, stored as strings.
-        // The match arms below use the right arithmetic.
-        enum CombinedScale {
-            F64(Vec<[String; 4]>),
-            F32(Vec<[String; 4]>),
+        let scale_a_lower_f64 = self.scale_byte_f64(&sa_lower_reg, byte_id_a, false);
+        let scale_a_upper_f64 = self.scale_byte_f64(&sa_upper_reg, byte_id_a, false);
+        let scale_b_col0_f64 = self.scale_byte_f64(&sb_col0_reg, byte_id_b, false);
+        let scale_b_col1_f64 = self.scale_byte_f64(&sb_col1_reg, byte_id_b, false);
+        let mut combined_f64: [String; 4] = Default::default();
+        for (i, (sa, sb)) in [
+            (&scale_a_lower_f64, &scale_b_col0_f64),
+            (&scale_a_lower_f64, &scale_b_col1_f64),
+            (&scale_a_upper_f64, &scale_b_col0_f64),
+            (&scale_a_upper_f64, &scale_b_col1_f64),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let comb = self.fresh_wide();
+            emit!(self, "mul.f64 {comb}, {sa}, {sb};");
+            combined_f64[i] = comb;
         }
 
-        let combined = if ue4m3 {
-            // Decode scale bytes to f32.
-            let sa_lower_f32: Vec<String> = (0..n_blocks as u32)
-                .map(|block| self.ue4m3_byte_f32(&sa_lower_reg, byte_offset(n_blocks, byte_id_a, block)))
-                .collect();
-            let sa_upper_f32: Vec<String> = (0..n_blocks as u32)
-                .map(|block| self.ue4m3_byte_f32(&sa_upper_reg, byte_offset(n_blocks, byte_id_a, block)))
-                .collect();
-            let sb_col0_f32: Vec<String> = (0..n_blocks as u32)
-                .map(|block| self.ue4m3_byte_f32(&sb_col0_reg, byte_offset(n_blocks, byte_id_b, block)))
-                .collect();
-            let sb_col1_f32: Vec<String> = (0..n_blocks as u32)
-                .map(|block| self.ue4m3_byte_f32(&sb_col1_reg, byte_offset(n_blocks, byte_id_b, block)))
-                .collect();
-            CombinedScale::F32(
-                (0..n_blocks)
-                    .map(|block| {
-                        let mut cs: [String; 4] = Default::default();
-                        for (i, (sa, sb)) in [
-                            (&sa_lower_f32[block], &sb_col0_f32[block]),
-                            (&sa_lower_f32[block], &sb_col1_f32[block]),
-                            (&sa_upper_f32[block], &sb_col0_f32[block]),
-                            (&sa_upper_f32[block], &sb_col1_f32[block]),
-                        ]
-                        .iter()
-                        .enumerate()
-                        {
-                            let c = self.fresh();
-                            emit!(self, "mul.f32 {c}, {sa}, {sb};");
-                            cs[i] = c;
-                        }
-                        cs
-                    })
-                    .collect(),
-            )
-        } else {
-            // Decode scale bytes to f64.
-            let scale_a_lower_f64: Vec<String> = (0..n_blocks as u32)
-                .map(|block| self.scale_byte_f64(&sa_lower_reg, byte_offset(n_blocks, byte_id_a, block), false))
-                .collect();
-            let scale_a_upper_f64: Vec<String> = (0..n_blocks as u32)
-                .map(|block| self.scale_byte_f64(&sa_upper_reg, byte_offset(n_blocks, byte_id_a, block), false))
-                .collect();
-            let scale_b_col0_f64: Vec<String> = (0..n_blocks as u32)
-                .map(|block| self.scale_byte_f64(&sb_col0_reg, byte_offset(n_blocks, byte_id_b, block), false))
-                .collect();
-            let scale_b_col1_f64: Vec<String> = (0..n_blocks as u32)
-                .map(|block| self.scale_byte_f64(&sb_col1_reg, byte_offset(n_blocks, byte_id_b, block), false))
-                .collect();
-            CombinedScale::F64(
-                (0..n_blocks)
-                    .map(|block| {
-                        let mut cs: [String; 4] = Default::default();
-                        for (i, (sa, sb)) in [
-                            (&scale_a_lower_f64[block], &scale_b_col0_f64[block]),
-                            (&scale_a_lower_f64[block], &scale_b_col1_f64[block]),
-                            (&scale_a_upper_f64[block], &scale_b_col0_f64[block]),
-                            (&scale_a_upper_f64[block], &scale_b_col1_f64[block]),
-                        ]
-                        .iter()
-                        .enumerate()
-                        {
-                            let c = self.fresh_wide();
-                            emit!(self, "mul.f64 {c}, {sa}, {sb};");
-                            cs[i] = c;
-                        }
-                        cs
-                    })
-                    .collect(),
-            )
-        };
-
-        // The accumulators in f64, starting from C (converted from f32).
         let sums: Vec<String> = (0..4).map(|_| self.fresh_wide()).collect();
         for (i, sum) in sums.iter().enumerate() {
             emit!(self, "cvt.f64.f32 {sum}, {};", c[i]);
         }
 
-        // For each block: run the half-precision products into a temporary f32 accumulator, convert
-        // to f64, multiply by the combined scale (f64 for UE8M0, f32 for UE4M3), and add to the f64
-        // accumulator.
-        match kind {
-            ScaledKind::Mxf4 => {
-                let combined_f64 = match &combined {
-                    CombinedScale::F64(v) => v,
-                    _ => unreachable!("Mxf4 always uses UE8M0 (f64 scales)"),
-                };
-                for block in 0..2 {
-                    self.e2m1_block_product_scaled_f64(
-                        a[2 * block],
-                        a[2 * block + 1],
-                        b[block],
-                        &combined_f64[block],
-                        &sums,
-                    );
-                }
-            }
-            ScaledKind::Nvf4Ue4m3x4 => {
-                let combined_f32 = match &combined {
-                    CombinedScale::F32(v) => v,
-                    _ => unreachable!("Nvf4 always uses UE4M3 (f32 scales)"),
-                };
-                // For scale_vec::4X, a block of 16 k-elements is held by ONE thread pair of the
-                // group (measured on an RTX 5090: probe_block_map). To run Volta's products on
-                // one block alone, the block's k-values are shuffled from the two source threads
-                // to all four, then one m16n8k8 FP16 product (= two m8n8k4) gives the block's
-                // sum. The sum is exact in f32 for E2M1 (at most 16*36 = 576, 10 bits).
-                //
-                // Three optimisations over the first pass:
-                //
-                // 1. **Shared decoding.** Blocks 0,1 share register pair 0; blocks 2,3 share
-                //    register pair 1. The E2M1 nibbles are decoded once per register pair (12
-                //    f16x2 halves instead of 24). The decoded values on each thread are then
-                //    shuffled to the destinations of each block.
-                //
-                // 2. **Two-way selection.** The pair offset within the source's 4 halves is
-                //    `(thread_in_group & 1) * 2`: 0 for even threads, 2 for odd. A single
-                //    predicate computed once replaces the 4-way runtime pick (3 setp + 3 selp
-                //    per value → 1 selp per value).
-                //
-                // 3. **f32 scale arithmetic.** For UE4M3 scales (max 448), the product
-                //    scale_A × scale_B × block_sum fits exactly in f32: the integer part of the
-                //    product is at most 14 × 14 × 2304 = 451,584 < 2^19, which is within f32's
-                //    24-bit mantissa. The f32 scaled sum is converted to f64 exactly for the
-                //    accumulation across blocks, which stays in f64 and is truncated to f32 at
-                //    the end (the same as before).
-                //
-                // Block b: source_pair = b & 1, reg_pair = b >> 1.
-                let thread = self.lane(Lane::Thread);
-                let group_start = self.lane(Lane::GroupStart);
-
-                // Thread parity predicate (computed once): odd threads take halves 2,3; even 0,1.
-                self.scratch_predicate = true;
-                let odd_bit = self.fresh();
-                emit!(self, "and.b32 {odd_bit}, {thread}, 1;");
-                emit!(self, "setp.ne.u32 %vf_n, {odd_bit}, 0;");
-                // Save the predicate in a named register so it can be reused across blocks.
-                let odd_pred = self.fresh();
-                emit!(self, "selp.b32 {odd_pred}, 1, 0, %vf_n;");
-
-                // Source lane base: group_start + (thread >> 1 & 1). Both source pairs add 0 or 2
-                // to this. Computed once.
-                let half_thread = self.fresh();
-                emit!(self, "shr.u32 {half_thread}, {thread}, 1;");
-                emit!(self, "and.b32 {half_thread}, {half_thread}, 1;");
-                // src_lane_pair0 = group_start + half_thread (source pair 0: threads 0,1)
-                let src_pair0 = self.fresh();
-                emit!(self, "or.b32 {src_pair0}, {group_start}, {half_thread};");
-                // src_lane_pair1 = src_pair0 + 2 (source pair 1: threads 2,3)
-                let src_pair1 = self.fresh();
-                emit!(self, "add.u32 {src_pair1}, {src_pair0}, 2;");
-
-                let src_lanes = [&src_pair0, &src_pair1];
-
-                // Helper: shuffle 4 halves from a source lane, then select 2 based on thread parity.
-                // Returns [out0, out1]: even threads get halves[0,1], odd threads get halves[2,3].
-                let shuffle_and_select = |body: &mut Self, halves: &[String], src_lane: &str| -> [String; 2] {
-                    // Shuffle all 4 from the source.
-                    let shuffled: Vec<String> = (0..4)
-                        .map(|i| {
-                            let d = body.fresh();
-                            emit!(body, "shfl.sync.idx.b32 {d}, {}, {src_lane}, 31, -1;", halves[i]);
-                            body.shuffles += 1;
-                            d
-                        })
-                        .collect();
-                    // Select: even thread → [0,1], odd thread → [2,3].
-                    body.scratch_predicate = true;
-                    let out0 = body.fresh();
-                    let out1 = body.fresh();
-                    emit!(body, "setp.ne.u32 %vf_n, {odd_pred}, 0;");
-                    emit!(body, "selp.b32 {out0}, {}, {}, %vf_n;", shuffled[2], shuffled[0]);
-                    emit!(body, "selp.b32 {out1}, {}, {}, %vf_n;", shuffled[3], shuffled[1]);
-                    [out0, out1]
-                };
-
-                // Process each register pair: decode once, run both blocks.
-                for reg_pair in 0..2 {
-                    let a_upper_halves = self.e2m1_all_halves(a[2 * reg_pair]);
-                    let a_lower_halves = self.e2m1_all_halves(a[2 * reg_pair + 1]);
-                    let b_halves = self.e2m1_all_halves(b[reg_pair]);
-
-                    for (source_pair, src_lane) in src_lanes.iter().enumerate() {
-                        let block = reg_pair * 2 + source_pair;
-
-                        let [au0, au1] = shuffle_and_select(self, &a_upper_halves, src_lane);
-                        let [al0, al1] = shuffle_and_select(self, &a_lower_halves, src_lane);
-                        let [bv0, bv1] = shuffle_and_select(self, &b_halves, src_lane);
-
-                        let of_a: Vec<&str> = vec![&au0, &al0, &au1, &al1].into_iter().map(String::as_str).collect();
-                        let of_b: Vec<&str> = vec![bv0.as_str(), bv1.as_str()];
-
-                        // Products into a temporary f32 accumulator.
-                        let block_sums: Vec<String> = (0..4).map(|_| self.fresh()).collect();
-                        for s in &block_sums {
-                            emit!(self, "mov.b32 {s}, 0f00000000;");
-                        }
-                        let bsn: Vec<&str> = block_sums.iter().map(String::as_str).collect();
-                        self.mma_f32(&bsn, &of_a, &of_b, &bsn);
-
-                        // Scale in f32 (exact for UE4M3: see ue4m3_byte_f32), then to f64 for
-                        // accumulation.
-                        for i in 0..4 {
-                            let scaled = self.fresh();
-                            emit!(self, "mul.f32 {scaled}, {}, {};", block_sums[i], combined_f32[block][i]);
-                            let f64_scaled = self.fresh_wide();
-                            emit!(self, "cvt.f64.f32 {f64_scaled}, {scaled};");
-                            emit!(self, "add.f64 {}, {}, {f64_scaled};", sums[i], sums[i]);
-                        }
-                    }
-                }
-            }
-            ScaledKind::Mxf8f6f4(a_type, b_type) => {
-                let combined_f64 = match &combined {
-                    CombinedScale::F64(v) => v,
-                    _ => unreachable!("Mxf8f6f4 always uses UE8M0 (f64 scales)"),
-                };
-                let block_sums: Vec<String> = (0..4).map(|_| self.fresh()).collect();
-                for sum in &block_sums {
-                    emit!(self, "mov.b32 {sum}, 0f00000000;");
-                }
-                let block_sum_names: Vec<&str> = block_sums.iter().map(String::as_str).collect();
-                let mut of_a = Vec::new();
-                for rows in a.chunks(2) {
-                    let (upper, lower) = (self.fp8_halves(a_type, rows[0]), self.fp8_halves(a_type, rows[1]));
-                    of_a.extend([upper[0].clone(), lower[0].clone(), upper[1].clone(), lower[1].clone()]);
-                }
-                let of_b: Vec<String> = b.iter().flat_map(|b_reg| self.fp8_halves(b_type, b_reg)).collect();
-                let (of_a_refs, of_b_refs): (Vec<&str>, Vec<&str>) = (
-                    of_a.iter().map(String::as_str).collect(),
-                    of_b.iter().map(String::as_str).collect(),
-                );
-                self.mma_f32(&block_sum_names, &of_a_refs, &of_b_refs, &block_sum_names);
-                // Convert the f32 block sums to f64, multiply by the combined scale, and add.
-                for i in 0..4 {
-                    let f64_sum = self.fresh_wide();
-                    emit!(self, "cvt.f64.f32 {f64_sum}, {};", block_sums[i]);
-                    let scaled = self.fresh_wide();
-                    emit!(self, "mul.f64 {scaled}, {f64_sum}, {};", combined_f64[0][i]);
-                    emit!(self, "add.f64 {}, {}, {scaled};", sums[i], sums[i]);
-                }
-            }
+        let block_sums: Vec<String> = (0..4).map(|_| self.fresh()).collect();
+        for sum in &block_sums {
+            emit!(self, "mov.b32 {sum}, 0f00000000;");
+        }
+        let block_sum_names: Vec<&str> = block_sums.iter().map(String::as_str).collect();
+        let mut of_a = Vec::new();
+        for rows in a.chunks(2) {
+            let (upper, lower) = (self.fp8_halves(a_type, rows[0]), self.fp8_halves(a_type, rows[1]));
+            of_a.extend([upper[0].clone(), lower[0].clone(), upper[1].clone(), lower[1].clone()]);
+        }
+        let of_b: Vec<String> = b.iter().flat_map(|b_reg| self.fp8_halves(b_type, b_reg)).collect();
+        let (of_a_refs, of_b_refs): (Vec<&str>, Vec<&str>) = (
+            of_a.iter().map(String::as_str).collect(),
+            of_b.iter().map(String::as_str).collect(),
+        );
+        self.mma_f32(&block_sum_names, &of_a_refs, &of_b_refs, &block_sum_names);
+        for i in 0..4 {
+            let f64_sum = self.fresh_wide();
+            emit!(self, "cvt.f64.f32 {f64_sum}, {};", block_sums[i]);
+            let scaled = self.fresh_wide();
+            emit!(self, "mul.f64 {scaled}, {f64_sum}, {};", combined_f64[i]);
+            emit!(self, "add.f64 {}, {}, {scaled};", sums[i], sums[i]);
         }
 
-        // Convert the f64 accumulators to f32: truncation toward zero for four scales (matches the
-        // hardware on all of 36,352 results of the vectors), round to nearest even for two or one
-        // (the better of the two for them; the hardware's accumulator is wider than f32 and its
-        // rounding is neither: `docs/emulations.md`, "Block-scaled products"). A NaN scale gives a NaN sum; the result
-        // is then the pattern 0x7fffffff that the hardware returns.
-        let rounding = if n_blocks == 4 { "rz" } else { "rn" };
         for name in d {
             self.written(name);
         }
         self.scratch_predicate = true;
         for (i, name) in d.iter().enumerate() {
             let f32_val = self.fresh();
-            emit!(self, "cvt.{rounding}.f32.f64 {f32_val}, {};", sums[i]);
-            // If the f64 sum is NaN, write 0x7fffffff (the hardware's NaN pattern for a NaN scale).
+            emit!(self, "cvt.rn.f32.f64 {f32_val}, {};", sums[i]);
             emit!(self, "setp.nan.f64 %vf_n, {}, {};", sums[i], sums[i]);
             emit!(self, "selp.b32 {f32_val}, 0x7fffffff, {f32_val}, %vf_n;");
             emit!(self, "mov.b32 {name}, {f32_val};");
         }
     }
 
-    /// Run the FP16 tensor-core products for one block of 32 E2M1 k-elements (8 nibbles per
-    /// register = 4 f16x2 pairs) into a temporary f32 accumulator, convert to f64, multiply by
-    /// the combined f64 scale, and add to `sums` (f64 accumulators).
-    pub(super) fn e2m1_block_product_scaled_f64(
+    /// Block-scaled FP4 (`kind::mxf4` and `kind::mxf4nvf4`) in the single-instruction split-octet
+    /// `mma.m8n8k4.row.col` arrangement:
+    /// - Packed E2M1 registers are shuffled before decoding (one 32-bit shuffle instead of four
+    ///   decoded halves, cutting NVFP4 operand shuffles from 88 to 12 and eliminating `columns`),
+    /// - Each 8-nibble register is decoded in place via `e2m1_all_halves` (PRMT/LOP3 LUT, 0 `HMUL2`),
+    /// - Only 8 `mma.m8n8k4.row.col` instructions (= 32 Volta HMMA steps) execute instead of 16
+    ///   (= 64 HMMA steps), because E2M1 block sums fit exactly in f32 (<= 1152 as multiples of 0.25),
+    /// - The f64 accumulator stays in split-octet layout across all blocks and converts back to
+    ///   Turing `d[0..4]` once at the end via `Lane::ChainOut`.
+    #[allow(clippy::too_many_arguments)]
+    fn mma_block_scaled_fp4(
         &mut self,
-        a_upper: &str, // row groupID, 8 nibbles
-        a_lower: &str, // row groupID+8, 8 nibbles
-        b_reg: &str,   // 8 nibbles
-        scales: &[String; 4],
-        sums: &[String],
+        kind: ScaledKind,
+        d: &[&str],
+        a: &[&str],
+        b: &[&str],
+        c: &[&str],
+        scale_a: &str,
+        byte_id_a: u32,
+        thread_id_a: u32,
+        scale_b: &str,
+        byte_id_b: u32,
+        thread_id_b: u32,
     ) {
-        let a_upper_halves = self.e2m1_all_halves(a_upper);
-        let a_lower_halves = self.e2m1_all_halves(a_lower);
-        let b_halves = self.e2m1_all_halves(b_reg);
-        let mut of_a = Vec::with_capacity(8);
-        for i in 0..4 {
-            of_a.push(a_upper_halves[i].clone());
-            of_a.push(a_lower_halves[i].clone());
+        let ue4m3 = kind.ue4m3_scale();
+        let n_blocks = kind.blocks();
+
+        // Scale registers in split-octet layout `S`: one row (`sa_reg`) and four columns (`sb_regs`).
+        let sa_reg = self.shuffle(scale_a, Lane::ScaledSa(thread_id_a));
+        let sb_regs: [String; 4] =
+            std::array::from_fn(|col_idx| self.shuffle(scale_b, Lane::ScaledSb(col_idx as u32, thread_id_b)));
+
+        let byte_offset_a = |block: u32| -> u32 { if n_blocks == 2 { byte_id_a + block } else { block } };
+        let byte_offset_b = |block: u32| -> u32 { if n_blocks == 2 { byte_id_b + block } else { block } };
+
+        // Initialize the 4 f64 accumulators in split-octet layout (ordered as `2 * parity + b1`).
+        let is_rh1 = self.lane(Lane::Has(4));
+        let sums: [String; 4] = std::array::from_fn(|_| self.fresh_wide());
+        if c.iter().all(|name| self.zeros.contains(*name)) {
+            for sum in &sums {
+                emit!(self, "mov.f64 {sum}, 0d0000000000000000;");
+            }
+        } else {
+            let c_lanes = [self.lane(Lane::ScaledC(0)), self.lane(Lane::ScaledC(1))];
+            for parity in 0..2 {
+                for (b1, c_lane) in c_lanes.iter().enumerate() {
+                    let idx = 2 * parity + b1;
+                    let [from_rh0, from_rh1, chosen]: [String; 3] = self.fresh_n();
+                    emit!(self, "shfl.sync.idx.b32 {from_rh0}, {}, {c_lane}, 31, -1;", c[parity],);
+                    self.shuffles += 1;
+                    emit!(
+                        self,
+                        "shfl.sync.idx.b32 {from_rh1}, {}, {c_lane}, 31, -1;",
+                        c[2 + parity],
+                    );
+                    self.shuffles += 1;
+                    emit!(self, "selp.b32 {chosen}, {from_rh1}, {from_rh0}, {is_rh1};");
+                    emit!(self, "cvt.f64.f32 {}, {chosen};", sums[idx]);
+                }
+            }
         }
-        let block_sums: Vec<String> = (0..4).map(|_| self.fresh()).collect();
-        for sum in &block_sums {
-            emit!(self, "mov.b32 {sum}, 0f00000000;");
+
+        // One zero register repeated across the 8 C slots compiles directly to RZ in HMMA.
+        let zero_f32 = self.fresh();
+        emit!(self, "mov.b32 {zero_f32}, 0f00000000;");
+        let zero_c = [zero_f32.as_str(); 8].join(", ");
+        let upper = self.lane(Lane::Has(8));
+
+        for block in 0..n_blocks {
+            let steps: Vec<(String, String, String, String)> = match kind {
+                ScaledKind::Nvf4Ue4m3x4 => {
+                    let reg_pair = block >> 1;
+                    let src = Lane::Nvf4Src((block & 1) as u32);
+                    let au_shuf = self.shuffle(a[2 * reg_pair], src);
+                    let al_shuf = self.shuffle(a[2 * reg_pair + 1], src);
+                    let b_shuf = self.shuffle(b[reg_pair], src);
+                    let a_sel = self.fresh();
+                    emit!(self, "selp.b32 {a_sel}, {al_shuf}, {au_shuf}, {is_rh1};");
+                    let ah = self.e2m1_all_halves(&a_sel);
+                    let bh = self.e2m1_all_halves(&b_shuf);
+                    vec![
+                        (ah[0].clone(), ah[2].clone(), bh[0].clone(), bh[2].clone()),
+                        (ah[1].clone(), ah[3].clone(), bh[1].clone(), bh[3].clone()),
+                    ]
+                }
+                ScaledKind::Mxf4 => {
+                    let au_w0 = self.shuffle(a[2 * block], Lane::ChainW0);
+                    let al_w0 = self.shuffle(a[2 * block + 1], Lane::ChainW0);
+                    let a_w0 = self.fresh();
+                    emit!(self, "selp.b32 {a_w0}, {al_w0}, {au_w0}, {is_rh1};");
+
+                    let au_w1 = self.shuffle(a[2 * block], Lane::ChainW1);
+                    let al_w1 = self.shuffle(a[2 * block + 1], Lane::ChainW1);
+                    let a_w1 = self.fresh();
+                    emit!(self, "selp.b32 {a_w1}, {al_w1}, {au_w1}, {is_rh1};");
+
+                    let b_w0 = self.shuffle(b[block], Lane::ChainW0);
+                    let b_w1 = self.shuffle(b[block], Lane::ChainW1);
+
+                    let ah0 = self.e2m1_all_halves(&a_w0);
+                    let ah1 = self.e2m1_all_halves(&a_w1);
+                    let bh0 = self.e2m1_all_halves(&b_w0);
+                    let bh1 = self.e2m1_all_halves(&b_w1);
+                    (0..4)
+                        .map(|s| (ah0[s].clone(), ah1[s].clone(), bh0[s].clone(), bh1[s].clone()))
+                        .collect()
+                }
+                _ => unreachable!(),
+            };
+
+            let mut bs: [String; 8] = self.fresh_n();
+            for (step, (aw0, aw1, bw0, bw1)) in steps.into_iter().enumerate() {
+                let (c_ops, next_bs): (String, [String; 8]) = if step == 0 {
+                    (zero_c.clone(), bs)
+                } else {
+                    (bs.join(", "), self.fresh_n())
+                };
+                emit!(
+                    self,
+                    "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {{{}}}, {{{aw0}, {aw1}}}, {{{bw0}, {bw1}}}, {{{c_ops}}};",
+                    next_bs.join(", "),
+                );
+                bs = next_bs;
+            }
+
+            // Combine k_half=0 and k_half=1 across lanes S and S^8 (index: 2 * parity + b1).
+            let mut block_sums = Vec::with_capacity(4);
+            for parity in 0..2 {
+                for b1 in 0..2 {
+                    let (low, high) = (&bs[parity + 4 * b1], &bs[parity + 4 * b1 + 2]);
+                    let [mine, given, sum]: [String; 3] = self.fresh_n();
+                    emit!(self, "selp.b32 {mine}, {high}, {low}, {upper};");
+                    emit!(self, "selp.b32 {given}, {low}, {high}, {upper};");
+                    let theirs = self.exchange(&given, 8);
+                    emit!(self, "add.f32 {sum}, {mine}, {theirs};");
+                    block_sums.push(sum);
+                }
+            }
+
+            if ue4m3 {
+                let sa_raw = self.ue4m3_byte_f32(&sa_reg, byte_offset_a(block as u32), false);
+                let sa_f32 = self.fresh();
+                emit!(self, "mul.f32 {sa_f32}, {sa_raw}, 0f47800000;"); // * 2^16 cancels two 2^-8s
+                for i in 0..4 {
+                    let sb_f32 = self.ue4m3_byte_f32(&sb_regs[i], byte_offset_b(block as u32), false);
+                    let comb = self.fresh();
+                    emit!(self, "mul.f32 {comb}, {sa_f32}, {sb_f32};");
+                    let scaled = self.fresh();
+                    emit!(self, "mul.f32 {scaled}, {}, {comb};", block_sums[i]);
+                    let f64_scaled = self.fresh_wide();
+                    emit!(self, "cvt.f64.f32 {f64_scaled}, {scaled};");
+                    emit!(self, "add.f64 {}, {}, {f64_scaled};", sums[i], sums[i]);
+                }
+            } else {
+                let sa_f64 = self.scale_byte_f64(&sa_reg, byte_offset_a(block as u32), false);
+                for i in 0..4 {
+                    let sb_f64 = self.scale_byte_f64(&sb_regs[i], byte_offset_b(block as u32), false);
+                    let comb = self.fresh_wide();
+                    emit!(self, "mul.f64 {comb}, {sa_f64}, {sb_f64};");
+                    let f64_sum = self.fresh_wide();
+                    emit!(self, "cvt.f64.f32 {f64_sum}, {};", block_sums[i]);
+                    let scaled = self.fresh_wide();
+                    emit!(self, "mul.f64 {scaled}, {f64_sum}, {comb};");
+                    emit!(self, "add.f64 {}, {}, {scaled};", sums[i], sums[i]);
+                }
+            }
+            self.split();
         }
-        let block_sum_names: Vec<&str> = block_sums.iter().map(String::as_str).collect();
-        let (of_a_refs, of_b_refs): (Vec<&str>, Vec<&str>) = (
-            of_a.iter().map(String::as_str).collect(),
-            b_halves.iter().map(String::as_str).collect(),
-        );
-        // The products of E2M1 values on Volta's tensor cores are exact in f32: each product is at
-        // most 36 (6*6) and there are at most 32 of them in a block, so the sum is at most 1152, an
-        // integer with 11 bits, well within f32's 24-bit mantissa. The existing FP16 tensor-core
-        // path adds four terms at a time (m8n8k4) with RNE, which is exact for these values.
-        self.mma_f32(&block_sum_names, &of_a_refs, &of_b_refs, &block_sum_names);
-        // Convert each f32 block sum to f64, multiply by the combined f64 scale, and add.
-        for i in 0..4 {
-            let f64_sum = self.fresh_wide();
-            emit!(self, "cvt.f64.f32 {f64_sum}, {};", block_sums[i]);
-            let scaled = self.fresh_wide();
-            emit!(self, "mul.f64 {scaled}, {f64_sum}, {};", scales[i]);
-            emit!(self, "add.f64 {}, {}, {scaled};", sums[i], sums[i]);
+
+        // Convert to f32 in S with the required rounding and NaN handling, then scatter to Turing D.
+        let rounding = if n_blocks == 4 { "rz" } else { "rn" };
+        self.scratch_predicate = true;
+        let f32_sums: [String; 4] = std::array::from_fn(|i| {
+            let f32_val = self.fresh();
+            emit!(self, "cvt.{rounding}.f32.f64 {f32_val}, {};", sums[i]);
+            emit!(self, "setp.nan.f64 %vf_n, {}, {};", sums[i], sums[i]);
+            emit!(self, "selp.b32 {f32_val}, 0x7fffffff, {f32_val}, %vf_n;");
+            f32_val
+        });
+
+        let from = [self.lane(Lane::ChainOut(false)), self.lane(Lane::ChainOut(true))];
+        let second = self.lane(Lane::Has(2));
+        for name in d {
+            self.written(name);
         }
+        for (j, name) in d.iter().enumerate() {
+            let pair = [0, 1].map(|b1| {
+                let fetched = self.fresh();
+                emit!(
+                    self,
+                    "shfl.sync.idx.b32 {fetched}, {}, {}, 31, -1;",
+                    f32_sums[2 * (j & 1) + b1],
+                    from[j >> 1]
+                );
+                self.shuffles += 1;
+                fetched
+            });
+            emit!(self, "selp.b32 {name}, {}, {}, {second};", pair[1], pair[0]);
+        }
+        self.split();
     }
 }
