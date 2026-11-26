@@ -286,6 +286,41 @@ def check(proxy, mock):
         c.c_void_p.in_dll(backend, "linked").value = c.addressof(fifth_linked)
         marked_everywhere(api, tmp, refusal_note.mark(output, [("bad", "bad", "an instruction without a Volta sequence")]))
 
+    # Through cuLinkAddFile and cuLinkAddFile_v2 on a PTX file: adapted for this GPU, with refused
+    # kernels withheld after cuLinkComplete and forwarding via cuLinkAddData[_v2] (not raw cuLinkAddFile).
+    with tempfile.TemporaryDirectory() as tmp:
+        ptx_file = Path(tmp) / "bad_file.ptx"
+        ptx_file.write_bytes(PTX)
+        encoded = os.fsencode(ptx_file)
+        for add_file in (api.cuLinkAddFile, api.cuLinkAddFile_v2):
+            seventh = bytearray(output)
+            seventh[len(seventh) // 7] ^= 0xff
+            seventh_linked = c.create_string_buffer(bytes(seventh), len(seventh))
+            c.c_void_p.in_dll(backend, "linked").value = c.addressof(seventh_linked)
+            before_files = c.c_uint.in_dll(backend, "file_inputs").value
+            assert api.cuLinkCreate_v2(0, None, None, c.byref(state)) == 0
+            assert add_file(state, INPUT_PTX, encoded, 0, None, None) == 0
+            assert c.c_uint.in_dll(backend, "file_inputs").value == before_files, add_file.__name__
+            assert c.c_char_p(c.addressof(c.c_char.in_dll(backend, "seen_target"))).value == b".target sm_70"
+            assert api.cuLinkComplete(state, c.byref(image), c.byref(size)) == 0
+            assert lookup(api, load(api, image), b"bad") == (218, None)
+            assert lookup(api, load(api, image), b"good")[0] == 0
+            assert api.cuLinkDestroy(state) == 0
+        # CU_JIT_TARGET forwarding (sm_70 adapted via cuLinkAddData_v2; sm_90 passed as file untouched)
+        for target, expected, delta_files in ((70, b".target sm_70", 0), (90, b".target sm_75", 1)):
+            options, values = (c.c_int * 1)(9), (c.c_void_p * 1)(target)
+            before_files = c.c_uint.in_dll(backend, "file_inputs").value
+            assert api.cuLinkCreate_v2(1, options, values, c.byref(state)) == 0
+            assert api.cuLinkAddFile_v2(state, INPUT_PTX, encoded, 0, None, None) == 0
+            assert c.c_uint.in_dll(backend, "file_inputs").value == before_files + delta_files, target
+            assert c.c_char_p(c.addressof(c.c_char.in_dll(backend, "seen_target"))).value == expected, target
+            assert api.cuLinkDestroy(state) == 0
+        before_files = c.c_uint.in_dll(backend, "file_inputs").value
+        assert api.cuLinkCreate_v2(0, None, None, c.byref(state)) == 0
+        assert api.cuLinkAddFile_v2(state, INPUT_PTX, b"/nonexistent_vf_link_test.ptx", 0, None, None) == 0
+        assert c.c_uint.in_dll(backend, "file_inputs").value == before_files + 1
+        assert api.cuLinkDestroy(state) == 0
+
     # A fat binary given with its size is read within it, whatever its header says: one cut short,
     # just before memory that cannot be read, is given to the linker as it is.
     fat = (Path(__file__).resolve().parents[2] / "crates/vf-fatbin/tests/data/elf75-ptx75-zstd.fatbin").read_bytes()
