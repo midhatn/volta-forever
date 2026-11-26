@@ -85,7 +85,9 @@ sm_75 cubins named with it, and counts what validate.py finds. A control that pa
                 a thread gathers for the columns 4 to 7 is 8 further and not 16
     unpaired    the upper half of a 64-bit uniform operand of an instruction that goes to
                 ordinary registers (UIMAD.WIDE, UIMAD.WIDE.X) gets another register than the
-                lower half's + 1, even when the lower half is even
+                lower half's + 1, even when the lower half is even: that of a single uniform
+                register, or else the first register that the translation leaves free (only
+                where the upper half is also named alone: elsewhere its register is named nowhere)
     misruled    the immediate of the first instruction translated by a rule to ordinary registers
                 is altered by one
 
@@ -337,7 +339,7 @@ careful than nvdisasm's (they are, across calls within a function) that predicat
 nothing after all. Such a 0 is worth a look, and is not a hole by itself: this program and
 tests/sass/controls.sh fail on each but those of RIGHT_THERE, each looked at.
 """
-import collections, os, re, struct, subprocess, sys, tempfile
+import collections, inspect, os, re, struct, subprocess, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import elf, machine, translate
 from machine import READ_BARRIER, WRITE_BARRIER, WAIT, stall_of, with_stall
@@ -776,8 +778,18 @@ def patched(control):
     translate_orig = Function.translate
     one_orig = Function.one
 
-    def unpaired_translate(self, place, *args, **kwargs):
-        place = dict(place)
+    # (The arguments of `Function.translate` are read and given back by their names. Until
+    # 2026-11-26 the sixth after `place` was taken by its place for the register to look from
+    # where no single uniform register is there to exchange with: it is `scratch`, the first of
+    # the registers of matrix sequences, which `placement` gives as None to a function without
+    # them, as level 3 does (it takes them at each instruction). The control stopped there on
+    # such a function, and in a function with them gave the upper half that first scratch
+    # register.)
+    translate_parameters = inspect.signature(translate_orig)
+
+    def unpaired_translate(*args, **kwargs):
+        given = translate_parameters.bind(*args, **kwargs)
+        self, place, free = given.arguments['self'], dict(given.arguments['place']), given.arguments['free']
         paired64 = {
             d.ops[op]
             for d in self.src
@@ -798,12 +810,13 @@ def patched(control):
                 if singleton is not None:
                     place[u + 1], place[singleton] = place[singleton], place[u + 1]
                     break
-                used = set(place.values()) | (set(self.borrow.used) if self.borrow else set())
-                free_r = next((r for r in range(max(args[5], 2), 255) if r not in used and r != place[u] + 1), None)
-                if free_r is not None:
-                    place[u + 1] = free_r
+                if free < 253:
+                    # None to exchange with: the first register that the translation leaves
+                    # free, which holds nothing else, and the function counts it.
+                    place[u + 1], free = free, free + 1
                     break
-        return translate_orig(self, place, *args, **kwargs)
+        given.arguments['place'], given.arguments['free'] = place, free
+        return translate_orig(*given.args, **given.kwargs)
 
     def unpaired_from_memory(self, i, d):
         items = from_memory(self, i, d)
