@@ -1943,10 +1943,6 @@ type LinkAddData = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> CUresult;
 
-/// Add `data` to the link `state`, with the CUDA input type matching the replacement image. The linker reads its input
-/// during the call, so the replacement does not outlive it; what was found in it goes to the image the link makes
-/// (`images::link_input`, `cuLinkComplete`). A kernel of another input that calls a function of this one that traps is
-/// not known: launched, it ends its CUDA context.
 type LinkAddFile =
     unsafe extern "C" fn(*mut c_void, c_int, *const c_char, c_uint, *mut c_int, *mut *mut c_void) -> CUresult;
 
@@ -1993,6 +1989,10 @@ unsafe fn link_add_replacement(
     fallback()
 }
 
+/// Add `data` to the link `state`, with the CUDA input type matching the replacement image. The linker reads its input
+/// during the call, so the replacement does not outlive it; what was found in it goes to the image the link makes
+/// (`images::link_input`, `cuLinkComplete`). A kernel of another input that calls a function of this one that traps is
+/// not known: launched, it ends its CUDA context.
 unsafe fn link_add_data(
     who: &str,
     state: *mut c_void,

@@ -1,5 +1,15 @@
 # Changes
 
+## Unreleased
+
+### Fixed
+
+- PTX, cubins and fat binaries given to the driver's linker in files (`cuLinkAddFile`, `cuLinkAddFile_v2`) went to the driver as they were, where the same bytes given in memory (`cuLinkAddData`) are adapted: on a V100, NVIDIA's driver refuses a file of PTX for sm_75 made by CUDA 13.5 (222, `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`) and one of relocatable sm_75 machine code (209, `CUDA_ERROR_NO_BINARY_FOR_GPU`), and links a fat binary of sm_75 machine code and PTX into an image without its kernels. The layer now reads such a file and gives the driver's `cuLinkAddData` what it makes of it, as of the same bytes in memory; its kernels that cannot run are refused at their lookup in the image that the link makes, with their line. The driver is given the file itself when nothing in it is adapted, when it cannot be read, and when the driver refuses what the layer made of it; a file of another type (a host object, a library of them) is not read, as such an input in memory is not (pull request #18, by midhatn). What is still not carried through a link, in memory or in a file, is in `LIMITS.md` ("Kernels refused"): a kernel whose code is a trap and nothing else, and a call into a function of another input that cannot run.
+
+### Tests
+
+- The unit tests of `vf-proxy` open no driver unless `VF_REAL_LIBCUDA` names one (they opened the machine's `libcuda.so.1`), and the report of a fault asks the driver for the library and the name of a kernel only once `cuCtxGetCurrent` succeeds: on the contributor's machine, with driver 580.196.07, a unit test ended with SIGSEGV in `cuKernelGetLibrary`, given a handle of its own before `cuInit`; `fault.rs` has a test of the guard (pull request #14, by midhatn). A program whose kernel faulted has initialized the driver: what the report says of it is the same.
+
 ## 0.1.6 (2026-11-25)
 
 ### Fixed

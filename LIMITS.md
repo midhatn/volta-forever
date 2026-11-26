@@ -58,10 +58,10 @@ where it is not from the build of this release. `docs/` says how each figure was
   fault. Strata's CUDA 13 engine 0.1.66 does, with its default settings, at its first prompt of a
   few thousand tokens (4,021 here); its guide says which setting avoids it ([its
   guide](docs/guides/strata.md)). Not recognised: such a kernel in an input of the driver's
-  linker (`cuLinkAddData`) or of nvJitLink, which traps as without the layer, and code that an
-  image has for sm_70, which is loaded as it is. A kernel whose body is empty is not refused:
-  launched, it does nothing and returns no error, as without the layer; `VF_LOG_LEVEL=2` counts
-  them in each image adapted ([Kernels refused](#kernels-refused)).
+  linker (`cuLinkAddData`, `cuLinkAddFile`) or of nvJitLink, which traps as without the layer,
+  and code that an image has for sm_70, which is loaded as it is. A kernel whose body is empty
+  is not refused: launched, it does nothing and returns no error, as without the layer;
+  `VF_LOG_LEVEL=2` counts them in each image adapted ([Kernels refused](#kernels-refused)).
 - **The bf16 cuBLAS variants are opt-in.** `VF_CUBLAS_BF16_SKINNY=1` and `VF_CUBLAS_BF16_TC=1`
   are off by default. The tensor-core path's results are not cuBLAS 12.9's bits. It takes TN
   products with k from 768 to 16384 only, but for the classes of shapes that its rules of speed
@@ -135,9 +135,10 @@ A kernel that the layer cannot run is refused when the program asks for it: the 
 (`cuModuleGetFunction`, `cuLibraryGetKernel`) returns `CUDA_ERROR_INVALID_PTX` (218) and leaves
 NULL in the handle, and a line on standard error names the kernel and says why. The other
 kernels of its module load and run. The same holds for the image that the driver's linker makes
-(`cuLinkAddData`, `cuLinkComplete`), with two exceptions: a kernel that calls a function of
-another input of the link that cannot run is not refused, and traps when it is launched; and
-inputs given with `cuLinkAddFile` are not adapted at all.
+(`cuLinkComplete`) of PTX, cubins and fat binaries given to it in memory (`cuLinkAddData`) or in
+files (`cuLinkAddFile`), with two exceptions: a kernel that calls a function of another input of
+the link that cannot run is not refused, and traps when it is launched; and an input of another
+type (a host object, or a library of them) is not read: the driver gets it as it is.
 
 **Eager loading (`CUDA_MODULE_LOADING=EAGER`).** The CUDA 13 runtime asks for each kernel by
 itself, and goes on without one that is refused, under eager loading as under lazy loading. The
@@ -194,9 +195,9 @@ NVIDIA's driver does, but a launch of any kind and a kernel node of a graph retu
 calling the driver, and a line names the kernel and its image; the context goes on. Code that the
 image already has for sm_70 is loaded as it is and not read: a stub there traps as without the
 layer. Nor is what was found carried through a link: a kernel without code in an input of
-`cuLinkAddData` or of nvJitLink is launched from the image that the link makes, and traps, as
-without the layer (at `VF_LOG_LEVEL=2` the line of an input of `cuLinkAddData` says that its
-launch is refused, which it is not). A kernel with an empty body is not refused: launched, it does nothing, as
+`cuLinkAddData` or `cuLinkAddFile`, or of nvJitLink, is launched from the image that the link
+makes, and traps, as without the layer (at `VF_LOG_LEVEL=2` the line of such an input of the
+driver's linker says that its launch is refused, which it is not). A kernel with an empty body is not refused: launched, it does nothing, as
 without the layer, and nothing says so but `VF_LOG_LEVEL=2`, which counts both kinds in each
 image adapted. A program that chooses, for the V100 it detects, kernels that its CUDA 13 build
 carries only as such stubs now stops with that error and no GPU fault: Strata's CUDA 13 engine
@@ -932,7 +933,7 @@ What that does not cover:
   as a GPU that compiled that PTX answers; native sm_70 code, PTX for sm_70 or earlier and
   translated machine code (whose header keeps its PTX's architecture) are answered what the
   driver answers. What that does not cover: the image that the driver's linker makes from PTX
-  inputs (`cuLinkAddData`, `cuLinkComplete`) and the cubins of the layer's nvJitLink are answered
+  inputs (`cuLinkAddData`, `cuLinkAddFile`) and the cubins of the layer's nvJitLink are answered
   7.0, the PTX that the driver compiled, so that CUB's algorithms in such code still answer
   "invalid device function"; a kernel of a library loaded whole from PTX text, asked about as a
   function in a context on a later card of the same machine, is answered what the driver answers
