@@ -236,9 +236,13 @@ A 16-byte load from shared memory faults on a V100 when its address is not a mul
 to its access size. By default (`VF_ALIGNED_ROWS` on, `Options::aligned_rows`) the layer
 takes the manual at its word and loads 16 bytes. A program whose rows are elsewhere stops
 with a misaligned-address fault (error 716), and `VF_ALIGNED_ROWS=0` makes the layer
-test the addresses at runtime: if a row is not at a multiple of 16 the same bytes are
-loaded word by word. The test costs 17 % to a factor of two on a program's emulated
-tensor-core kernels; every program tested keeps its rows aligned.
+test addresses at runtime when static alignment cannot be proved: if a row is not at a
+multiple of 16, the same bytes are loaded word by word. Under `VF_ALIGNED_ROWS=0`, a
+forward low-zero-bits dataflow pass tracks `.shared .align N` symbols (with `N` a multiple
+of 16), literals, `mov`/`cvt`/`cvta.shared`/`cvta.to.shared`, shifts, bitwise masks,
+`add`/`sub`/`mul.lo`/`mul.wide`/`mad.lo`/`mad.wide`, `selp`, and `bfi` across the
+control-flow graph; every `ldmatrix` whose base and literal offset are proven 16-byte
+aligned on all paths emits direct 16-byte loads with zero runtime test overhead.
 
 **Instruction counts.** Plain `ldmatrix` of 4 matrices: 14 instructions (2 for the
 address, one more when it has an offset, and 3 per matrix), besides the lane values of the

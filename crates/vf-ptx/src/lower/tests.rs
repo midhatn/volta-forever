@@ -4149,3 +4149,60 @@ fn a_product_with_b_by_ldmatrix_trans_is_summed_on_even_and_odd_k() {
     assert_eq!(count(&paired, HALVES_F32), 4);
     assert_eq!(count(&paired, VOLTA_F32), 4);
 }
+
+#[test]
+fn static_16b_aligned_ldmatrix_skips_runtime_alignment_diamond() {
+    // Real-world shared-memory alignment via shl/mad/cvta/loop induction: no runtime & 15 check.
+    let text = "{\n	.reg .b32 %r<8>, %d<4>, %a<4>, %b<2>;\n	.reg .b64 %rd<4>;\n	.reg .pred %p1;\n        	.shared .align 16 .b8 smem[4096];\n        	mov.u32 %r0, %tid.x;\n        	and.b32 %r1, %r0, 31;\n        	mad.lo.s32 %r2, %r1, 136, 0;\n        	shl.b32 %r3, %r2, 1;\n        	mov.u32 %r4, smem;\n        	add.s32 %r5, %r4, %r3;\n        	cvt.u64.u32 %rd0, %r5;\n        	cvta.shared.u64 %rd1, %rd0;\n        $L_loop:\n        	ldmatrix.sync.aligned.m8n8.x4.b16 {%a0, %a1, %a2, %a3}, [%rd1];\n        	ldmatrix.sync.aligned.m8n8.x2.b16 {%b0, %b1}, [%rd1+128];\n        	mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n        	add.s64 %rd1, %rd1, 256;\n        	@%p1 bra $L_loop;\n	ret;\n}";
+    let lowered = lower(text);
+    assert_eq!(
+        count(&lowered, "$vf_u"),
+        0,
+        "expected static 16B proof to drop $vf_u:\n{lowered}"
+    );
+    assert_eq!(count(&lowered, ", 15;"), 0, "expected no & 15 runtime test:\n{lowered}");
+    assert_eq!(
+        count(&lowered, "ld.shared.v4.u32 "),
+        4,
+        "expected direct v4 loads:\n{lowered}"
+    );
+    assert_eq!(undeclared(&lowered), Vec::<String>::new());
+
+    // Negative soundness controls: .align 4 base, +4 loop step, or predicated +4 must keep runtime check.
+    let unaligned_step = text.replace("add.s64 %rd1, %rd1, 256;", "add.s64 %rd1, %rd1, 4;");
+    assert_eq!(
+        count(&lower(&unaligned_step), ", 15;"),
+        2,
+        "unaligned loop step must keep runtime check"
+    );
+    let guarded_misalign = text.replace("add.s64 %rd1, %rd1, 256;", "@%p1 add.s64 %rd1, %rd1, 4;");
+    assert_eq!(
+        count(&lower(&guarded_misalign), ", 15;"),
+        2,
+        "guarded misalign must keep runtime check"
+    );
+    let align4_base = text.replace(".shared .align 16 .b8 smem[4096];", ".shared .align 4 .b8 smem[4096];");
+    assert_eq!(
+        count(&lower(&align4_base), ", 15;"),
+        2,
+        ".align 4 shared must keep runtime check"
+    );
+}
+
+#[test]
+fn module_level_aligned_extern_shared_skips_runtime_alignment_diamond() {
+    let module = ".version 8.0\n.target sm_80\n.address_size 64\n.extern .shared .align 16 .b8 gsm[];\n.visible .entry k()\n{\n\t.reg .b32 %r<6>, %a<4>, %b<2>, %d<4>;\n\tmov.u32 %r0, %tid.x;\n\tshl.b32 %r1, %r0, 4;\n\tmov.u32 %r2, gsm;\n\tadd.u32 %r3, %r2, %r1;\n\tldmatrix.sync.aligned.m8n8.x4.b16 {%a0, %a1, %a2, %a3}, [%r3];\n\tldmatrix.sync.aligned.m8n8.x2.b16 {%b0, %b1}, [gsm+128];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n\tret;\n}\n";
+    let (out, _) = crate::lower_to_volta_with(
+        module.as_bytes(),
+        Options {
+            aligned_rows: false,
+            ..Options::default()
+        },
+    );
+    let s = std::str::from_utf8(&out).unwrap();
+    assert!(
+        !s.contains("$vf_u"),
+        "expected module-level .extern .shared .align 16 to skip $vf_u:\n{s}"
+    );
+    assert!(!s.contains(", 15;"), "expected no & 15 runtime check:\n{s}");
+}

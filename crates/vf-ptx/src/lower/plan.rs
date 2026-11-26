@@ -74,6 +74,8 @@ pub(super) struct Plan<'a> {
     pub(super) chain_b: HashSet<&'a str>,
     /// Pairs of FP16 products computed together, and what their accumulators need (`pairs`).
     pub(super) pairs: super::pairs::Pairs<'a>,
+    /// `ldmatrix` statement indices whose addresses are statically 16-byte aligned.
+    pub(super) aligned_16: HashSet<usize>,
 }
 
 /// Collect labels that appear in statement operands or line directives, avoiding allocation when
@@ -111,7 +113,12 @@ impl<'a> Plan<'a> {
         self.origins.get(register).is_some_and(|origin| origin.transposed)
     }
 
-    pub(super) fn new(text: &'a str, items: &[scan::Item], options: Options) -> Plan<'a> {
+    pub(super) fn new(
+        text: &'a str,
+        items: &[scan::Item],
+        options: Options,
+        shared_aligned: &HashMap<String, u64>,
+    ) -> Plan<'a> {
         const TRIGGERS: [&str; 7] = [
             "mma.",
             "ldmatrix.",
@@ -515,6 +522,11 @@ impl<'a> Plan<'a> {
                     plan.plain.insert(b);
                 }
             }
+        }
+
+        if !options.aligned_rows && text.contains("ldmatrix.") {
+            plan.aligned_16 =
+                super::known_bits::align::prove_aligned_16(text, items, shared_aligned, &plan.constants16);
         }
 
         plan
