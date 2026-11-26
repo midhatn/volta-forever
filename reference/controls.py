@@ -839,8 +839,12 @@ def patched(control):
         return items
 
     def misruled_one(self, i, d):
+        # (The instruction that was altered is kept, not that one was: the translator may
+        # translate a function again, after an attempt that it gives up, and the next attempt
+        # alters the same instruction. Until 2026-11-26 it altered none, and the function was
+        # translated as it is: one function of cuSOLVER's 0015, of 198 cubins looked at.)
         items = one_orig(self, i, d)
-        if not getattr(self, '_misruled_done', False):
+        if getattr(self, '_misruled_at', i) == i:
             for item in items:
                 if item.what == 'ordinary registers':
                     d70 = self.mc.decode(70, item.word)
@@ -849,7 +853,7 @@ def patched(control):
                             if kind == 'operand' and data in ('Sc', 'Sb') and any('Imm' in f.name or 'imm' in f.name or d70.c.operands[data].type == 'SImm' for f in fields if data in d70.c.operands):
                                 val = fields[0].get(item.word)
                                 item.word = fields[0].put(item.word, val ^ 1)
-                                self._misruled_done = True
+                                self._misruled_at = i
                                 return items
         return items
 
