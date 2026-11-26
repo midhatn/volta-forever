@@ -16,4 +16,5 @@ vf-fatbin.workspace = true
 vf-ptx.workspace = true
 vf-adapt.workspace = true
 libc.workspace = true
+lz4_flex.workspace = true
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }

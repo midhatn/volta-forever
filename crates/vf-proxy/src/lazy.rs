@@ -759,26 +759,37 @@ fn build_standin_ptx(full_ptx: &[u8]) -> Vec<u8> {
 /// its load, and analyse the result. Fills `lazy_lib.adapted_data` and `lazy_lib.info` so that
 /// materialization and sub-module extraction work. Must be called outside the lock.
 fn ensure_adapted(original: &[u8], policy: &vf_adapt::Policy) -> Option<(Vec<u8>, ModuleInfo)> {
-    // The original bytes are the fat binary or PTX the program gave. Adapt them exactly as
-    // `images::adapt` would.
-    let adapted = if original.len() >= 4 && u32::from_le_bytes(original[..4].try_into().ok()?) == fatbin::MAGIC {
-        let fat = fatbin::parse(original).ok()?;
-        policy.adapt_fatbin(&fat).ok()?.image?
+    // The original bytes are the fat binary or PTX the program gave. Adapt them (or restore from
+    // the retargeted proxy cache) exactly as `images::adapt` would.
+    let is_fatbin = original.len() >= 4 && u32::from_le_bytes(original[..4].try_into().ok()?) == fatbin::MAGIC;
+    let key_bytes = if is_fatbin {
+        original
     } else {
-        // PTX text: adapt, then append the null terminator the driver needs (the hooks path
-        // does this in `finish` via `terminate`; we must do it here too).
-        let text = if original.last() == Some(&0) {
-            &original[..original.len() - 1]
-        } else {
-            original
-        };
-        let mut image = policy.adapt_ptx(text).image?;
-        image.push(0);
-        image
+        original.strip_suffix(&[0]).unwrap_or(original)
     };
-    let ptx = extract_ptx_from_adapted(&adapted)?;
+    let ck = crate::cache::enabled().then(|| crate::cache::key_for(key_bytes));
+    let mut image = if let Some(kept) = ck.as_ref().and_then(crate::cache::load_retargeted) {
+        kept.image?
+    } else {
+        let out = if is_fatbin {
+            let fat = fatbin::parse(original).ok()?;
+            policy.adapt_fatbin(&fat).ok()?
+        } else {
+            policy.adapt_ptx(key_bytes)
+        };
+        if let Some(ref ck) = ck
+            && matches!(out.outcome, vf_adapt::Outcome::Retargeted { .. })
+        {
+            crate::cache::save_retargeted(ck, &out);
+        }
+        out.image?
+    };
+    if !is_fatbin {
+        image.push(0);
+    }
+    let ptx = extract_ptx_from_adapted(&image)?;
     let info = ModuleInfo::analyse(&ptx);
-    Some((adapted, info))
+    Some((image, info))
 }
 
 /// Get the real `cuLibraryLoadData` function pointer (counts the call).
@@ -792,7 +803,9 @@ fn real_library_load() -> unsafe extern "C" fn(
     *mut *mut c_void,
     c_uint,
 ) -> CUresult {
-    COUNTS[idx::cuLibraryLoadData].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuLibraryLoadData].fetch_add(1, Relaxed);
+    }
     // SAFETY: REALS holds the address of NVIDIA's cuLibraryLoadData, whose prototype matches.
     unsafe { std::mem::transmute(REALS[idx::cuLibraryLoadData].load(Relaxed)) }
 }

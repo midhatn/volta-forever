@@ -278,6 +278,11 @@ if __name__ == "__main__":
             if start == "from the cache" and "cache hit" not in done.stderr:
                 ok = False
                 print("    the libraries were not set up from the cache")
+            if start == "from the cache" and (
+                "retargeted from the cache" not in done.stderr or "PTX retargeted in" in done.stderr
+            ):
+                ok = False
+                print("    retargeted PTX modules were not loaded from the cache")
             print(f"{'ok  ' if ok else 'FAIL'}  {label}")
             if not ok:
                 print("    " + (done.stderr.strip() or done.stdout.strip()).replace("\n", "\n    "))

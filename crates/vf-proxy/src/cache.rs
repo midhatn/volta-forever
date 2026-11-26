@@ -682,7 +682,31 @@ pub fn save_submodule(ck: &CacheKey, kernel_name: &str, ptx: &[u8]) {
 
 // ---- translations --------------------------------------------------------------------------------
 
-/// The counts of emulated instructions, in the order they are written in a cached translation.
+fn put_usize(buf: &mut Vec<u8>, v: usize) {
+    buf.extend_from_slice(&(v as u32).to_le_bytes());
+}
+
+fn put_str(buf: &mut Vec<u8>, s: &str) {
+    put_usize(buf, s.len());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+fn take_usize(data: &[u8], pos: &mut usize) -> Option<usize> {
+    let v = u32::from_le_bytes(data.get(*pos..*pos + 4)?.try_into().ok()?);
+    *pos += 4;
+    Some(v as usize)
+}
+
+fn take_str(data: &[u8], pos: &mut usize) -> Option<String> {
+    let len = take_usize(data, pos)?;
+    let s = std::str::from_utf8(data.get(*pos..pos.checked_add(len)?)?)
+        .ok()?
+        .to_string();
+    *pos += len;
+    Some(s)
+}
+
+/// The counts of emulated instructions, in the order they are written in cached entries.
 fn counts_of(c: &vf_ptx::EmulatedCounts) -> [usize; 14] {
     [
         c.fp16_tensor,
@@ -702,94 +726,51 @@ fn counts_of(c: &vf_ptx::EmulatedCounts) -> [usize; 14] {
     ]
 }
 
-/// A translation as it is kept: what `vf_adapt` said of the image (how many modules and
-/// functions, from which architecture, the kernels refused and those with instructions added),
-/// then the image to load. `None` for anything that is not a translation with an image.
-fn encode_translation(adapted: &vf_adapt::Adapted) -> Option<Vec<u8>> {
-    let vf_adapt::Outcome::Translated {
-        entries,
-        from_sm,
-        functions,
-        refused,
-        emulated,
-        over_budget,
-        stubs,
-        paired,
-    } = &adapted.outcome
-    else {
-        return None;
-    };
-    let image = adapted.image.as_ref()?;
-    let mut buf = Vec::with_capacity(image.len() + 256);
-    let put = |buf: &mut Vec<u8>, v: usize| buf.extend_from_slice(&(v as u32).to_le_bytes());
-    let put_str = |buf: &mut Vec<u8>, s: &str| {
-        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        buf.extend_from_slice(s.as_bytes());
-    };
-    put(&mut buf, *entries);
-    put(&mut buf, *from_sm as usize);
-    put(&mut buf, *functions);
-    put(&mut buf, *over_budget as usize);
-    put(&mut buf, refused.len());
+fn put_outcome_lists(
+    buf: &mut Vec<u8>,
+    refused: &[vf_adapt::Refused],
+    emulated: &[vf_adapt::Emulated],
+    stubs: &vf_adapt::Stubs,
+) {
+    put_usize(buf, refused.len());
     for r in refused {
-        put_str(&mut buf, &r.kernel);
-        put_str(&mut buf, &r.function);
-        put_str(&mut buf, &r.reason);
+        put_str(buf, &r.kernel);
+        put_str(buf, &r.function);
+        put_str(buf, &r.reason);
     }
-    put(&mut buf, emulated.len());
+    put_usize(buf, emulated.len());
     for e in emulated {
-        put_str(&mut buf, &e.kernel);
+        put_str(buf, &e.kernel);
         for v in counts_of(&e.counts) {
-            put(&mut buf, v);
+            put_usize(buf, v);
         }
     }
     for list in [&stubs.trap_only, &stubs.empty] {
-        put(&mut buf, list.len());
+        put_usize(buf, list.len());
         for kernel in list {
-            put_str(&mut buf, kernel);
+            put_str(buf, kernel);
         }
     }
-    put(&mut buf, paired.len());
-    for name in paired {
-        put_str(&mut buf, name);
-    }
-    buf.extend_from_slice(image);
-    Some(buf)
 }
 
-fn decode_translation(data: &[u8]) -> Option<vf_adapt::Adapted> {
-    let mut pos = 0;
-    let read = |pos: &mut usize| -> Option<usize> {
-        let v = u32::from_le_bytes(data.get(*pos..*pos + 4)?.try_into().ok()?);
-        *pos += 4;
-        Some(v as usize)
-    };
-    let read_str = |pos: &mut usize| -> Option<String> {
-        let len = read(pos)?;
-        let s = std::str::from_utf8(data.get(*pos..pos.checked_add(len)?)?)
-            .ok()?
-            .to_string();
-        *pos += len;
-        Some(s)
-    };
-    let entries = read(&mut pos)?;
-    let from_sm = read(&mut pos)? as u32;
-    let functions = read(&mut pos)?;
-    let over_budget = read(&mut pos)? != 0;
+fn take_outcome_lists(
+    data: &[u8],
+    pos: &mut usize,
+) -> Option<(Vec<vf_adapt::Refused>, Vec<vf_adapt::Emulated>, vf_adapt::Stubs)> {
     let mut refused = Vec::new();
-    for _ in 0..read(&mut pos)? {
+    for _ in 0..take_usize(data, pos)? {
         refused.push(vf_adapt::Refused {
-            kernel: read_str(&mut pos)?,
-            function: read_str(&mut pos)?,
-            reason: read_str(&mut pos)?,
+            kernel: take_str(data, pos)?,
+            function: take_str(data, pos)?,
+            reason: take_str(data, pos)?,
         });
     }
     let mut emulated = Vec::new();
-    for _ in 0..read(&mut pos)? {
-        let kernel = read_str(&mut pos)?;
+    for _ in 0..take_usize(data, pos)? {
+        let kernel = take_str(data, pos)?;
         let mut v = [0usize; 14];
         for x in &mut v {
-            *x = read(&mut pos)?;
+            *x = take_usize(data, pos)?;
         }
         emulated.push(vf_adapt::Emulated {
             kernel,
@@ -813,13 +794,55 @@ fn decode_translation(data: &[u8]) -> Option<vf_adapt::Adapted> {
     }
     let mut stubs = vf_adapt::Stubs::default();
     for list in [&mut stubs.trap_only, &mut stubs.empty] {
-        for _ in 0..read(&mut pos)? {
-            list.push(read_str(&mut pos)?);
+        for _ in 0..take_usize(data, pos)? {
+            list.push(take_str(data, pos)?);
         }
     }
+    Some((refused, emulated, stubs))
+}
+
+/// A translation as it is kept: what `vf_adapt` said of the image (how many modules and
+/// functions, from which architecture, the kernels refused and those with instructions added),
+/// then the image to load. `None` for anything that is not a translation with an image.
+fn encode_translation(adapted: &vf_adapt::Adapted) -> Option<Vec<u8>> {
+    let vf_adapt::Outcome::Translated {
+        entries,
+        from_sm,
+        functions,
+        refused,
+        emulated,
+        over_budget,
+        stubs,
+        paired,
+    } = &adapted.outcome
+    else {
+        return None;
+    };
+    let image = adapted.image.as_ref()?;
+    let mut buf = Vec::with_capacity(image.len() + 256);
+    put_usize(&mut buf, *entries);
+    put_usize(&mut buf, *from_sm as usize);
+    put_usize(&mut buf, *functions);
+    put_usize(&mut buf, *over_budget as usize);
+    put_outcome_lists(&mut buf, refused, emulated, stubs);
+    put_usize(&mut buf, paired.len());
+    for name in paired {
+        put_str(&mut buf, name);
+    }
+    buf.extend_from_slice(image);
+    Some(buf)
+}
+
+fn decode_translation(data: &[u8]) -> Option<vf_adapt::Adapted> {
+    let mut pos = 0;
+    let entries = take_usize(data, &mut pos)?;
+    let from_sm = take_usize(data, &mut pos)? as u32;
+    let functions = take_usize(data, &mut pos)?;
+    let over_budget = take_usize(data, &mut pos)? != 0;
+    let (refused, emulated, stubs) = take_outcome_lists(data, &mut pos)?;
     let mut paired = Vec::new();
-    for _ in 0..read(&mut pos)? {
-        paired.push(read_str(&mut pos)?);
+    for _ in 0..take_usize(data, &mut pos)? {
+        paired.push(take_str(data, &mut pos)?);
     }
     Some(vf_adapt::Adapted {
         outcome: vf_adapt::Outcome::Translated {
@@ -836,9 +859,116 @@ fn decode_translation(data: &[u8]) -> Option<vf_adapt::Adapted> {
     })
 }
 
+/// Serialize a retargeted PTX/fatbin adaptation outcome with LZ4-compressed image bytes.
+pub(crate) fn encode_retargeted(adapted: &vf_adapt::Adapted) -> Option<Vec<u8>> {
+    let vf_adapt::Outcome::Retargeted {
+        entries,
+        from_sm,
+        tensor_rewritten,
+        tanh_expanded,
+        trapped,
+        refused,
+        emulated,
+        replaced,
+        reported,
+        stubs,
+    } = &adapted.outcome
+    else {
+        return None;
+    };
+    let image = adapted.image.as_ref()?;
+    let compressed = lz4_flex::compress_prepend_size(image);
+    let mut buf = Vec::with_capacity(compressed.len() + 256);
+    put_usize(&mut buf, *entries);
+    put_usize(&mut buf, *from_sm as usize);
+    put_usize(&mut buf, *tensor_rewritten);
+    put_usize(&mut buf, *tanh_expanded);
+    put_outcome_lists(&mut buf, refused, emulated, stubs);
+    put_usize(&mut buf, trapped.len());
+    for t in trapped {
+        put_str(&mut buf, &t.function);
+        put_str(&mut buf, &t.reason);
+    }
+    put_usize(&mut buf, replaced.len());
+    for rep in replaced {
+        put_str(&mut buf, &rep.function);
+        put_usize(&mut buf, rep.forms.len());
+        for form in &rep.forms {
+            put_str(&mut buf, form);
+        }
+    }
+    put_usize(&mut buf, reported.len());
+    for rep in reported {
+        put_str(&mut buf, &rep.kernel);
+        put_str(&mut buf, &rep.function);
+        put_str(&mut buf, &rep.form);
+        put_usize(&mut buf, rep.instructions);
+        put_usize(&mut buf, rep.functions);
+    }
+    buf.extend_from_slice(&compressed);
+    Some(buf)
+}
+
+/// Deserialize a cached retargeted PTX/fatbin outcome and decompress its image bytes.
+pub(crate) fn decode_retargeted(data: &[u8]) -> Option<vf_adapt::Adapted> {
+    let mut pos = 0;
+    let entries = take_usize(data, &mut pos)?;
+    let from_sm = take_usize(data, &mut pos)? as u32;
+    let tensor_rewritten = take_usize(data, &mut pos)?;
+    let tanh_expanded = take_usize(data, &mut pos)?;
+    let (refused, emulated, stubs) = take_outcome_lists(data, &mut pos)?;
+    let mut trapped = Vec::new();
+    for _ in 0..take_usize(data, &mut pos)? {
+        trapped.push(vf_adapt::Trapped {
+            function: take_str(data, &mut pos)?,
+            reason: take_str(data, &mut pos)?,
+        });
+    }
+    let mut replaced = Vec::new();
+    for _ in 0..take_usize(data, &mut pos)? {
+        let function = take_str(data, &mut pos)?;
+        let mut forms = Vec::new();
+        for _ in 0..take_usize(data, &mut pos)? {
+            forms.push(take_str(data, &mut pos)?);
+        }
+        replaced.push(vf_adapt::Replaced { function, forms });
+    }
+    let mut reported = Vec::new();
+    for _ in 0..take_usize(data, &mut pos)? {
+        reported.push(vf_adapt::Reported {
+            kernel: take_str(data, &mut pos)?,
+            function: take_str(data, &mut pos)?,
+            form: take_str(data, &mut pos)?,
+            instructions: take_usize(data, &mut pos)?,
+            functions: take_usize(data, &mut pos)?,
+        });
+    }
+    let image = lz4_flex::decompress_size_prepended(data.get(pos..)?).ok()?;
+    Some(vf_adapt::Adapted {
+        outcome: vf_adapt::Outcome::Retargeted {
+            entries,
+            from_sm,
+            tensor_rewritten,
+            tanh_expanded,
+            trapped,
+            refused,
+            emulated,
+            replaced,
+            reported,
+            stubs,
+        },
+        image: Some(image),
+    })
+}
+
 /// File path for the translation of a module.
 fn translation_path(cs: &CacheState, key: u128) -> PathBuf {
     cs.dir.join(format!("{key:032x}.t"))
+}
+
+/// File path for a retargeted PTX/fatbin image.
+fn retargeted_path(cs: &CacheState, key: u128) -> PathBuf {
+    cs.dir.join(format!("{key:032x}.p"))
 }
 
 /// The translation of the image of this key, if an earlier run kept it.
@@ -847,20 +977,39 @@ pub fn load_translation(ck: &CacheKey) -> Option<vf_adapt::Adapted> {
     decode_translation(&checked_read(&translation_path(cs, ck.key), ck.key, cs.uid)?)
 }
 
+/// The retargeted PTX/fatbin image of this key, if an earlier run kept it.
+pub fn load_retargeted(ck: &CacheKey) -> Option<vf_adapt::Adapted> {
+    let cs = state()?;
+    decode_retargeted(&checked_read(&retargeted_path(cs, ck.key), ck.key, cs.uid)?)
+}
+
+fn save_encoded(path: PathBuf, ck: &CacheKey, cs: &CacheState, data: &[u8], kind: &str) {
+    // (The length of a file is written in 32 bits.)
+    if data.len() > u32::MAX as usize {
+        return;
+    }
+    if let Err(e) = atomic_write(&path, data, ck.key) {
+        log::trace(format_args!("cache: failed to write {kind}: {e}"));
+    }
+    enforce_limit(cs);
+}
+
 /// Keep a translation for later runs (anything else is not kept). Enforces the size limit afterwards.
 pub fn save_translation(ck: &CacheKey, adapted: &vf_adapt::Adapted) {
     let Some(cs) = state() else { return };
     let Some(data) = encode_translation(adapted) else {
         return;
     };
-    // (The length of a file is written in 32 bits.)
-    if data.len() > u32::MAX as usize {
+    save_encoded(translation_path(cs, ck.key), ck, cs, &data, "a translation");
+}
+
+/// Keep a retargeted PTX/fatbin adaptation for later runs. Enforces the size limit afterwards.
+pub fn save_retargeted(ck: &CacheKey, adapted: &vf_adapt::Adapted) {
+    let Some(cs) = state() else { return };
+    let Some(data) = encode_retargeted(adapted) else {
         return;
-    }
-    if let Err(e) = atomic_write(&translation_path(cs, ck.key), &data, ck.key) {
-        log::trace(format_args!("cache: failed to write a translation: {e}"));
-    }
-    enforce_limit(cs);
+    };
+    save_encoded(retargeted_path(cs, ck.key), ck, cs, &data, "retargeted PTX");
 }
 
 // ---- tests ---------------------------------------------------------------------------------------
@@ -1333,5 +1482,80 @@ mod tests {
             cache_hash(img, &vf_adapt::Policy { pairs: true, ..safe }),
             cache_hash(img, &safe)
         );
+    }
+
+    #[test]
+    fn retargeted_round_trip() {
+        let adapted = vf_adapt::Adapted {
+            outcome: vf_adapt::Outcome::Retargeted {
+                entries: 2,
+                from_sm: 120,
+                tensor_rewritten: 42,
+                tanh_expanded: 3,
+                trapped: vec![vf_adapt::Trapped {
+                    function: "helper_bad".to_string(),
+                    reason: "unsupported opcode".to_string(),
+                }],
+                refused: vec![vf_adapt::Refused {
+                    kernel: "k_refused".to_string(),
+                    function: "helper_bad".to_string(),
+                    reason: "unsupported opcode".to_string(),
+                }],
+                emulated: vec![vf_adapt::Emulated {
+                    kernel: "k_emu".to_string(),
+                    counts: vf_ptx::EmulatedCounts {
+                        fp16_tensor: 8,
+                        tanh: 3,
+                        ..Default::default()
+                    },
+                }],
+                replaced: vec![vf_adapt::Replaced {
+                    function: "k_nccl".to_string(),
+                    forms: vec!["multimem.ld_reduce.global.b32".to_string()],
+                }],
+                reported: vec![vf_adapt::Reported {
+                    kernel: "k_nccl".to_string(),
+                    function: "k_nccl".to_string(),
+                    form: "multimem.ld_reduce.global.b32".to_string(),
+                    instructions: 5,
+                    functions: 1,
+                }],
+                stubs: vf_adapt::Stubs {
+                    trap_only: vec!["k_stub".to_string()],
+                    empty: vec!["k_empty".to_string()],
+                },
+            },
+            image: Some(b".version 8.0\n.target sm_70\n.address_size 64\n.entry k_emu() { ret; }\n".to_vec()),
+        };
+        let encoded = encode_retargeted(&adapted).expect("encode_retargeted");
+        let decoded = decode_retargeted(&encoded).expect("decode_retargeted");
+        assert_eq!(decoded.outcome, adapted.outcome);
+        assert_eq!(decoded.image, adapted.image);
+
+        // Truncating or corrupting the LZ4 stream/length header must fail cleanly.
+        assert!(decode_retargeted(&encoded[..encoded.len() - 1]).is_none());
+        let mut bad_hdr = encoded.clone();
+        let hdr_at = bad_hdr.len() - lz4_flex::compress_prepend_size(adapted.image.as_ref().unwrap()).len();
+        bad_hdr[hdr_at + 4] = 0x0f;
+        bad_hdr[hdr_at + 5] = 0x00;
+        bad_hdr[hdr_at + 6] = 0x00;
+        assert!(decode_retargeted(&bad_hdr).is_none());
+
+        // File-level header + checksum round-trip rejects single-byte corruption too.
+        let dir = test_dir("retargeted");
+        let cs = CacheState {
+            dir: dir.clone(),
+            max_bytes: DEFAULT_MAX_BYTES,
+            uid: unsafe { libc::geteuid() },
+        };
+        let path = retargeted_path(&cs, 0x1234_5678_9abc_def0);
+        atomic_write(&path, &encoded, 0x1234_5678_9abc_def0).unwrap();
+        let read_back = checked_read(&path, 0x1234_5678_9abc_def0, cs.uid).unwrap();
+        assert_eq!(decode_retargeted(&read_back).unwrap().image, adapted.image);
+        let mut raw = std::fs::read(&path).unwrap();
+        *raw.last_mut().unwrap() ^= 1;
+        std::fs::write(&path, raw).unwrap();
+        assert!(checked_read(&path, 0x1234_5678_9abc_def0, cs.uid).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
