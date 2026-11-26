@@ -286,6 +286,9 @@ pub(crate) struct Flow {
     lead: Vec<bool>,
     uniform: Vec<bool>,
     whole: Vec<bool>,
+    /// The entries of the function (`entries`): where it may be entered other than from the
+    /// instruction before.
+    entered: FastSet<usize>,
 }
 
 impl Flow {
@@ -305,7 +308,7 @@ impl Flow {
         let kind: Vec<&'static str> = (0..n).map(|i| Self::kind_of(src, tables, i)).collect();
         let known = entries.is_some() && !kind.contains(&"unknown");
         if !known {
-            return Self::empty(n, kind);
+            return Self::empty(n, kind, entered);
         }
 
         let mut instr_reads_r = vec![[0u64; 4]; n];
@@ -389,6 +392,13 @@ impl Flow {
             })
             .collect();
 
+        // Every branch goes to an instruction of the function (`reference/pairing.py`): one to
+        // its end or outside leaves the ways unknown.
+        let all_known = (0..n).all(|i| !(kind[i] == "jump" || kind[i] == "cond") || named[i].is_some());
+        if !all_known {
+            return Self::empty(n, kind, entered);
+        }
+
         let mut pred: Vec<Vec<usize>> = vec![Vec::new(); n];
         for (i, targets) in succ.iter().enumerate() {
             for &s in targets {
@@ -454,8 +464,13 @@ impl Flow {
             if kind[i] != "call" {
                 continue;
             }
-            let Some(entry) = named[i] else {
-                continue;
+            // A function that is not here: anything.
+            let entry = match named[i] {
+                Some(entry) if src[i].name.starts_with("call_rel") => entry,
+                _ => {
+                    called.insert(i, None);
+                    continue;
+                }
             };
             body_nodes.clear();
             work.clear();
@@ -567,6 +582,7 @@ impl Flow {
             lead: if with_pairing { vec![false; n] } else { Vec::new() },
             uniform: if with_pairing { vec![false; n] } else { Vec::new() },
             whole: if with_pairing { vec![false; n] } else { Vec::new() },
+            entered,
         };
         if with_pairing {
             flow.compute_whole_places(src);
@@ -574,7 +590,7 @@ impl Flow {
         flow
     }
 
-    fn empty(n: usize, kind: Vec<&'static str>) -> Self {
+    fn empty(n: usize, kind: Vec<&'static str>, entered: FastSet<usize>) -> Self {
         Self {
             n,
             kind,
@@ -598,6 +614,7 @@ impl Flow {
             lead: Vec::new(),
             uniform: Vec::new(),
             whole: Vec::new(),
+            entered,
         }
     }
 
@@ -659,11 +676,6 @@ impl Flow {
     #[inline]
     fn all_of(&self, i: usize, r: u32) -> bool {
         self.kind[i] != "call" && self.unguarded[i] && regset_test(&self.writes_r[i], r)
-    }
-
-    #[inline]
-    fn simple(&self, i: usize) -> bool {
-        i > 0 && self.block_of[i] == self.block_of[i - 1]
     }
 
     #[inline]
@@ -1134,10 +1146,10 @@ pub fn plan(src: &[Decoded], tables: &[(u64, Vec<u64>)], entries: &Option<HashSe
 }
 
 pub(crate) fn plan_with_flow(src: &[Decoded], flow: &Flow) -> Option<Plan> {
-    debug_assert_eq!(flow.whole.len(), flow.n, "Flow built without pairing facts");
     if !flow.known || !src.iter().any(|d| d.name == PRODUCT) {
         return None;
     }
+    debug_assert_eq!(flow.whole.len(), flow.n, "Flow built without pairing facts");
     let forms: BTreeMap<usize, Option<ProductForm>> = src
         .iter()
         .enumerate()
@@ -1369,7 +1381,9 @@ fn attempt(
             }
             let mine_mask = regset_4(c.d);
             for j in i + 1..n {
-                if !flow.simple(j) {
+                // (As `reference/pairing.py`: an entry, or an instruction after one that is not
+                // plain.)
+                if flow.entered.contains(&j) || flow.kind[j - 1] != "plain" {
                     break;
                 }
                 if let Some(o) = candidate.get(&j)

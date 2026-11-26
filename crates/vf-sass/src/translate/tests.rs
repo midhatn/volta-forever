@@ -3,8 +3,8 @@
 use std::collections::HashSet;
 
 use super::borrowed::Borrowed;
-use super::context::pick;
-use super::parse::{FuncData, placement};
+use super::context::{entries, pick};
+use super::parse::{FuncData, parse_function, placement};
 use super::*;
 use crate::assemble;
 use crate::decode::{Decoder, Kind, LETTER_P, LETTER_R, LETTER_U};
@@ -1519,4 +1519,130 @@ fn at_level_3_each_matrix_instruction_reads_the_lane() {
             "nothing reads the lane for the matrix load at 0x{at:x}"
         );
     }
+}
+
+/// The 16-byte word of a branch, always taken, to `16 * target` from `16 * at` (`at` in its own
+/// function: its relative operand put as `reference/translate.py` reads it).
+fn branch(dec75: &mut Decoder, at: usize, target: usize) -> u128 {
+    // BRA to the next instruction, under no guard.
+    let word: u128 = 0x000fc200038000000000000000007947;
+    let d = dec75.decode(word).unwrap();
+    assert_eq!(d.mnemonic, "BRA");
+    let (fid, scale) = super::util::find_relative(&d, 75).unwrap();
+    let distance = (16 * target as i64 - 16 * at as i64 - 16) / scale as i64;
+    let width = crate::field::width(fid);
+    crate::field::put(fid, word, (distance as u64) & ((1u64 << width) - 1))
+}
+
+/// The functions of k_pairs.cu whose products the translation makes in pairs.
+fn paired_of(data: &[u8]) -> Vec<String> {
+    let result = translate_with_options(data, false, &Options::default()).unwrap();
+    result
+        .report
+        .iter()
+        .filter(|f| f.paired)
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+/// A branch to the end of its function, past its last instruction, leaves the ways through the
+/// function unknown, as `reference/pairing.py` has it (and `main` had it): no pairs, no borrowed
+/// registers. In k_pairs.cu the last instruction of each function with pairs that ends on a NOP
+/// (after its end) made such a branch.
+#[test]
+fn a_branch_to_the_end_of_its_function_leaves_the_ways_unknown() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let before = paired_of(original);
+    let mut input = crate::elf::Elf::parse(original).unwrap();
+    let mut dec75 = Decoder::new(75);
+    let mut changed = Vec::new();
+    for name in &before {
+        let section = input.section(&format!(".text.{name}")).unwrap();
+        let code = &mut input.sections[section].data;
+        let n = code.len() / 16;
+        let last = u128::from_le_bytes(code[16 * (n - 1)..].try_into().unwrap());
+        if dec75.decode(last).unwrap().mnemonic != "NOP" {
+            continue;
+        }
+        let word = branch(&mut dec75, n - 1, n);
+        code[16 * (n - 1)..].copy_from_slice(&word.to_le_bytes());
+        let fd = parse_function(&mut dec75, name, code, 255, vec![]).unwrap();
+        let flow = crate::pairing::Flow::new(&fd.src, &fd.tables, &entries(&fd));
+        assert!(!flow.known, "{name}");
+        assert!(
+            crate::pairing::plan(&fd.src, &fd.tables, &entries(&fd)).is_none(),
+            "{name}"
+        );
+        assert!(Borrowed::new(&fd, false, None).is_err(), "{name}");
+        changed.push(name.clone());
+    }
+    assert!(!changed.is_empty());
+    let after = paired_of(&input.write());
+    assert!(changed.iter().all(|name| !after.contains(name)), "{after:?}");
+}
+
+/// The window in which a product finds the other of its pair goes on while the next instruction
+/// is not an entry of the function and the one before it is plain (`reference/pairing.py`,
+/// `attempt`): it is not cut where another way comes in that is not among the entries. In
+/// k_pairs.cu, a branch from after the end of the code (reached from nowhere) to the second
+/// product of a pair, with the entries as they were: the pairs stay.
+#[test]
+fn the_pair_window_is_cut_by_entries_only() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let elf = crate::elf::Elf::parse(original).unwrap();
+    let mut dec75 = Decoder::new(75);
+    let mut tried = 0;
+    for section in elf.sections.iter().filter(|s| s.name.starts_with(".text.")) {
+        let name = &section.name[".text.".len()..];
+        let fd = parse_function(&mut dec75, name, &section.data, 255, vec![]).unwrap();
+        let entered = entries(&fd);
+        let Some(plan) = crate::pairing::plan(&fd.src, &fd.tables, &entered) else {
+            continue;
+        };
+        let n = fd.src.len();
+        let last = n - 1;
+        if fd.src[last].mnemonic != "NOP" {
+            continue;
+        }
+        for (&j, site) in &plan.sites {
+            if site.partner > j {
+                continue;
+            }
+            let mut src = fd.src.clone();
+            let word = branch(&mut dec75, last, j);
+            src[last] = dec75.decode(word).unwrap();
+            let paired = crate::pairing::plan(&src, &fd.tables, &entered);
+            assert_eq!(
+                paired.map(|p| p.sites.keys().copied().collect::<Vec<_>>()),
+                Some(plan.sites.keys().copied().collect::<Vec<_>>()),
+                "{name}: a way into the product at 0x{:x}",
+                16 * j
+            );
+            tried += 1;
+        }
+    }
+    assert!(tried > 0);
+}
+
+/// Where the ways through a function are not known (here no entries are: a branch through a
+/// register without a table gives none), there is no plan, and the flow is asked nothing more
+/// (`debug_assert` of the facts that pairing needs came before that check, and panicked).
+#[test]
+fn no_plan_where_the_ways_are_unknown() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let elf = crate::elf::Elf::parse(original).unwrap();
+    let mut dec75 = Decoder::new(75);
+    let mut planned = 0;
+    for section in elf.sections.iter().filter(|s| s.name.starts_with(".text.")) {
+        let fd = parse_function(&mut dec75, &section.name[".text.".len()..], &section.data, 255, vec![]).unwrap();
+        if crate::pairing::plan(&fd.src, &fd.tables, &entries(&fd)).is_some() {
+            planned += 1;
+            assert!(
+                crate::pairing::plan(&fd.src, &fd.tables, &None).is_none(),
+                "{}",
+                section.name
+            );
+        }
+    }
+    assert!(planned > 0);
 }
