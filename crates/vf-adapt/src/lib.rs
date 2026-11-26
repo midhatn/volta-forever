@@ -105,6 +105,9 @@ pub struct Policy {
     /// (`VF_PAIRS=0`: they are not, nor in safe mode). The same variable sets `lowering.pairs`, the
     /// pairs of the program-text lowering.
     pub pairs: bool,
+    /// Whether loop-invariant whole-row matrix load addresses are hoisted into companion registers
+    /// before loops in machine code (`VF_COMPANIONS=0`: they are not; unused when `pairs` is false).
+    pub companions: bool,
     /// Where the translation of machine code takes its registers (`VF_BORROW`; the values are
     /// those of `vf_sass::translate::Options::borrow`). The default, 7: above the program's
     /// wherever that translates, and for a kernel refused for want of registers, among the
@@ -264,6 +267,7 @@ impl Default for Policy {
             told_sm: None,
             translate: Translate::WithoutPtx,
             pairs: true,
+            companions: true,
             borrow: vf_sass::translate::BORROW_DEFAULT,
             keep_sources: false,
             safe: false,
@@ -467,7 +471,8 @@ impl Policy {
     /// a value that is not one, or is below 7.0, is not used (`requested_capability`).
     /// `VF_TRANSLATE=0`: do not translate machine code; `VF_TRANSLATE=first`: translate it also
     /// where an image has PTX (`Translate`). `VF_PAIRS=0`: compute every tensor-core product by
-    /// itself, in machine code (`pairs`) and in program text (`lowering.pairs`). `VF_SAFE=1`: what
+    /// itself, in machine code (`pairs`) and in program text (`lowering.pairs`). `VF_COMPANIONS=0`: do not hoist loop-invariant whole-row
+    /// matrix load addresses into companion registers in machine code (`companions`). `VF_SAFE=1`: what
     /// these ask for whose results are not bit-identical to the default's is not used, nor the pairs
     /// of machine code (`make_safe`). `VF_REPORTED_TRAPS=0` (that value only: any other leaves it
     /// on): no instruction is replaced by a reported trap (`lowering.reported_traps`): the functions
@@ -587,6 +592,9 @@ impl Policy {
         if let Ok(value) = std::env::var("VF_PAIRS") {
             self.pairs = value != "0";
             self.lowering.pairs = self.pairs;
+        }
+        if let Ok(value) = std::env::var("VF_COMPANIONS") {
+            self.companions = value != "0";
         }
         if let Ok(value) = std::env::var("VF_BORROW") {
             self.borrow = vf_sass::translate::borrow_from(Some(&value));
@@ -715,6 +723,7 @@ impl Policy {
         let opts = vf_sass::translate::Options {
             pairs: self.pairs,
             aligned_rows: self.lowering.aligned_rows,
+            companions: self.companions,
             borrow: self.borrow,
         };
         let translated = vf_sass::translate::translate_with_options(cubin, false, &opts)?;
@@ -3535,13 +3544,14 @@ mod tests {
         );
         // What gives the default's bits, what refuses instead of computing otherwise, and what the
         // programs are told: left as they are (the pairs of machine code apart).
-        let kept: [Change; 6] = [
+        let kept: [Change; 7] = [
             &|p| p.lowering.bf16_column = Bf16Column::Ordered,
             &|p| p.lowering.bf16_row = Bf16Row::Ordered,
             &|p| p.translate = Translate::Never,
             &|p| p.told_sm = Some(80),
             &|p| p.borrow = 9,
             &|p| p.lowering.aligned_rows = false,
+            &|p| p.companions = false,
         ];
         for change in kept {
             let mut policy = with(change);
@@ -3601,6 +3611,35 @@ mod tests {
         unpaired.lowering.pairs = false;
         assert_ne!(text(&Policy::default()), text(&unpaired));
         assert_eq!(text(&safe), text(&Policy::default()));
+    }
+
+    #[test]
+    fn policy_companions_controls_hoisting_and_respects_unpaired_and_safe() {
+        let cubin = include_bytes!("../../../tests/kernels/k_pairs.135.sm75.cubin");
+        let default = Policy::default();
+        assert!(default.companions);
+        let no_comp = Policy {
+            companions: false,
+            ..default
+        };
+        let image = |policy: &Policy| policy.adapt_cubin(cubin).image.unwrap();
+        assert_ne!(image(&default), image(&no_comp));
+
+        let unpaired = Policy {
+            pairs: false,
+            ..default
+        };
+        let unpaired_no_comp = Policy {
+            companions: false,
+            ..unpaired
+        };
+        assert_eq!(image(&unpaired), image(&unpaired_no_comp));
+
+        let mut safe = default;
+        safe.make_safe();
+        let mut safe_no_comp = no_comp;
+        safe_no_comp.make_safe();
+        assert_eq!(image(&safe), image(&safe_no_comp));
     }
 
     #[test]

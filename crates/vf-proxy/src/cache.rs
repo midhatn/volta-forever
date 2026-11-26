@@ -1333,5 +1333,12 @@ mod tests {
             cache_hash(img, &vf_adapt::Policy { pairs: true, ..safe }),
             cache_hash(img, &safe)
         );
+        let no_companions = vf_adapt::Policy {
+            companions: false,
+            ..vf_adapt::Policy::default()
+        };
+        assert_ne!(cache_hash(img, &no_companions), h1);
+        assert_ne!(cache_hash(img, &no_companions), cache_hash(img, &unpaired));
+        assert_ne!(cache_hash(img, &no_companions), cache_hash(img, &safe));
     }
 }

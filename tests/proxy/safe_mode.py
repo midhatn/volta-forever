@@ -114,6 +114,7 @@ ELF75_PTX75 = W / "crates" / "vf-fatbin" / "tests" / "data" / "elf75-ptx75-zstd.
 ELF70_ELF75_PTX70 = W / "crates" / "vf-fatbin" / "tests" / "data" / "elf70-elf75-ptx70-lz4.fatbin"
 CUBIN = W / "tests" / "kernels" / "k_fit_test.135.sm75.cubin"
 PAIRED = W / "tests" / "kernels" / "k_pair_bits.135.sm75.cubin"
+PAIRED_COMP = W / "tests" / "kernels" / "k_pairs.135.sm75.cubin"
 MACHINE_PAIRS = "VF_PAIRS in machine code"
 
 checks = wrong = 0
@@ -241,6 +242,16 @@ def images(proxy):
     notsafe, said = proxy.run(PAIRED, {"VF_SAFE": "true"})
     check(f"{PAIRED.name}: VF_SAFE='true' keeps the pairs", notsafe == paired)
 
+    # Companion register hoisting (VF_COMPANIONS=0 disables): enabled by default on paired machine
+    # code; under VF_SAFE=1 (which turns off pairs), companions are unused and not named separately.
+    paired_comp, _ = proxy.run(PAIRED_COMP)
+    no_comp, _ = proxy.run(PAIRED_COMP, {"VF_COMPANIONS": "0"})
+    check(f"{PAIRED_COMP.name}: VF_COMPANIONS=0 gives another image (control)", no_comp != paired_comp)
+    safe_comp, said = proxy.run(PAIRED_COMP, {"VF_SAFE": "1"})
+    safe_no_comp, _ = proxy.run(PAIRED_COMP, {"VF_SAFE": "1", "VF_COMPANIONS": "0"})
+    check(f"{PAIRED_COMP.name}: VF_SAFE=1 ignores VF_COMPANIONS and keeps one safe image",
+          safe_comp == safe_no_comp and len(said) == 1 and f"{MACHINE_PAIRS} not used" in said[0], said)
+
 
 def cache(proxy, out):
     def files(directory, suffix):
@@ -288,6 +299,31 @@ def cache(proxy, out):
         manifests.append(files(directory, ".manifest"))
     check("library: default, the switch, the switch in safe mode: three keys; safe mode alone: the third again",
           [len(m) for m in manifests] == [1, 2, 3, 3, 3], manifests)
+
+    # Companion register hoisting (VF_COMPANIONS=0 disables): cached separately for both module
+    # and library loads, so toggling VF_COMPANIONS never reuses a cached translation of the other.
+    for library in (False, True):
+        kind = "library" if library else "module"
+        comp_runs = {}
+        for order in (("default", "no-companions"), ("no-companions", "default")):
+            directory = fresh(f"cache-companions-{kind}-" + "-".join(order))
+            settings = {"VF_PROXY_CACHE": str(directory), "VF_LAZY": "1"}
+            seen = []
+            for _ in range(2):
+                for mode in order:
+                    env = dict(settings, **({"VF_COMPANIONS": "0"} if mode == "no-companions" else {}))
+                    given, _ = proxy.run(PAIRED_COMP, env, library=library)
+                    comp_runs.setdefault(mode, given)
+                    check(f"{PAIRED_COMP.name} ({kind}, {' then '.join(order)}): {mode} gives the same image",
+                          given == comp_runs[mode])
+                    seen.append(files(directory, ".t"))
+            check(f"{PAIRED_COMP.name} ({kind}, {' then '.join(order)}): separate keys for default and VF_COMPANIONS=0",
+                  [len(s) for s in seen] == [1, 2, 2, 2], seen)
+            comp_runs.setdefault("keys", seen[-1])
+            check(f"{PAIRED_COMP.name} ({kind}, {' then '.join(order)}): same keys whatever the order",
+                  seen[-1] == comp_runs["keys"])
+        check(f"{PAIRED_COMP.name} ({kind}): VF_COMPANIONS=0 gives another image",
+              comp_runs["no-companions"] != comp_runs["default"])
 
 
 def main():
