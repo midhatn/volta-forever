@@ -83,6 +83,11 @@ sm_75 cubins named with it, and counts what validate.py finds. A control that pa
                 from elsewhere, a call, another register of B gathered
     unkept      of what a function with a product keeps of the lane, the lane that holds what
                 a thread gathers for the columns 4 to 7 is 8 further and not 16
+    unpaired    the upper half of a 64-bit uniform operand of an instruction that goes to
+                ordinary registers (UIMAD.WIDE, UIMAD.WIDE.X) gets another register than the
+                lower half's + 1, even when the lower half is even
+    misruled    the immediate of the first instruction translated by a rule to ordinary registers
+                is altered by one
 
 With pairs of products on whole rows (the translation as it is has them, unless VF_PAIRS=0:
 these change nothing then):
@@ -768,6 +773,73 @@ def patched(control):
             item.what = {'to pairs': 'from pairs', 'from pairs': 'to pairs'}.get(item.what, item.what)
         return new
 
+    translate_orig = Function.translate
+    one_orig = Function.one
+
+    def unpaired_translate(self, place, *args, **kwargs):
+        place = dict(place)
+        paired64 = {
+            d.ops[op]
+            for d in self.src
+            if d.c.name in self.mc.rule_of
+            for l, op, span in self.mc._uses[(75, d.c.name)].reads + self.mc._uses[(75, d.c.name)].writes
+            if l == 'U' and op in d.ops and d.ops[op] != 63 and machine.registers(span, d.ops) == 2
+        }
+        indiv = {
+            d.ops[op] + k
+            for d in self.src
+            for l, op, span in self.mc._uses[(75, d.c.name)].reads + self.mc._uses[(75, d.c.name)].writes
+            if l == 'U' and op in d.ops and d.ops[op] != 63
+            for k in ((0, 1) if d.c.name.startswith('uldc') and machine.registers(span, d.ops) == 2 else ((0,) if machine.registers(span, d.ops) == 1 else ()))
+        }
+        for u in sorted(paired64):
+            if u in place and u + 1 in place and u + 1 in indiv and place[u] % 2 == 0 and place[u + 1] == place[u] + 1:
+                singleton = next((v for v in sorted(place) if v != u and v != u + 1 and v not in self.pairs and (v - 1) not in self.pairs and place[v] != place[u] + 1), None)
+                if singleton is not None:
+                    place[u + 1], place[singleton] = place[singleton], place[u + 1]
+                    break
+                used = set(place.values()) | (set(self.borrow.used) if self.borrow else set())
+                free_r = next((r for r in range(max(args[5], 2), 255) if r not in used and r != place[u] + 1), None)
+                if free_r is not None:
+                    place[u + 1] = free_r
+                    break
+        return translate_orig(self, place, *args, **kwargs)
+
+    def unpaired_from_memory(self, i, d):
+        items = from_memory(self, i, d)
+        if d.c.name in self.mc.rule_of and self.borrow and self.borrow.slots:
+            _, _, together = self.in_frame(d)
+            for u in sorted(together):
+                if u in self._mem_regs and u + 1 in self._mem_regs and self._mem_regs[u] % 2 == 0 and self._mem_regs[u + 1] == self._mem_regs[u] + 1:
+                    old_r1 = self._mem_regs[u + 1]
+                    try:
+                        alt = self.take(1)
+                    except translate.Refused:
+                        alt = None
+                    if alt is not None and alt != old_r1:
+                        self._mem_regs[u + 1] = alt
+                        for item in items:
+                            d70 = self.mc.decode(70, item.word)
+                            if d70 and d70.mnemonic == 'LDL' and d70.ops.get('Rd') == old_r1:
+                                item.word = self.mc.assemble('ldl__sImmOffset', Rd=alt, Ra=d70.ops['Ra'], Ra_offset=d70.ops.get('Ra_offset', 0), dst_wr_sb=d70.ops.get('dst_wr_sb', 7))
+                        break
+        return items
+
+    def misruled_one(self, i, d):
+        items = one_orig(self, i, d)
+        if not getattr(self, '_misruled_done', False):
+            for item in items:
+                if item.what == 'ordinary registers':
+                    d70 = self.mc.decode(70, item.word)
+                    if d70 is not None:
+                        for kind, fields, data in self.mc.d70.plan(d70.c):
+                            if kind == 'operand' and data in ('Sc', 'Sb') and any('Imm' in f.name or 'imm' in f.name or d70.c.operands[data].type == 'SImm' for f in fields if data in d70.c.operands):
+                                val = fields[0].get(item.word)
+                                item.word = fields[0].put(item.word, val ^ 1)
+                                self._misruled_done = True
+                                return items
+        return items
+
     all_controls = {
         'as it is': {},
         'unsaved': {'stand_ins': unsaved},
@@ -829,6 +901,8 @@ def patched(control):
         'overlap_pool': {},
         'short_home': {},
         'pool_in_home_unsaid': {},
+        'unpaired': {'translate': unpaired_translate, 'from_memory': unpaired_from_memory},
+        'misruled': {'one': misruled_one},
     }
     # ---- level 3 controls (the frame) ----
     from_memory, to_memory = Function.from_memory, Function.to_memory
@@ -1248,7 +1322,7 @@ def patched(control):
     return all_controls[control]
 
 
-CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
+CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'unpaired', 'misruled', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
 # (Those of pairs of products on whole rows: only when the translator makes them, not with VF_PAIRS=0.)
 PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso']
 CONTROLS += PAIR_CONTROLS
@@ -1373,7 +1447,7 @@ def run(mc, control, path, out_dir, untouched, validated=True):
     """(problems validate.py finds, its first objection) for one cubin; (None, '') when the control
     changed nothing in its translation, which `untouched` holds by path. (`validated` false: the
     translation as it is is kept there and not validated.)"""
-    originals = {name: getattr(Function, name) for name in ('stand_ins', 'liveness', 'late', 'schedule', 'return_addresses', 'matrix_load', 'matrix_product', 'kept', 'kept_gathering', 'given_back', 'all_predicates', 'waits_for', 'masked',
+    originals = {name: getattr(Function, name) for name in ('stand_ins', 'liveness', 'late', 'schedule', 'return_addresses', 'matrix_load', 'matrix_product', 'kept', 'kept_gathering', 'given_back', 'all_predicates', 'waits_for', 'masked', 'translate', 'one',
                                                              'kept_for_rows', 'whole_rows', 'half_of_pair', 'converted',
                                                              'from_memory', 'to_memory', 'frame_top', 'load_word', 'store_word', 'read_back')}
     for name, replacement in patched(control).items():

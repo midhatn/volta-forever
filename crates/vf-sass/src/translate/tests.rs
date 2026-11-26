@@ -1071,6 +1071,152 @@ fn a_uniform_sign_extension_becomes_sgxt() {
 }
 
 #[test]
+fn uimad_stride_and_wide_kernel_translates_and_preserves_pairs() {
+    let cubin = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/k_uimad.sm75.cubin"
+    ));
+    let mut decoder = Decoder::new(70);
+    for borrow in [Options::default().borrow, 8] {
+        let options = Options {
+            borrow,
+            ..Options::default()
+        };
+        let result = translate_with_options(cubin, true, &options).unwrap();
+        assert!(
+            result.report.iter().all(|f| f.refused.is_none()),
+            "refused under borrow={borrow:?}: {:?}",
+            result.report
+        );
+        let out = crate::elf::Elf::parse(&result.bytes).unwrap();
+        let map = result.map.unwrap();
+        let mut decode_at = |func: &str, origin: u64| {
+            let code = &out.sections[out.section(&format!(".text.{func}")).unwrap()].data;
+            let (_, new, _, what) = map
+                .iter()
+                .find(|(f, _, old, w)| f == func && *old == origin && !w.starts_with("mem: "))
+                .unwrap_or_else(|| panic!("missing {func}+0x{origin:x} under {borrow:?}"));
+            let at = *new as usize;
+            let d = decoder
+                .decode(u128::from_le_bytes(code[at..at + 16].try_into().unwrap()))
+                .unwrap();
+            (what.clone(), d)
+        };
+        let (w_stride, d_stride) = decode_at("k_uimad_stride", 0xb0);
+        assert_eq!((w_stride.as_str(), d_stride.mnemonic), ("ordinary registers", "IMAD"));
+        assert_eq!(d_stride.op_or_name("Sc", 0), 0x240);
+
+        let (w_wide, d_wide) = decode_at("k_uimad_wide_hi", 0x60);
+        assert_eq!((w_wide.as_str(), d_wide.mnemonic), ("ordinary registers", "IMAD"));
+        assert_eq!(d_wide.name, "imad_wide__RRR_RRR");
+        let rd = d_wide.op_or_name("Rd", 255);
+        assert_eq!(rd % 2, 0);
+        assert_eq!(d_wide.op_or_name("Rc", 255), rd);
+        let (_, d_hi_read) = decode_at("k_uimad_wide_hi", 0x80);
+        assert_eq!(d_hi_read.op_or_name("Rc", 255), rd + 1);
+    }
+}
+
+#[test]
+fn uimad_x_and_uimad_wide_x_preserve_predicates_and_pairs() {
+    let mut decoder = Decoder::new(70);
+    // Patch k_guarded_state+0x1d0 with UIMAD.X UR5, UR4, UR6, 0x240, UP0 right after 0x1c0 writes UP0.
+    let guards_tmpl = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/k_guards.sm75.cubin"
+    ));
+    let mut g_in = crate::elf::Elf::parse(guards_tmpl).unwrap();
+    let g_sec = g_in.section(".text.k_guarded_state").unwrap();
+    assert_eq!(
+        &g_in.sections[g_sec].data[0x1d0..0x1e0],
+        &0x000fd2000fffe006_0000000104057890_u128.to_le_bytes()
+    );
+    g_in.sections[g_sec].data[0x1d0..0x1e0].copy_from_slice(&0x000fd200080e0606_00000240040574a4_u128.to_le_bytes());
+
+    // Patch k_uimad_wide_hi+0x60 with UIMAD.WIDE.X UR4, UR8, UR9, UR4, UPT.
+    let uimad_tmpl = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/k_uimad.sm75.cubin"
+    ));
+    let mut u_in = crate::elf::Elf::parse(uimad_tmpl).unwrap();
+    let u_sec = u_in.section(".text.k_uimad_wide_hi").unwrap();
+    assert_eq!(
+        &u_in.sections[u_sec].data[0x60..0x70],
+        &0x000fcc000f8e0004_00000009080472a5_u128.to_le_bytes()
+    );
+    u_in.sections[u_sec].data[0x60..0x70].copy_from_slice(&0x000fcc000b8e0604_00000009080472a5_u128.to_le_bytes());
+
+    let g_bytes = g_in.write();
+    let u_bytes = u_in.write();
+    for borrow in [Options::default().borrow, 8] {
+        let options = Options {
+            borrow,
+            ..Options::default()
+        };
+        let gr = translate_with_options(&g_bytes, true, &options).unwrap();
+        assert!(gr.report.iter().all(|f| f.refused.is_none()));
+        let gout = crate::elf::Elf::parse(&gr.bytes).unwrap();
+        let gcode = &gout.sections[gout.section(".text.k_guarded_state").unwrap()].data;
+        let gmap = gr.map.unwrap();
+        let (_, cmp_off, _, _) = gmap
+            .iter()
+            .find(|(f, _, old, w)| {
+                f == "k_guarded_state"
+                    && *old == 0x1c0
+                    && !w.starts_with("mem: ")
+                    && *w != "held: back"
+                    && *w != "held: kept"
+            })
+            .unwrap();
+        let cmp = decoder
+            .decode(u128::from_le_bytes(
+                gcode[*cmp_off as usize..*cmp_off as usize + 16].try_into().unwrap(),
+            ))
+            .unwrap();
+        let (_, u_off, _, u_what) = gmap
+            .iter()
+            .find(|(f, _, old, w)| {
+                f == "k_guarded_state"
+                    && *old == 0x1d0
+                    && !w.starts_with("mem: ")
+                    && *w != "held: back"
+                    && *w != "held: kept"
+            })
+            .unwrap();
+        let uimad_x = decoder
+            .decode(u128::from_le_bytes(
+                gcode[*u_off as usize..*u_off as usize + 16].try_into().unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(u_what, "ordinary registers");
+        assert_eq!(uimad_x.name, "imad_x__RRsI_RRI");
+        assert_eq!(uimad_x.op_or_name("Sc", 0), 0x240);
+        assert_eq!(uimad_x.op_or_name("Pp", 7), cmp.op_or_name("Pu", 6));
+
+        let ur = translate_with_options(&u_bytes, true, &options).unwrap();
+        assert!(ur.report.iter().all(|f| f.refused.is_none()));
+        let uout = crate::elf::Elf::parse(&ur.bytes).unwrap();
+        let ucode = &uout.sections[uout.section(".text.k_uimad_wide_hi").unwrap()].data;
+        let umap = ur.map.unwrap();
+        let (_, w_off, _, w_what) = umap
+            .iter()
+            .find(|(f, _, old, w)| f == "k_uimad_wide_hi" && *old == 0x60 && !w.starts_with("mem: "))
+            .unwrap();
+        let wide_x = decoder
+            .decode(u128::from_le_bytes(
+                ucode[*w_off as usize..*w_off as usize + 16].try_into().unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(w_what, "ordinary registers");
+        assert_eq!(wide_x.name, "imad_wide_x__RRR_RRR");
+        assert_eq!(wide_x.op_or_name("Pp", 0), 7);
+        let rd = wide_x.op_or_name("Rd", 255);
+        assert_eq!(rd % 2, 0);
+        assert_eq!(wide_x.op_or_name("Rc", 255), rd);
+    }
+}
+
+#[test]
 fn graph_register_policy_only_rebudgets_an_entry_that_loses_a_legal_block() {
     let original = include_bytes!("../../../../tests/kernels/k_fit_test.135.sm75.cubin");
     let name = "k_fit_regs";

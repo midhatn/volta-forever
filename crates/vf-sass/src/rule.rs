@@ -165,4 +165,56 @@ mod tests {
             assert_eq!(mapped, expected, "{}", insn.name);
         }
     }
+
+    #[test]
+    fn remap_uimad_and_carry_variants() {
+        // Verified with nvdisasm -b SM75 and nvdisasm -b SM70; ordinary registers start at R100.
+        let cases = [
+            // UIMAD UR4, UR4, UR5, 0x240 -> IMAD R104, R104, R105, 0x240
+            (
+                0x001fcc000f8e0205_00000240040474a4_u128,
+                0x001fcc00078e0269_0000024068687424_u128,
+            ),
+            // UIMAD UR4, UR4, UR5, -0x240 -> IMAD R104, R104, R105, -0x240
+            (
+                0x000fc2000f8e0205_fffffdc0040474a4_u128,
+                0x000fc200078e0269_fffffdc068687424_u128,
+            ),
+            // UIMAD.X UR4, UR6, UR8, UR10, UP2 -> IMAD.X R104, R106, R108, R110, P2
+            (
+                0x000fc200090e060a_00000008060472a4_u128,
+                0x000fc200010e066e_0000006c6a687224_u128,
+            ),
+            // UIMAD.X UR4, UR6, UR8, 0x240, UPT -> IMAD.X R104, R106, R108, 0x240, PT
+            (
+                0x000fc2000b8e0608_00000240060474a4_u128,
+                0x000fc200038e066c_000002406a687424_u128,
+            ),
+            // @UP2 UIMAD.X UR4, UR6, 0x240, UR8, UP1 -> @P2 IMAD.X R104, R106, 0x240, R108, P1
+            (
+                0x000fc200088e0608_00000240060428a4_u128,
+                0x000fc200008e066c_000002406a682824_u128,
+            ),
+            // UIMAD.WIDE.X UR4, UP1, UR6, UR8, UR10, UPT -> IMAD.WIDE.X R104, P1, R106, R108, R110, PT
+            (
+                0x000fc2000b82060a_00000008060472a5_u128,
+                0x000fc2000382066e_0000006c6a687225_u128,
+            ),
+            // UIMAD.WIDE.X UR4, UR6, -0x240, UR10, UPT -> IMAD.WIDE.X R104, R106, -0x240, R110, PT
+            (
+                0x000fc2000b8e060a_fffffdc0060478a5_u128,
+                0x000fc200038e066e_fffffdc06a687825_u128,
+            ),
+        ];
+        let mut decoder = Decoder::new(75);
+        for (source, expected) in cases {
+            let insn = decoder.decode(source).unwrap();
+            let target = rule_of_target(insn.class_id).expect(insn.name);
+            let rule = find_rule(insn.name, target, "").unwrap();
+            let Applied::Word(mapped) = apply(rule, source, &|ur| Some(100 + ur), &Some) else {
+                panic!("failed to map {}", insn.name);
+            };
+            assert_eq!(mapped, expected, "{}", insn.name);
+        }
+    }
 }

@@ -3945,6 +3945,7 @@ def main():
                 want = unreused(source)
                 pairs = list(zip(REG.findall(want), REG.findall(got[0])))
                 ok = len(REG.findall(want)) == len(REG.findall(got[0]))
+                got_ur = {}
                 for u, r in pairs:
                     if u.startswith('UR') and u != 'URZ':
                         un = int(u[2:])
@@ -3957,6 +3958,8 @@ def main():
                             ok = ok and rn >= 0 and (rn > highest or rn >= 2)
                         else:
                             ok = ok and rn >= 0 and place.setdefault(u, r) == r and (rn > highest or rn >= 2)
+                        if ok and rn >= 0:
+                            got_ur[un] = rn
                         if ok and rn <= highest and rn >= 2:
                             borrowed_regs.add(rn)
                     elif u == 'URZ':
@@ -3967,6 +3970,27 @@ def main():
                         ok = ok and r == 'PT'
                     else:
                         ok = ok and u == r
+                # A 64-bit uniform operand (e.g. UIMAD.WIDE, UIMAD.WIDE.X): its upper register
+                # UR(u+1) stands for R(r+1) on an aligned even pair, and counts if borrowed.
+                d75 = mc.decode(75, int.from_bytes(a.data[old:old + 16], 'little'))
+                uses75 = mc._uses.get((75, d75.c.name)) if d75 is not None else None
+                if ok and uses75 is not None:
+                    for letter, operand, span in uses75.reads + uses75.writes:
+                        if letter == 'U' and operand in d75.ops and d75.ops[operand] != 63 and machine.registers(span, d75.ops) == 2:
+                            un = d75.ops[operand]
+                            rn = got_ur.get(un, -1)
+                            ok = ok and rn >= 0 and rn % 2 == 0
+                            if not ok:
+                                break
+                            r_hi = 'R%d' % (rn + 1)
+                            if un + 1 in mem_standins:
+                                ok = ok and mem_standins[un + 1] == r_hi and (rn + 1 > highest or rn + 1 >= 2)
+                            elif un + 1 in frame_slots:
+                                ok = ok and (rn + 1 > highest or rn + 1 >= 2)
+                            else:
+                                ok = ok and place.setdefault('UR%d' % (un + 1), r_hi) == r_hi and (rn + 1 > highest or rn + 1 >= 2)
+                            if ok and rn + 1 <= highest and rn + 1 >= 2:
+                                borrowed_regs.add(rn + 1)
                 # Everything but the registers: the same once the uniform mnemonic and names are made ordinary.
                 if not ok or plain(shape_of(want)) != plain(shape_of(unreused(got[0]))):
                     say(new, old, whats[0], 'not the same on ordinary registers')
