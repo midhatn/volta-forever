@@ -422,8 +422,7 @@ gathered from other lanes with shuffles. The B columns (eight registers, four fo
 the two columns) come from eight lanes, one shuffle each. Each sum is four `dp4a.s32.s32`
 instructions, one for each group of 4 consecutive k-elements. The two sums are interleaved: three steps of the first,
 three of the second, then the last step of each (which writes the destination register).
-The accumulator is passed through; when `d[0]` does not alias `c[1]` or `d[1]`, `.satfinite`-free
-products accumulate straight into `d` without intermediate temporary registers.
+The accumulator is passed through.
 
 Signed, unsigned and mixed forms are all supported (`dp4a.s32.s32` for signed, `.u32.u32`
 for unsigned, `.u32.s32` or `.s32.u32` for mixed). Products on 4-bit integers (`.s4`, `.u4`)
@@ -465,10 +464,9 @@ last with `add.sat.s32`.
 ### Ampere shapes: m16n8k16, m16n8k32
 
 Each is a composition of Turing products. `m16n8k16` is two Turing products (rows 0-7 and
-8-15) with the same B. `m16n8k32` is four, scheduled `(a[0], b[0])`, `(a[1], b[0])`,
-`(a[2], b[1])`, `(a[3], b[1])` (and the same order inside `.satfinite`) so all 8 shuffled
-registers of `b[0]` finish and retire before `b[1]` is gathered. The decomposition follows
-from the fragment layouts of the PTX manual.
+8-15) with the same B. `m16n8k32` is four: for each half of the rows, the first 16 columns
+then the last 16, the second accumulating on the first. The decomposition follows from the
+fragment layouts of the PTX manual.
 
 ### A operands loaded from shared memory
 
@@ -476,11 +474,12 @@ Kernels keep many A operands in registers through long unrolled loops, four regi
 each. When the A operand was loaded by `ldmatrix` and nothing between the load and the
 product can change the memory (no label, no store to shared memory, no call, no barrier),
 the layer keeps only the address of the row. Within each immutable shared-memory segment,
-reused A registers (`>= 2` products) are promoted to cached non-volatile `ld.shared.v4.u32`
-(remembered as `Form::Row`) up to 8 concurrently live row fragments per segment (`32`
-registers), so dense MMA tiles reload each reused A fragment once while single-use or
-higher-concurrency unrolled loops (such as `q6_K`) remain `ld.volatile.shared.v4.u32` to
-avoid local-memory spills. It takes `VF_ALIGNED_ROWS` on (the default, section 3); with
+A fragments reused across `>= 3` products are loaded once with `ld.volatile.shared.v4.u32`
+and remembered as `Form::Row` up to 8 concurrently live row fragments per segment (`32`
+registers): keeping `volatile` on the single load prevents `ptxas` from hoisting loads
+across unrolled loop turns (avoiding local-memory spills) or over-packing rolled loops,
+while dense MMA tiles (such as `2x4` and `4x4`) eliminate redundant shared-memory reloads;
+lower-reuse (`< 3`) or over-budget fragments reload per product as before. It takes `VF_ALIGNED_ROWS` on (the default, section 3); with
 `VF_ALIGNED_ROWS=0` the row is gathered by shuffles.
 
 **Test cases.** `tests/gpu/run.sh`: `tensor-core` (integer kernels among the 37),
@@ -550,10 +549,15 @@ products of the three type combinations, and operands from `ldmatrix`.
 A 4-bit float with 2 exponent bits (bias 1) and 1 mantissa bit. The 16 values: 0, 0.5, 1,
 1.5, 2, 3, 4, 6, and their negatives. Every value is an exact f16 half.
 
-**Conversions.** `cvt.rn.f16x2.e2m1x2` (decode): exact. The upper nibble gives the upper
-half, the lower nibble the lower half. `cvt.rn.satfinite.e2m1x2.f32` (encode): round to
-nearest, ties to even. NaN becomes +6 (the format has no NaN); values beyond +-6 become
-+-6. The `.relu` variant sets negative inputs to +0.
+**Conversions.** `cvt.rn.f16x2.e2m1x2` (decode): exact, lowered with `prmt.b32` byte
+lookup (`0x3E3C3800`, `0x46444240` for the high bytes of magnitudes `0..7`, zero low bytes)
+and `prmt.b32` + `lop3.b32` sign placement (without `HMUL2`). Because generic `prmt`
+sign-extends bit 7 (0) of those LUT bytes whenever selector bit 3 is set (`8..15`), the
+`.relu` variant clamps negative inputs including `-0.0` to `+0.0` in two `prmt.b32`
+instructions. The upper nibble gives the upper half, the lower nibble the lower half.
+`cvt.rn.satfinite.e2m1x2.f32` (encode): round to nearest, ties to even. NaN becomes +6
+(the format has no NaN); values beyond +-6 become +-6. The `.relu` variant sets negative
+inputs to +0.
 
 ### UE8M0 (unsigned 8-bit exponent)
 
@@ -612,19 +616,24 @@ sum over k in block b of A[r][k] * B[k][c]).
 
 For each block:
 
-1. E2M1 nibbles are decoded to exact halves (every E2M1 value is an f16). For E4M3 and
-   E5M2 (the MXF8F6F4 form), bytes are decoded to halves as in section 6.
-2. The block is computed by FP16 products on Volta's `mma.m8n8k4` (section 2), into an f32
-   sum that starts from zero. For `scale_vec::4X` (NVFP4), where one pair of threads of the
-   group holds a block of 16, the block's k-values are first shuffled to all four threads of
-   the group. The f32 block sum is exact for E2M1 (at most 16 * 36 = 576 for NVFP4, 1,152 for
-   the blocks of 32 of MXFP4).
-3. The block sum is multiplied by the product of the two scales, and the scaled sums of the
-   blocks are added in f64. (For NVFP4 the scales are combined and applied in f32, where
-   every such product is exact: a UE4M3 scale has few significant bits and the block sum is a
-   small integer of quarters. The sum over the blocks is in f64 for every form.)
-4. The final f64 sum is converted to f32: by truncation toward zero for `scale_vec::4X`
-   (NVFP4), by round-to-nearest-even for `scale_vec::2X` and `1X`.
+1. For FP4 (`kind::mxf4` and `kind::mxf4nvf4`), packed 32-bit E2M1 operand registers are
+   first shuffled to the split-octet `mma.m8n8k4.row.col` arrangement and then decoded in
+   place to exact f16x2 halves via the `prmt`/`lop3` lookup (8 nibbles per `.b32` word,
+   zero `HMUL2`). For E4M3 and E5M2 (`kind::mxf8f6f4`), bytes are decoded to halves as in
+   section 6.
+2. Each block is computed on Volta's `mma.m8n8k4` (section 2) into a zero-initialized f32
+   accumulator. Both FP4 forms use the single-instruction `mma.m8n8k4.row.col` split-octet
+   layout (8 Volta `mma.m8n8k4` instructions = 32 HMMA steps total for K=64, reducing across
+   octets with four `bfly 8` exchanges per block). The f32 block sum is exact for E2M1
+   (every term is a quarter, and sums reach at most 576 for NVFP4 or 1,152 for MXFP4).
+3. Each block sum is multiplied by `scale_A * scale_B` and added to the `f64` accumulator
+   (kept in split-octet layout across blocks for FP4). For NVFP4, UE4M3 scales are decoded
+   to `value * 2^-8` in f32 (exact normal values) with `* 2^16` folded once onto `scale_A` per
+   block, then combined and applied in f32 before widening to f64 (exact for the small
+   integer-of-quarters block sums); MXFP4 and MXF8F6F4 keep UE8M0 scales in f64.
+4. The final f64 sum is converted to f32 (truncation toward zero for `scale_vec::4X`,
+   round-to-nearest-even for `scale_vec::2X` and `1X`, `0x7fffffff` on NaN) and, for FP4,
+   gathered back to Turing's `D` layout once at the end.
 
 ### Scale distribution
 

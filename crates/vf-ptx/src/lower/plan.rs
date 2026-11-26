@@ -37,8 +37,8 @@ pub(super) struct Plan<'a> {
     pub(super) columns: HashSet<&'a str>,
     /// A operands of integer products whose row every product loads from shared memory.
     pub(super) row: HashSet<&'a str>,
-    /// Reused A operands in `row` promoted to cached non-volatile `ld.shared.v4.u32` (`Form::Row`)
-    /// within the per-segment register budget.
+    /// Highly-reused (>= 3 products) A operands in `row` loaded once with
+    /// `ld.volatile.shared.v4.u32` and reused via `Form::Row` within the per-segment budget.
     pub(super) cached_row: HashSet<&'a str>,
     /// Registers that some statement reads in Turing layout.
     pub(super) plain: HashSet<&'a str>,
@@ -386,9 +386,11 @@ impl<'a> Plan<'a> {
         plan.row.retain(|a| !gathered.contains(a));
         plan.plain.extend(gathered);
 
-        // Promote reused `plan.row` registers to cached non-volatile `Form::Row` up to 8
-        // concurrently live rows per segment (<= 32 live registers) so sequential MMQ tiles reuse
-        // all SMEM loads while overlapping unrolled loops (such as q6_K) avoid local spills.
+        // Promote highly-reused (>= 3 products) `plan.row` registers to volatile-once `Form::Row`
+        // reuse up to 8 concurrently live rows per segment (<= 32 live registers) so dense MMQ
+        // tiles (e.g. 2x4, 4x4) eliminate redundant SMEM reloads across rolled and unrolled turns
+        // without hoisting spills or regressing 2-use / launch-bounds-capped kernels.
+        const ROW_CACHE_MIN_USES: usize = 3;
         const ROW_CACHE_LIVE_BUDGET: usize = 8;
         struct RowUse<'r> {
             uses: usize,
@@ -401,7 +403,7 @@ impl<'a> Plan<'a> {
         let mut by_segment: HashMap<u32, Vec<RowUse<'a>>> = HashMap::new();
         for &a_reg in &plan.row {
             if let Some(uses) = row_uses.get(a_reg)
-                && uses.len() >= 2
+                && uses.len() >= ROW_CACHE_MIN_USES
                 && let Some(origin) = plan.origins.get(a_reg)
             {
                 let (first, last) = (uses[0], *uses.last().unwrap());

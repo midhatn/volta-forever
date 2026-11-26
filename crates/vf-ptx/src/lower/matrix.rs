@@ -45,35 +45,8 @@ impl<'a> Body<'a> {
             for (column, sum) in sums.iter().enumerate() {
                 emit!(self, "mov.b32 {}, {sum};", d[column]);
             }
-        } else if d[0] != c[1] && d[0] != d[1] {
-            // `byte_operands` already copied A and B into fresh registers; when writing `d[0]` in
-            // column 0 does not clobber `c[1]`, `dp4a` can accumulate straight into `d[0..2]`
-            // without temporary registers.
-            for (column, dest) in d.iter().enumerate() {
-                for part in 0..3 {
-                    let accumulator = if part == 0 { c[column] } else { *dest };
-                    emit!(
-                        self,
-                        "dp4a.{types} {dest}, {}, {}, {accumulator};",
-                        row[part],
-                        columns[4 * column + part]
-                    );
-                }
-            }
-            for (column, dest) in d.iter().enumerate() {
-                emit!(
-                    self,
-                    "dp4a.{types} {dest}, {}, {}, {dest};",
-                    row[3],
-                    columns[4 * column + 3]
-                );
-            }
-            for name in d {
-                self.written(name);
-            }
         } else {
-            // Cross-aliased accumulator (e.g. `{d0, d1}, ..., {d1, d0}`): both sums complete
-            // before either destination is written.
+            // Both sums are complete before the first destination is written: it may be an input.
             let sums: [String; 2] = self.fresh_n();
             for (column, sum) in sums.iter().enumerate() {
                 for part in 0..3 {
@@ -155,15 +128,14 @@ impl<'a> Body<'a> {
                 // m16n8k16: rows 0-7 use a[0],b[0]; rows 8-15 use a[1],b[0].
                 vec![(a[0], b[0]), (a[1], b[0])]
             } else {
-                // m16n8k32: finish both halves on b[0] before gathering b[1] so their 8 shuffled
-                // B registers do not overlap in liveness.
-                vec![(a[0], b[0]), (a[1], b[0]), (a[2], b[1]), (a[3], b[1])]
+                // m16n8k32: rows 0-7 use a[0],b[0] then a[2],b[1]; rows 8-15 use a[1],b[0] then a[3],b[1].
+                vec![(a[0], b[0]), (a[2], b[1]), (a[1], b[0]), (a[3], b[1])]
             };
             let sums: [[String; 2]; 2] = [self.fresh_n(), self.fresh_n()];
             for (step, &(a_reg, b_reg)) in steps.iter().enumerate() {
-                let half = step & 1; // 0 for rows 0-7, 1 for rows 8-15
+                let half = step / (steps.len() / 2); // 0 for rows 0-7, 1 for rows 8-15
                 let (row, columns) = self.byte_operands(a_reg, b_reg)?;
-                let first_step = step < 2;
+                let first_step = (a.len() == 2 && step < 2) || (a.len() == 4 && step % 2 == 0);
                 for column in 0..2 {
                     for part in 0..4 {
                         let accumulator = if first_step && part == 0 {
@@ -200,11 +172,10 @@ impl<'a> Body<'a> {
             self.mma_bytes(types, false, &d[..2], a[0], b[0], &c[..2])?;
             self.mma_bytes(types, false, &d[2..], a[1], b[0], &c[2..])?;
         } else {
-            // m16n8k32: finish both halves on b[0] before gathering b[1] so their 8 shuffled B
-            // registers do not overlap in liveness.
+            // m16n8k32: four Turing m8n8k16 products, chaining the accumulators.
             self.mma_bytes(types, false, &d[..2], a[0], b[0], &c[..2])?;
-            self.mma_bytes(types, false, &d[2..], a[1], b[0], &c[2..])?;
             self.mma_bytes(types, false, &d[..2], a[2], b[1], &d[..2])?;
+            self.mma_bytes(types, false, &d[2..], a[1], b[0], &c[2..])?;
             self.mma_bytes(types, false, &d[2..], a[3], b[1], &d[2..])?;
         }
         Ok(())

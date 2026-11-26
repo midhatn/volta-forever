@@ -3,6 +3,10 @@
 //
 // usage: drvrun [-d ORDINAL] [-r REPEAT] [-q] MODULE_FILE
 //
+// With DRVRUN_LINK=cuLinkAddFile or cuLinkAddFile_v2, MODULE_FILE goes to the driver's linker by its
+// path, through that entry point (as PTX, a cubin or a fat binary, by its first bytes), and the image
+// that the link makes is loaded.
+//
 // Only libcuda.so.1 is needed (dlopen): no CUDA runtime, so the test isolates the driver's behaviour.
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -373,7 +377,33 @@ int main(int argc, char** argv) {
                   CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES, CU_JIT_LOG_VERBOSE};
     void* vals[] = {info, (void*)(uintptr_t)sizeof info, err, (void*)(uintptr_t)sizeof err, (void*)(uintptr_t)1};
     CUmodule mod;
-    CUresult r = cuModuleLoadDataEx(&mod, image, 5, opts, vals);
+    CUresult r;
+    const char* link = getenv("DRVRUN_LINK");
+    if (link) {
+        CUresult (*create)(unsigned, int*, void**, void**) = sym("cuLinkCreate_v2");
+        CUresult (*add_file)(void*, int, const char*, unsigned, int*, void**) = sym(link);
+        CUresult (*complete)(void*, void**, size_t*) = sym("cuLinkComplete");
+        CUresult (*destroy)(void*) = sym("cuLinkDestroy");
+        uint32_t magic = 0;
+        memcpy(&magic, image, size < 4 ? (size_t)size : 4);
+        // CU_JIT_INPUT_CUBIN, CU_JIT_INPUT_FATBINARY, else CU_JIT_INPUT_PTX
+        int type = size >= 4 && !memcmp(image, "\177ELF", 4) ? 0 : magic == 0xBA55ED50u ? 2 : 1;
+        void *state = NULL, *linked = NULL;
+        size_t linked_size = 0;
+        r = create(5, opts, vals, &state);
+        if (!r) {
+            r = add_file(state, type, path, 0, NULL, NULL);
+            printf("link: %s of input type %d -> %d %s\n", link, type, r, r ? ename(r) : "CUDA_SUCCESS");
+        }
+        if (!r) {
+            r = complete(state, &linked, &linked_size);
+            printf("link: complete -> %d %s\n", r, r ? ename(r) : "CUDA_SUCCESS");
+        }
+        if (!r) r = cuModuleLoadDataEx(&mod, linked, 0, NULL, NULL);
+        if (state) destroy(state);
+    } else {
+        r = cuModuleLoadDataEx(&mod, image, 5, opts, vals);
+    }
     printf("load %s -> %d %s\n", path, r, r ? ename(r) : "CUDA_SUCCESS");
     if (err[0]) printf("  jit error log: %s\n", err);
     if (info[0] && !quiet) printf("  jit info log: %.600s\n", info);

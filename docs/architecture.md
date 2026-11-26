@@ -108,8 +108,8 @@ launches it with `cuLaunchKernel` (measured on a V100 with driver 580.178.04, 20
 the layer refuses is refused at those public calls too (section 5).
 
 In a machine that also has a later card, a module loaded into a context on that card
-(`cuModuleLoadData` and its variants, `cuModuleLoad`, `cuLinkAddData`) is given to the
-driver as the program gave it: the proxy asks the driver which device the current
+(`cuModuleLoadData` and its variants, `cuModuleLoad`, `cuLinkAddData`, `cuLinkAddFile`) is given
+to the driver as the program gave it: the proxy asks the driver which device the current
 context is on. A library (`cuLibraryLoadData`) is loaded for every context of the
 process, the V100's included, so its code is adapted wherever it is loaded; a fat binary
 keeps the entries of the other cards.
@@ -282,11 +282,16 @@ The refusals of a library that is not deferred hold on the V100 only: in a conte
 card the driver runs the library's own code.
 
 Through the driver's linker the same holds: what was refused or emulated in each input of
-`cuLinkAddData` is kept for the link, given at `cuLinkComplete` to the image the link made
-(known by its length and a hash of its bytes, so that a copy of it loaded later is known
-too), and dropped at `cuLinkDestroy`. Each input is adapted alone: a kernel that calls a
-function of another input that cannot run is not refused, and traps when it is launched.
-Inputs given with `cuLinkAddFile` are not adapted.
+`cuLinkAddData` or `cuLinkAddFile` is kept for the link, given at `cuLinkComplete` to the image
+the link made (known by its length and a hash of its bytes, so that a copy of it loaded later is
+known too), and dropped at `cuLinkDestroy`. Each input is adapted alone: a kernel that calls a
+function of another input that cannot run is not refused, and traps when it is launched. A file
+of PTX, a cubin or a fat binary given with `cuLinkAddFile` is read by the layer
+(`images::adapt_file`, as for `cuModuleLoad`), and what it makes of it goes to the driver's
+`cuLinkAddData` of the same version, named by the file's path; the driver is given the file
+itself when nothing in it is adapted, when it cannot be read, and when the driver refuses what
+the layer made of it. An input of another type (a host object, or a library of them) goes to the
+driver as it is, in memory or in a file.
 
 The first refused kernel of NCCL's collectives in a process (a name that starts with
 `ncclDevKernel_` or `ncclKernel_`) also makes the proxy say, at the default log level, that
@@ -642,11 +647,11 @@ image the program gave (its size and XXH64 digest) and the call, once for each k
 goes on; a capture in progress goes on, without the kernel. The record goes with the image through
 the paths that adapt it for a load: modules, libraries compiled whole or kernel by kernel,
 retained PTX, translated machine code, and the cache. Not through a link: the inputs of
-`cuLinkAddData` and of nvJitLink are adapted, but what was found of their kernels without code is
-not passed on to the image that the link makes (as their refused kernels are, `Links` in
-`images.rs` and the note of `vf_fatbin::cubin_with_refused`), so such a kernel is launched from
-there and traps, as without the layer. An image that already has sm_70 code is given to the driver
-as it is and not read: a kernel without code there traps as it does without the layer.
+`cuLinkAddData`, `cuLinkAddFile` and nvJitLink are adapted, but what was found of their kernels
+without code is not passed on to the image that the link makes (as their refused kernels are,
+`Links` in `images.rs` and the note of `vf_fatbin::cubin_with_refused`), so such a kernel is
+launched from there and traps, as without the layer. An image that already has sm_70 code is given
+to the driver as it is and not read: a kernel without code there traps as it does without the layer.
 
 A kernel whose body does nothing (`ret`, or `EXIT` in machine code) is not refused: some are meant
 to do nothing. At `VF_LOG_LEVEL=2` each image adapted says how many kernels have a body that is a
