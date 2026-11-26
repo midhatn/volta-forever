@@ -1943,34 +1943,27 @@ type LinkAddData = unsafe extern "C" fn(
     *mut *mut c_void,
 ) -> CUresult;
 
-/// Add `data` to the link `state`, with the CUDA input type matching the replacement image. The linker reads its input
-/// during the call, so the replacement does not outlive it; what was found in it goes to the image the link makes
-/// (`images::link_input`, `cuLinkComplete`). A kernel of another input that calls a function of this one that traps is
-/// not known: launched, it ends its CUDA context.
-unsafe fn link_add_data(
+type LinkAddFile =
+    unsafe extern "C" fn(*mut c_void, c_int, *const c_char, c_uint, *mut c_int, *mut *mut c_void) -> CUresult;
+
+fn link_for_this_gpu(state: *mut c_void) -> bool {
+    // A link whose options name the architecture of its output links for that one, whatever the
+    // device of the current context.
+    match images::link_target(state as usize) {
+        Some(sm) => sm == config().policy.device_sm,
+        None => context_needs_adapting(),
+    }
+}
+
+unsafe fn link_add_replacement(
     who: &str,
     state: *mut c_void,
     input: c_int,
-    data: *mut c_void,
-    size: usize,
-    call: impl Fn(c_int, *mut c_void, usize) -> CUresult,
+    replacement: images::Replacement,
+    add_data: impl FnOnce(c_int, *mut c_void, usize) -> CUresult,
+    fallback: impl FnOnce() -> CUresult,
+    fallback_what: &str,
 ) -> CUresult {
-    // A link whose options name the architecture of its output links for that one, whatever the
-    // device of the current context.
-    let for_this_gpu = match images::link_target(state as usize) {
-        Some(sm) => sm == config().policy.device_sm,
-        None => context_needs_adapting(),
-    };
-    let replacement = match input {
-        _ if !for_this_gpu => None,
-        // (Read within the size given, which is the length of the input, as the header has it: of
-        // no bytes, nothing is read, and the input goes to the driver as it is.)
-        INPUT_CUBIN | INPUT_PTX | INPUT_FATBINARY => unsafe { images::adapt(who, data, Some(size)) },
-        _ => None,
-    };
-    let Some(replacement) = replacement else {
-        return call(input, data, size);
-    };
     if let Some(first) = replacement.refused().first() {
         log::info(format_args!(
             "{who}: {} kernels of this code cannot run on this GPU (the first is {}: {}); they are refused if the \
@@ -1985,15 +1978,70 @@ unsafe fn link_add_data(
     } else {
         input
     };
-    let result = call(kind, replacement.as_ptr() as *mut c_void, replacement.len());
+    let result = add_data(kind, replacement.as_ptr() as *mut c_void, replacement.len());
     if result == CUDA_SUCCESS {
         images::link_input(state as usize, &replacement);
         return result;
     }
     log::warn(format_args!(
-        "{who}: the driver refused the adapted input (error {result}); adding the original"
+        "{who}: the driver refused the adapted input (error {result}); adding {fallback_what}"
     ));
-    call(input, data, size)
+    fallback()
+}
+
+/// Add `data` to the link `state`, with the CUDA input type matching the replacement image. The linker reads its input
+/// during the call, so the replacement does not outlive it; what was found in it goes to the image the link makes
+/// (`images::link_input`, `cuLinkComplete`). A kernel of another input that calls a function of this one that traps is
+/// not known: launched, it ends its CUDA context.
+unsafe fn link_add_data(
+    who: &str,
+    state: *mut c_void,
+    input: c_int,
+    data: *mut c_void,
+    size: usize,
+    call: impl Fn(c_int, *mut c_void, usize) -> CUresult,
+) -> CUresult {
+    let replacement = match input {
+        _ if !link_for_this_gpu(state) => None,
+        // (Read within the size given, which is the length of the input, as the header has it: of
+        // no bytes, nothing is read, and the input goes to the driver as it is.)
+        INPUT_CUBIN | INPUT_PTX | INPUT_FATBINARY => unsafe { images::adapt(who, data, Some(size)) },
+        _ => None,
+    };
+    let Some(replacement) = replacement else {
+        return call(input, data, size);
+    };
+    unsafe {
+        link_add_replacement(
+            who,
+            state,
+            input,
+            replacement,
+            &call,
+            || call(input, data, size),
+            "the original",
+        )
+    }
+}
+
+unsafe fn link_add_file(
+    who: &str,
+    state: *mut c_void,
+    input: c_int,
+    path: *const c_char,
+    add_data: impl FnOnce(c_int, *mut c_void, usize) -> CUresult,
+    call_file: impl FnOnce() -> CUresult,
+) -> CUresult {
+    let replacement =
+        if path.is_null() || !link_for_this_gpu(state) || !matches!(input, INPUT_CUBIN | INPUT_PTX | INPUT_FATBINARY) {
+            None
+        } else {
+            images::adapt_file(who, unsafe { CStr::from_ptr(path) })
+        };
+    let Some(replacement) = replacement else {
+        return call_file();
+    };
+    unsafe { link_add_replacement(who, state, input, replacement, add_data, call_file, "the file") }
 }
 
 #[unsafe(naked)]
@@ -2063,6 +2111,78 @@ unsafe extern "C" fn link_add_data_v2(
         link_add_data("cuLinkAddData", state, input, data, size, |input, data, size| {
             real(state, input, data, size, name, count, options, values)
         })
+    }
+}
+
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuLinkAddFile(
+    state: *mut c_void,
+    input: c_int,
+    path: *const c_char,
+    count: c_uint,
+    options: *mut c_int,
+    values: *mut *mut c_void,
+) -> CUresult {
+    noting_caller!(link_add_file_v1)
+}
+
+unsafe extern "C" fn link_add_file_v1(
+    state: *mut c_void,
+    input: c_int,
+    path: *const c_char,
+    count: c_uint,
+    options: *mut c_int,
+    values: *mut *mut c_void,
+) -> CUresult {
+    let _told = images::ForCaller::told(callers::told_sm(noted_caller()));
+    let real_file = real!(cuLinkAddFile: LinkAddFile);
+    let real_data = real!(cuLinkAddData: LinkAddData);
+    unsafe {
+        link_add_file(
+            "cuLinkAddFile",
+            state,
+            input,
+            path,
+            |kind, data, size| real_data(state, kind, data, size, path, count, options, values),
+            || real_file(state, input, path, count, options, values),
+        )
+    }
+}
+
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cuLinkAddFile_v2(
+    state: *mut c_void,
+    input: c_int,
+    path: *const c_char,
+    count: c_uint,
+    options: *mut c_int,
+    values: *mut *mut c_void,
+) -> CUresult {
+    noting_caller!(link_add_file_v2)
+}
+
+unsafe extern "C" fn link_add_file_v2(
+    state: *mut c_void,
+    input: c_int,
+    path: *const c_char,
+    count: c_uint,
+    options: *mut c_int,
+    values: *mut *mut c_void,
+) -> CUresult {
+    let _told = images::ForCaller::told(callers::told_sm(noted_caller()));
+    let real_file = real!(cuLinkAddFile_v2: LinkAddFile);
+    let real_data = real!(cuLinkAddData_v2: LinkAddData);
+    unsafe {
+        link_add_file(
+            "cuLinkAddFile",
+            state,
+            input,
+            path,
+            |kind, data, size| real_data(state, kind, data, size, path, count, options, values),
+            || real_file(state, input, path, count, options, values),
+        )
     }
 }
 
