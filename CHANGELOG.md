@@ -1,5 +1,12 @@
 # Changes
 
+## Unreleased
+
+### Changed
+
+- The translation of machine code (sm_75 and sm_80 cubins) takes less time, and runs on worker threads (`vf-sass-N`) for a cubin of 64 KiB of code or more with two functions or more: as many as `VF_THREADS` allows (the CPUs the process may run on, 8 at most, the calling thread among them); where a thread cannot be started, the work left runs on the calling thread (pull request #16, by midhatn). The output is the same bytes at every number of threads, and the same as before the change at every `VF_BORROW` level and with `VF_PAIRS` 0 and 1.
+- `VF_THREADS` caps or disables the threads of the translation of machine code too (`0` or `1`: on the calling thread).
+
 ## 0.1.6 (2026-11-25)
 
 ### Fixed

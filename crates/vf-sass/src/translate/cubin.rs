@@ -68,11 +68,15 @@ pub(super) fn translate_with_threads(
 
     let n_texts = texts.len();
     let mut info_sec: Vec<Option<usize>> = vec![None; n_texts];
+    // Every section of attributes of a function's name, for what it calls (the first one is
+    // the function's for everything else, as `Elf::section` finds it).
+    let mut info_secs: Vec<Vec<usize>> = vec![Vec::new(); n_texts];
     let mut const2_sec: Vec<Option<usize>> = vec![None; n_texts];
     for (i, s) in e.sections.iter().enumerate() {
         if let Some(fn_name) = s.name.strip_prefix(".nv.info.") {
             if let Some(&slot) = text_by_name.get(fn_name) {
                 info_sec[slot].get_or_insert(i);
+                info_secs[slot].push(i);
             }
         } else if let Some(fn_name) = s.name.strip_prefix(".nv.constant2.")
             && let Some(&slot) = text_by_name.get(fn_name)
@@ -166,29 +170,30 @@ pub(super) fn translate_with_threads(
             at += 8;
         }
     }
-    for (slot, &ii_opt) in info_sec.iter().enumerate() {
-        let Some(ii) = ii_opt else { continue };
-        let sdata = &e.sections[ii].data;
-        let mut pos = 0;
-        while pos + 4 <= sdata.len() {
-            let fmt = sdata[pos];
-            let attr = sdata[pos + 1];
-            let val = u16::from_le_bytes(sdata[pos + 2..pos + 4].try_into().unwrap()) as usize;
-            if fmt == 4 && attr == 0x0f {
-                let mut at = pos + 4;
-                while at + 4 <= (pos + 4 + val).min(sdata.len()) {
-                    let callee = u32::from_le_bytes(sdata[at..at + 4].try_into().unwrap()) as usize;
-                    if let Some(&cs) = by_symbol.get(&callee) {
-                        let fa = find_group(&mut group_parent, slot);
-                        let fb = find_group(&mut group_parent, cs);
-                        if fa != fb {
-                            group_parent[fa] = fb;
+    for (slot, sections) in info_secs.iter().enumerate() {
+        for &ii in sections {
+            let sdata = &e.sections[ii].data;
+            let mut pos = 0;
+            while pos + 4 <= sdata.len() {
+                let fmt = sdata[pos];
+                let attr = sdata[pos + 1];
+                let val = u16::from_le_bytes(sdata[pos + 2..pos + 4].try_into().unwrap()) as usize;
+                if fmt == 4 && attr == 0x0f {
+                    let mut at = pos + 4;
+                    while at + 4 <= (pos + 4 + val).min(sdata.len()) {
+                        let callee = u32::from_le_bytes(sdata[at..at + 4].try_into().unwrap()) as usize;
+                        if let Some(&cs) = by_symbol.get(&callee) {
+                            let fa = find_group(&mut group_parent, slot);
+                            let fb = find_group(&mut group_parent, cs);
+                            if fa != fb {
+                                group_parent[fa] = fb;
+                            }
                         }
+                        at += 4;
                     }
-                    at += 4;
                 }
+                pos += if fmt == 4 { 4 + val } else { 4 };
             }
-            pos += if fmt == 4 { 4 + val } else { 4 };
         }
     }
 

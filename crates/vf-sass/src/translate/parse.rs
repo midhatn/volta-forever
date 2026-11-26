@@ -143,9 +143,8 @@ pub(super) fn parse_function(
                 }
             }
         });
-        if let Some(count) = bad_count {
-            return Err(Refused(format!("a uniform operand of {count} registers")));
-        }
+        // (A uniform operand of another size is refused once every word is known to decode:
+        // a word that does not is the reason first, as `reference/translate.py` has it.)
         let name = d.name;
         if !needs_pool
             && (name.starts_with("imad_hi__")
@@ -183,6 +182,9 @@ pub(super) fn parse_function(
             }
         }
         src.push(d);
+    }
+    if let Some(count) = bad_count {
+        return Err(Refused(format!("a uniform operand of {count} registers")));
     }
 
     let collect_mask = |mut mask: u64, extra: &mut Vec<u32>| -> Vec<u32> {

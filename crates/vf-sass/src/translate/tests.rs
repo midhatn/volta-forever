@@ -1646,3 +1646,41 @@ fn no_plan_where_the_ways_are_unknown() {
     }
     assert!(planned > 0);
 }
+
+/// What a function calls is read from every section of attributes of its name (`.nv.info.NAME`,
+/// attribute 0x0f), as `main` and `reference/translate.py` read it. In k_pairs.cu, a second
+/// `.nv.info.` section of one function says it calls another, which is refused (its first word is
+/// of no sm_75 class): the one that calls it is refused with it.
+#[test]
+fn every_section_of_attributes_says_what_a_function_calls() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let mut elf = crate::elf::Elf::parse(original).unwrap();
+    let names: Vec<String> = elf
+        .sections
+        .iter()
+        .filter_map(|s| s.name.strip_prefix(".text.").map(str::to_string))
+        .collect();
+    assert!(names.len() >= 2);
+    let (caller, callee) = (&names[0], &names[1]);
+    let at = elf.section(&format!(".text.{callee}")).unwrap();
+    elf.sections[at].data[..16].copy_from_slice(&[0xff; 16]);
+    let symbols = elf.symbols().unwrap();
+    let symbol = symbols
+        .iter()
+        .position(|s| s.name == *callee && s.info & 0xf == 2)
+        .unwrap() as u32;
+    let info = elf.section(&format!(".nv.info.{caller}")).unwrap();
+    let mut second = elf.sections[info].clone();
+    second.data = [4u8, 0x0f, 4, 0].into_iter().chain(symbol.to_le_bytes()).collect();
+    elf.sections.push(second);
+    let mut data = elf.write();
+    // (`write` keeps the header's count of sections.)
+    data[0x3c..0x3e].copy_from_slice(&(elf.sections.len() as u16).to_le_bytes());
+    let result = translate_with_options(&data, false, &Options::default()).unwrap();
+    let why = |name: &str| result.report.iter().find(|f| f.name == name).unwrap().refused.clone();
+    assert!(why(callee).is_some());
+    assert_eq!(
+        why(caller).as_deref(),
+        Some("a function it calls, or that calls it, is refused")
+    );
+}
