@@ -163,6 +163,16 @@ third register that is not `URZ`, a negated operand, a guard, the other forms of
 rules (`remap_uniform_operands_in_triton_kernels` in `crates/vf-sass/src/rule.rs`);
 a `USGXT` put into a test kernel goes through the whole translator
 (`a_uniform_sign_extension_becomes_sgxt` in `crates/vf-sass/src/translate/tests.rs`).
+`UIMAD` with an immediate addend (`UIMAD UR4, UR4, UR5, 0x240`, the form of
+issue #8) and the forms with a carry in, `UIMAD.X` and `UIMAD.WIDE.X`, map to
+`IMAD`, `IMAD.X` and `IMAD.WIDE.X` with the same operands (pull request #15).
+Seven words of these forms,
+each as nvdisasm reads it on both sides, are the unit test
+`remap_uimad_and_carry_variants` in `crates/vf-sass/src/rule.rs`;
+`tests/kernels/translate/k_uimad.cu` (the immediate form and `UIMAD.WIDE`) goes
+through the whole translator and runs on a V100, and a `UIMAD.X` and a
+`UIMAD.WIDE.X` put into test kernels go through the whole translator
+(`crates/vf-sass/src/translate/tests.rs`).
 
 An instruction with a uniform operand (a load at `[R4 + UR6 + 0x10]`, a
 comparison against UR2) is rewritten to the sm_70 form with an ordinary
