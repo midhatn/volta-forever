@@ -493,12 +493,23 @@ fn maybe_var_decl_opcode(op: &str) -> bool {
 
 type BranchEdgeFn<'a, 'b> = &'b mut dyn FnMut(usize, &HashMap<&'a str, u64>);
 
+/// A declaration of `name` in the function's own scope: the first shadows the module's symbol of
+/// that name, and a second one (which ptxas refuses as a duplicate definition) keeps only the bits
+/// that both guarantee.
+fn declare_in_function<'a>(shared_overrides: &mut HashMap<&'a str, u64>, name: &'a str, mask: u64) {
+    shared_overrides
+        .entry(name)
+        .and_modify(|prev| *prev &= mask)
+        .or_insert(mask);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_block<'a>(
     text: &'a str,
     items: &[scan::Item],
     range: std::ops::Range<usize>,
     shared: &HashMap<String, u64>,
+    function_decls: &[(usize, &'a str, u64)],
     label_block: &HashMap<&str, usize>,
     constants16: &HashMap<&str, u32>,
     state: &mut HashMap<&'a str, u64>,
@@ -507,8 +518,22 @@ fn run_block<'a>(
 ) {
     let mut scopes: Vec<ScopeFrame<'a>> = Vec::new();
     let mut shared_overrides: HashMap<&'a str, u64> = HashMap::new();
+    // A declaration in the function's own scope holds from its place in the text on, whatever the
+    // path that reaches a statement: ptxas resolves a name in the order of the text, and a
+    // statement before the declaration names the module's symbol. The block starts with those
+    // before it and takes the others at their place.
+    let mut next_decl = function_decls.partition_point(|&(at, _, _)| at < range.start);
+    for &(_, name, mask) in &function_decls[..next_decl] {
+        declare_in_function(&mut shared_overrides, name, mask);
+    }
     for (offset, item) in items[range.clone()].iter().enumerate() {
         let idx = range.start + offset;
+        while let Some(&(at, name, mask)) = function_decls.get(next_decl)
+            && at == idx
+        {
+            declare_in_function(&mut shared_overrides, name, mask);
+            next_decl += 1;
+        }
         match &item.kind {
             Kind::Open => {
                 if idx > 0 {
@@ -622,8 +647,9 @@ pub(in crate::lower) fn prove_aligned_16<'a>(
     if items.is_empty() {
         return HashSet::new();
     }
-    let mut shared = module_shared.clone();
-    let mut depth0_shared_seen: HashSet<&str> = HashSet::new();
+    // The declarations of the function's own scope (depth 0), in the order of the text: the item,
+    // the name and its mask (0 for a declaration that guarantees nothing).
+    let mut function_decls: Vec<(usize, &'a str, u64)> = Vec::new();
     let mut label_block: HashMap<&str, usize> = HashMap::new();
     let mut block_starts = vec![0usize];
     let mut depth = 0usize;
@@ -656,25 +682,7 @@ pub(in crate::lower) fn prove_aligned_16<'a>(
                     && let Some((mask, names)) = parse_var_decl(&text[item.range.clone()], true)
                 {
                     for name in names {
-                        if !depth0_shared_seen.insert(name) {
-                            match (shared.get(name).copied(), mask) {
-                                (Some(a), Some(b)) => {
-                                    shared.insert(name.to_string(), a & b);
-                                }
-                                _ => {
-                                    shared.remove(name);
-                                }
-                            }
-                        } else {
-                            match mask {
-                                Some(m) => {
-                                    shared.insert(name.to_string(), m);
-                                }
-                                None => {
-                                    shared.remove(name);
-                                }
-                            }
-                        }
+                        function_decls.push((i, name, mask.unwrap_or(0)));
                     }
                 }
             }
@@ -777,7 +785,8 @@ pub(in crate::lower) fn prove_aligned_16<'a>(
             text,
             items,
             block_ranges[b].clone(),
-            &shared,
+            module_shared,
+            &function_decls,
             &label_block,
             constants16,
             &mut state,
@@ -798,7 +807,8 @@ pub(in crate::lower) fn prove_aligned_16<'a>(
             text,
             items,
             block_ranges[b].clone(),
-            &shared,
+            module_shared,
+            &function_decls,
             &label_block,
             constants16,
             &mut state,

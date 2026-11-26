@@ -4437,3 +4437,76 @@ fn malformed_shared_directive_does_not_panic() {
     );
     assert!(!out.is_empty());
 }
+
+#[test]
+fn function_level_shared_declaration_holds_from_its_place_in_the_text() {
+    // ptxas resolves a name in the order of the text, whatever the branches: a statement before a
+    // function-level declaration names the module's symbol of that name, one after it the
+    // function's (ptxas 12.9 compiles `mov.u32 %r4, buf` before `.shared .align 16 .b8 buf[4096]`
+    // in the body to 0x1004, the module's `.align 4` buffer after `pad`, and after it to 0). A
+    // 16-byte load through the module's `buf` keeps its check; each case counts the checks left.
+    let module4 = ".shared .align 4 .b8 pad[4];\n.shared .align 4 .b8 buf[4096];\n";
+    let module16 = ".shared .align 4 .b8 pad[4];\n.shared .align 16 .b8 buf[4096];\n";
+    let decl16 = "\t.shared .align 16 .b8 buf[4096];\n";
+    let loads = "\tldmatrix.sync.aligned.m8n8.x4.shared.b16 {%a0, %a1, %a2, %a3}, [%r4];\n\tldmatrix.sync.aligned.m8n8.x2.shared.b16 {%b0, %b1}, [%r4+128];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n";
+    let mov = "\tmov.u32 %r4, buf;\n";
+    let cases = [
+        ("a use before the declaration", module4, format!("{mov}{decl16}{loads}"), 2),
+        ("no function-level declaration", module4, format!("{mov}{loads}"), 2),
+        ("a use after the declaration", module4, format!("{decl16}{mov}{loads}"), 0),
+        (
+            "a block before the declaration, reached only from a block after it",
+            module4,
+            format!("\tbra $A;\n$B:\n{mov}{loads}\tret;\n$A:\n{decl16}\tbra $B;\n"),
+            2,
+        ),
+        (
+            "a loop whose head is before the declaration, entered with the module's buf",
+            module4,
+            format!("{mov}$L:\n{loads}{decl16}{mov}\tsetp.ne.u32 %p1, %r0, 0;\n\t@%p1 bra $L;\n"),
+            2,
+        ),
+        (
+            "a use in a nested scope before the declaration",
+            module4,
+            format!("\t{{\n{mov}\t}}\n{decl16}{loads}"),
+            2,
+        ),
+        (
+            "a nested scope's declaration shadows the function's",
+            module4,
+            format!("{decl16}\t{{\n\t.shared .align 4 .b8 buf[64];\n{mov}\t}}\n{loads}"),
+            2,
+        ),
+        (
+            "the function's declaration holds again after that nested scope",
+            module4,
+            format!("{decl16}\t{{\n\t.shared .align 4 .b8 buf[64];\n\tmov.u32 %r6, buf;\n\t}}\n{mov}{loads}"),
+            0,
+        ),
+        (
+            "a use of the module's .align 16 buf before the function's .align 4 buf, and one after",
+            module16,
+            "\tmov.u32 %r4, buf;\n\t.shared .align 4 .b8 buf[4096];\n\tmov.u32 %r6, buf;\n\tldmatrix.sync.aligned.m8n8.x4.shared.b16 {%a0, %a1, %a2, %a3}, [%r4];\n\tldmatrix.sync.aligned.m8n8.x2.shared.b16 {%b0, %b1}, [%r6];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n".to_string(),
+            1,
+        ),
+    ];
+    for (what, symbols, body, checks) in cases {
+        let module = format!(
+            ".version 8.0\n.target sm_80\n.address_size 64\n{symbols}.visible .entry k(.param .u64 out)\n{{\n\t.reg .b32 %r<8>, %a<4>, %b<2>, %d<4>;\n\t.reg .pred %p1;\n\tmov.u32 %r0, %tid.x;\n\tmov.u32 %r5, pad;\n\tst.shared.u32 [%r5], %r0;\n{body}\tret;\n}}\n"
+        );
+        let (out, _) = crate::lower_to_volta_with(
+            module.as_bytes(),
+            Options {
+                aligned_rows: false,
+                ..Options::default()
+            },
+        );
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(
+            count(s, "ld.shared.v4.u32 ") > 0,
+            "{what}: expected the wide loads:\n{s}"
+        );
+        assert_eq!(count(s, ", 15;"), checks, "{what}:\n{s}");
+    }
+}
