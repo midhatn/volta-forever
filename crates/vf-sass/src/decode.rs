@@ -12,8 +12,6 @@ use crate::generated::classes::*;
 use crate::generated::fields::{OP_NAMES, OP_PG, OP_UPG};
 use crate::generated::special::*;
 
-const WAIT_MASK: u128 = 63u128 << WAIT;
-
 /// The scheduling kind of an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
@@ -239,13 +237,13 @@ impl Decoder {
 
     #[inline]
     fn match_class_cached(&mut self, word: u128, is_75: bool) -> Option<u16> {
-        // WAIT (bits 116..121) has zero opcode/const/domain/unused checks on both sm_70 and sm_75.
-        let key = word & !WAIT_MASK;
-        if let Some(&cached) = self.class_cache.get(&key) {
+        // By the whole word: the wait mask is a constant field of some classes (the four `ttu*`
+        // of sm_75 take no wait), so what a word decodes to may depend on it.
+        if let Some(&cached) = self.class_cache.get(&word) {
             return cached;
         }
         let class_id = self.match_class(word, is_75);
-        self.class_cache.insert(key, class_id);
+        self.class_cache.insert(word, class_id);
         class_id
     }
 
@@ -491,5 +489,74 @@ impl Decoder {
             }
         }
         writes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A word of a class of sm_75: its opcode, its constant fields, the first value of each field of
+    /// a domain, and nothing else.
+    fn word_of(name: &str) -> (u16, u128) {
+        let class_id = SM75_CLASSES
+            .iter()
+            .position(|c| c.0 == name)
+            .unwrap_or_else(|| panic!("{name}")) as u16;
+        let cls = &SM75_CLASSES[class_id as usize];
+        let mut word = 0u128;
+        let opcode = [
+            (0u16, &SM75_OPCODE_0_OFFSETS[..], &SM75_OPCODE_0_CANDIDATES[..]),
+            (34, &SM75_OPCODE_34_OFFSETS[..], &SM75_OPCODE_34_CANDIDATES[..]),
+        ]
+        .into_iter()
+        .find_map(|(fid, offsets, candidates)| {
+            offsets
+                .iter()
+                .position(|&(off, cnt)| candidates[off as usize..off as usize + cnt as usize].contains(&class_id))
+                .map(|v| (fid, v))
+        });
+        let (fid, value) = opcode.unwrap_or_else(|| panic!("no opcode for {name}"));
+        word = field::put(fid, word, value as u64);
+        for &(fid, expected) in &SM75_CONST_CHECKS[cls.6 as usize..(cls.6 + cls.7) as usize] {
+            word = field::put(fid, word, expected as u64);
+        }
+        for &(fid, domain_id) in &SM75_DOMAIN_CHECKS[cls.8 as usize..(cls.8 + cls.9) as usize] {
+            let (offset, _) = SM75_DOMAIN_OFFSETS[domain_id as usize];
+            word = field::put(fid, word, SM75_DOMAIN_VALUES[offset as usize] as u64);
+        }
+        (class_id, word)
+    }
+
+    /// Four classes of sm_75 (the tree-traversal unit's `ttugo_`, `ttuld_`, `ttuclose_`, `ttust_`)
+    /// have the wait mask among their constant fields: such a word with a wait is not theirs. What
+    /// a word decodes to does not depend on the words the decoder saw before it (one decoder a
+    /// worker with `VF_THREADS`): the same word with a wait, before and after the word without one.
+    #[test]
+    fn a_word_decodes_the_same_whatever_the_decoder_saw_before() {
+        for name in ["ttugo_", "ttuld_", "ttuclose_", "ttust_"] {
+            let (class_id, word) = word_of(name);
+            // (`ttuclose_` is an alternate form, which no word decodes to.)
+            if !SM75_CLASSES[class_id as usize].2 {
+                assert_eq!(
+                    Decoder::new(75).decode(word).map(|d| d.class_id),
+                    Some(class_id),
+                    "{name}"
+                );
+            }
+            let waits = word | (1u128 << WAIT);
+            let alone = Decoder::new(75).decode(waits).map(|d| d.name);
+            assert_ne!(alone, Some(name), "{name} with a wait");
+            let mut after = Decoder::new(75);
+            after.decode(word);
+            assert_eq!(
+                after.decode(waits).map(|d| d.name),
+                alone,
+                "{name} with a wait, after it without"
+            );
+            let mut checked = Decoder::new(75);
+            checked.is_valid(word);
+            assert_eq!(checked.is_valid(waits), alone.is_some(), "{name}: is_valid");
+        }
     }
 }

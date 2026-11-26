@@ -94,10 +94,11 @@ pub(super) fn translate_function(
     let has_room = ctx.borrow.as_ref().is_some_and(|b| b.room);
     let has_slots = ctx.borrow.as_ref().is_some_and(|b| !b.slots.is_empty());
     let needs_stack_top = frame > 0 || has_room;
+    // At level 3 a matrix sequence takes the lane at its instruction (`Ctx::lane`), and what reads
+    // it is put before the sequence below: such a function takes the full path everywhere.
+    let lane_at_instruction = fd.needs_lane && ctx.lane_at.is_none();
     let empty_ampere_ops = fd.ampere_ops.is_empty();
-    let empty_lane = ctx.lane_taken.is_empty();
     let empty_held = predicates.held.is_empty();
-    let empty_spilled = ctx.spilled.is_empty();
     let empty_saves = predicates.saves.is_empty();
     let empty_restores = predicates.restores.is_empty();
     let empty_delayed = predicates.delayed.is_empty();
@@ -114,21 +115,23 @@ pub(super) fn translate_function(
         }
         ctx.base_reg = None;
 
+        // The short path: nothing is put around the instruction's own translation. (Registers
+        // put away for room made, `spilled`, come with `has_room` only.)
         if i > 0
             && !has_slots
             && !needs_stack_top
+            && !lane_at_instruction
             && !fd.ampere
             && ctx.q.is_none()
             && (empty_ampere_ops || !fd.ampere_ops.contains_key(&i))
-            && (empty_lane || !ctx.lane_taken.contains_key(&i))
             && (empty_held || !predicates.held.contains_key(&i))
-            && (empty_spilled || !ctx.spilled.contains_key(&i))
             && (empty_saves || !predicates.saves.contains_key(&i))
             && (empty_restores || !predicates.restores.contains_key(&i))
             && (empty_delayed || !predicates.delayed.contains_key(&i))
         {
             let start = items.len();
             translate_one_into(&mut ctx, i, d, &mut items)?;
+            debug_assert!(!ctx.lane_taken.contains_key(&i) && !ctx.spilled.contains_key(&i));
             if let Some((rel_fid, scale)) = find_relative(d, 75) {
                 let v = field::signed(rel_fid, d.word);
                 let target = 16 * i as i64 + 16 + v * scale as i64;

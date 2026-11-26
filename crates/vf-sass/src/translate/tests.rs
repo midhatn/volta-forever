@@ -1459,3 +1459,64 @@ fn parallel_cubin_translation_matches_single_threaded() {
         assert_eq!(multi.report, single.report, "{label}: report differs");
     }
 }
+
+/// At level 3 every register of a matrix sequence is taken at its instruction, the lane too, and
+/// read there (`S2R SR_LANEID`, "lane" in the map): also at an instruction around which nothing
+/// else is put (no uniform register in memory, no room made, the frame empty). `t_stored_plain` of
+/// k_stored.cu with any instruction on uniform registers made a NOP, 128 registers and a NOP that
+/// writes R100 (registers that hold nothing), at VF_BORROW=3 (level 3 first): each of its matrix
+/// loads reads the lane.
+#[test]
+fn at_level_3_each_matrix_instruction_reads_the_lane() {
+    let original = include_bytes!("../../../../tests/kernels/k_stored.135.sm75.cubin");
+    let name = "t_stored_plain";
+    let mut input = crate::elf::Elf::parse(original).unwrap();
+    let section = input.section(&format!(".text.{name}")).unwrap();
+    let info = input.sections[section].info;
+    input.sections[section].info = (128 << 24) | (info & 0x00ff_ffff);
+    let mut dec75 = Decoder::new(75);
+    let mut loads = Vec::new();
+    let mut made_nop = Vec::new();
+    for (i, bytes) in input.sections[section]
+        .data
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        let d = dec75.decode(u128::from_le_bytes(*bytes)).unwrap();
+        let uniform = d
+            .reads
+            .iter()
+            .any(|&(l, _, _)| l == LETTER_U || l == crate::decode::LETTER_Q)
+            || d.writes
+                .iter()
+                .any(|&(l, _)| l == LETTER_U || l == crate::decode::LETTER_Q);
+        if uniform || d.mnemonic == "NOP" {
+            bytes.copy_from_slice(&NOP.to_le_bytes());
+            made_nop.push(i);
+        } else if d.mnemonic == "LDSM" {
+            loads.push(16 * i as u64);
+        }
+    }
+    assert!(!loads.is_empty());
+    // Registers that hold nothing for the sequences to take: one of the NOPs writes R100.
+    let mov = assemble::assemble_int("mov__RCR_RC", &[("Rd", 100)]).unwrap();
+    let k = made_nop[0];
+    input.sections[section].data[16 * k..16 * (k + 1)].copy_from_slice(&mov.to_le_bytes());
+    let opts = Options {
+        borrow: 3,
+        ..Options::default()
+    };
+    let result = translate_with_options(&input.write(), true, &opts).unwrap();
+    let report = result.report.iter().find(|f| f.name == name).unwrap();
+    assert_eq!(report.refused, None);
+    let map = result.map.unwrap();
+    for at in loads {
+        assert!(
+            map.iter()
+                .any(|(f, _, old, what)| f == name && *old == at && what == "lane"),
+            "nothing reads the lane for the matrix load at 0x{at:x}"
+        );
+    }
+}
