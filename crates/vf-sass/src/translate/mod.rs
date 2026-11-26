@@ -31,7 +31,11 @@ use crate::generated::special::*;
 
 pub use self::util::find_relative_decoded;
 pub use ampere::{Word as AmpereWord, described as ampere_class, word as ampere_word};
-pub use cubin::{translate, translate_with_options};
+pub use cubin::{translate, translate_with_companions, translate_with_options};
+
+pub(super) fn companions_enabled() -> bool {
+    std::env::var_os("VF_COMPANIONS").is_none_or(|v| v != "0")
+}
 
 // ---- Error type ----
 #[derive(Debug)]
@@ -170,6 +174,8 @@ const AROUND: &[&str] = &[
     "settled",
     "to pairs",
     "from pairs",
+    "companion",
+    "companion: lane",
 ];
 /// The relocations that write the lower and the upper half of an address into the 32 bits of an
 /// immediate (R_CUDA_ABS32_LO_32, R_CUDA_ABS32_HI_32).

@@ -444,7 +444,7 @@ def patched(control):
     stand_ins, liveness, late, schedule, return_addresses = (
         Function.stand_ins, Function.liveness, Function.late, Function.schedule, Function.return_addresses)
     matrix_load, matrix_product, kept = Function.matrix_load, Function.matrix_product, Function.kept
-    kept_for_rows, whole_rows, half_of_pair, converted = Function.kept_for_rows, Function.whole_rows, Function.half_of_pair, Function.converted
+    kept_for_rows, whole_rows, half_of_pair, converted, accompanied = Function.kept_for_rows, Function.whole_rows, Function.half_of_pair, Function.converted, Function.accompanied
     given_back = Function.given_back
 
     def alive_scratch_pred(self):
@@ -759,6 +759,49 @@ def patched(control):
         finally:
             load['also'] = was
 
+    def halfsplit(self, i, *args):
+        if i in self.q.sites and self.q.sites[i]['half'] == 0 and len(self.q.sites) >= 2:
+            sb = self.q.site_sb.get(i, translate.SEQUENCE)
+            alt = (sb + 1) & 3
+            self.q.site_sb[i] = alt
+            try:
+                return half_of_pair(self, i, *args)
+            finally:
+                self.q.site_sb[i] = sb
+        return half_of_pair(self, i, *args)
+
+    def halfnoarrive(self, i, d, wait):
+        if i in self.q.site_seq_wait and not (wait & (1 << (WAIT + translate.SEQUENCE))):
+            new = half_of_pair(self, i, d, wait)
+            new[0].word &= ~(1 << (WAIT + translate.SEQUENCE))
+            return new
+        return half_of_pair(self, i, d, wait)
+
+    def compnotsettled(self, i, plan):
+        new = accompanied(self, i, plan)
+        if new:
+            new[0].word = with_stall(new[0].word, 2)
+        return new
+
+    def compbadlane(self, i, plan):
+        new = accompanied(self, i, plan)
+        c = self.mc.md70.by_name['iadd3_imm__RsIR_RIR']
+        for item in new:
+            if item.what == 'companion: lane':
+                item.word = self.put(c, item.word, 'Sb', self.mc.d70.operands(c, item.word)['Sb'] ^ 2)
+                return new
+        shfl = self.mc.md70.by_name['shfl__RRI']
+        for item in new:
+            if item.what == 'companion':
+                item.word = self.put(shfl, item.word, 'Sc', 15)
+                return new
+        return new
+
+    def compdrop(self, i, plan):
+        if plan and i == next(iter(plan)):
+            return []
+        return accompanied(self, i, plan)
+
     def unpermuted(self, i, plan):
         if not {'pi', 'inv'} <= set(self.kept_rows):
             return converted(self, i, plan)
@@ -813,6 +856,11 @@ def patched(control):
         'unpermuted': {'converted': unpermuted},
         'unconverted': {'converted': unconverted},
         'notalso': {'whole_rows': notalso},
+        'halfsplit': {'half_of_pair': halfsplit},
+        'halfnoarrive': {'half_of_pair': halfnoarrive},
+        'compnotsettled': {'accompanied': compnotsettled},
+        'compbadlane': {'accompanied': compbadlane},
+        'compdrop': {'accompanied': compdrop},
         'slowno': {},
         'slowshort': {},
         'slownowait': {},
@@ -1250,7 +1298,8 @@ def patched(control):
 
 CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
 # (Those of pairs of products on whole rows: only when the translator makes them, not with VF_PAIRS=0.)
-PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso']
+PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso',
+                 'halfsplit', 'halfnoarrive', 'compnotsettled', 'compbadlane', 'compdrop']
 CONTROLS += PAIR_CONTROLS
 # (Those of borrowed registers: only when VF_BORROW=1.)
 BORROW_CONTROLS = ['alive_pair', 'alive_home', 'no_borrow_wait', 'no_late_borrow', 'written_pair', 'shared_home', 'overlap_pool', 'short_home', 'pool_in_home_unsaid']
@@ -1374,7 +1423,7 @@ def run(mc, control, path, out_dir, untouched, validated=True):
     changed nothing in its translation, which `untouched` holds by path. (`validated` false: the
     translation as it is is kept there and not validated.)"""
     originals = {name: getattr(Function, name) for name in ('stand_ins', 'liveness', 'late', 'schedule', 'return_addresses', 'matrix_load', 'matrix_product', 'kept', 'kept_gathering', 'given_back', 'all_predicates', 'waits_for', 'masked',
-                                                             'kept_for_rows', 'whole_rows', 'half_of_pair', 'converted',
+                                                             'kept_for_rows', 'whole_rows', 'half_of_pair', 'converted', 'accompanied',
                                                              'from_memory', 'to_memory', 'frame_top', 'load_word', 'store_word', 'read_back')}
     for name, replacement in patched(control).items():
         setattr(Function, name, replacement)

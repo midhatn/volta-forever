@@ -25,6 +25,16 @@ pub fn translate(data: &[u8], want_map: bool) -> Result<TranslateResult, String>
 
 /// Translate an sm_75 or supported sm_80 cubin to sm_70 with the given options.
 pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Result<TranslateResult, String> {
+    translate_with_companions(data, want_map, opts, super::companions_enabled())
+}
+
+/// Translate an sm_75 or supported sm_80 cubin with explicit options and companion-hoisting switch.
+pub fn translate_with_companions(
+    data: &[u8],
+    want_map: bool,
+    opts: &Options,
+    companions: bool,
+) -> Result<TranslateResult, String> {
     let mut dec75 = Decoder::new(75);
     let mut dec70 = Decoder::new(70);
     let mut e = Elf::parse(data)?;
@@ -304,23 +314,38 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                 let saves = predicates.iter().map(|p| p.save_slots).max().unwrap_or(0);
                 // A function's pairing plan depends on the original instructions and control
                 // flow. Register-placement retries and budget alternatives can reuse it.
-                let paired = std::cell::LazyCell::new(|| {
+                let make_plans = |with_comp: bool| -> Vec<Option<crate::pairing::Plan>> {
+                    let mut pdec70 = Decoder::new(70);
                     fs.iter()
                         .map(|f| {
                             if opts.pairs && f.needs_lane && !f.entered_inside {
-                                crate::pairing::plan(&f.src, &f.tables, &self::entries(f))
+                                crate::pairing::plan_with_companions(
+                                    &f.src,
+                                    &f.tables,
+                                    &self::entries(f),
+                                    with_comp,
+                                    &mut pdec70,
+                                )
                             } else {
                                 None
                             }
                         })
-                        .collect::<Vec<_>>()
-                });
+                        .collect()
+                };
+                let paired_comp = std::cell::LazyCell::new(|| make_plans(companions));
+                let paired_nocomp = std::cell::LazyCell::new(|| make_plans(false));
                 let unpaired: Vec<_> = fs.iter().map(|_| None).collect();
                 // `borrow_level`: 2, the uniform registers that find a home in the function's
                 // own registers have it and the pool is taken there at each instruction; 1, the
                 // homes only, the pool above; 0, everything above, as it was.
-                let mut attempt = |do_pairs: bool, borrow_level: u32, top_override: Option<u32>, gave_up: &[String]| -> Result<Vec<(usize, TransResult)>, Refused> {
-                    let plans = if do_pairs { &*paired } else { &unpaired };
+                let mut attempt = |do_pairs: bool, with_companions: bool, borrow_level: u32, top_override: Option<u32>, gave_up: &[String]| -> Result<Vec<(usize, TransResult)>, Refused> {
+                    let plans = if !do_pairs {
+                        &unpaired
+                    } else if with_companions {
+                        &*paired_comp
+                    } else {
+                        &*paired_nocomp
+                    };
                     // has_product when not in a pair site.
                     let has_product_flags: Vec<bool> = fs
                         .iter()
@@ -430,6 +455,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             false,
                             None,
                             &[],
+                            None,
                             &[],
                         )?;
                         let si = indices[0];
@@ -447,6 +473,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             None,     // no scratch (taken at instruction)
                             placed.7, // free
                             None,     // no pairs plan
+                            HashMap::new(),
                             HashMap::new(),
                             HashMap::new(),
                             opts.aligned_rows,
@@ -488,6 +515,13 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         all.dedup();
                         all.into_iter().filter(|u| !homed_set.contains(u)).collect()
                     };
+                    let mut beside: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+                    for plan in plans.iter().flatten() {
+                        for (root, count) in plan.companion_registers() {
+                            let entry = beside.entry(root).or_insert(0);
+                            *entry = (*entry).max(count);
+                        }
+                    }
                     let placed = placement(
                         fs.iter().map(|f| f.highest).max().unwrap() + 1,
                         &uniform_for_placement,
@@ -499,6 +533,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         fs.iter().zip(has_product_flags.iter()).any(|(_, &hp)| hp),
                         if rows.is_empty() { None } else { Some(&rows) },
                         &row_kept,
+                        if beside.is_empty() { None } else { Some(&beside) },
                         &held_preds,
                     )?;
                     let (
@@ -512,6 +547,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         free,
                         rows_at_base,
                         kept_rows_base,
+                        comp_at,
                         hold_at,
                     ) = placed;
                     // Merge the borrowed homes into the placement map.
@@ -546,6 +582,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             plan.as_ref(),
                             func_rows_at,
                             kept_rows_base.clone(),
+                            comp_at.clone(),
                             opts.aligned_rows,
                             has_product_flags[k],
                             &hold_at,
@@ -572,35 +609,44 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     Ok(result)
                 };
                 let alone = fs.len() == 1 && indices.iter().any(|si| entries.contains(si));
-                let has_pairs_to_drop = || paired.iter().any(Option::is_some);
+                let has_pairs_to_drop = || paired_comp.iter().any(Option::is_some);
+                let has_companions_to_drop = || companions && paired_comp.iter().any(|p| p.as_ref().is_some_and(|q| !q.roots.is_empty()));
                 type Tried = Result<Vec<(usize, TransResult)>, Refused>;
-                type AttemptFn<'a> = dyn FnMut(bool, u32, Option<u32>, &[String]) -> Tried + 'a;
+                type AttemptFn<'a> = dyn FnMut(bool, bool, u32, Option<u32>, &[String]) -> Tried + 'a;
                 let empty_gave_up: Vec<String> = Vec::new();
-                // usual(): the chain of attempts (levels 2, 1, 0, pairs fallback).
+                // usual(): the chain of attempts (levels 2, 1, 0, companions fallback, pairs fallback).
                 let usual = |attempt: &mut AttemptFn<'_>| {
                     let r = if opts.borrow > 0 && alone {
-                        attempt(true, 2, None, &[])
-                            .or_else(|_| attempt(true, 1, None, &[]))
-                            .or_else(|_| attempt(true, 0, None, &[]))
+                        attempt(true, true, 2, None, &[])
+                            .or_else(|_| attempt(true, true, 1, None, &[]))
+                            .or_else(|_| attempt(true, true, 0, None, &[]))
                     } else {
-                        attempt(true, 0, None, &[])
+                        attempt(true, true, 0, None, &[])
                     };
                     r.or_else(|refused| {
-                        if has_pairs_to_drop() {
-                            attempt(false, 0, None, &[])
-                        } else {
-                            Err(refused)
+                        if !has_pairs_to_drop() {
+                            return Err(refused);
                         }
+                        if has_companions_to_drop()
+                            && let Ok(res) = attempt(true, false, 0, None, &[])
+                        {
+                            return Ok(res);
+                        }
+                        attempt(false, false, 0, None, &[])
                     })
                 };
-                // plain(): level 0 with pairs fallback but no borrow (for the budget).
+                // plain(): level 0 with companions then pairs fallback, without borrow (for the budget).
                 let plain = |attempt: &mut AttemptFn<'_>, gave_up: &[String]| {
-                    attempt(true, 0, None, gave_up).or_else(|refused| {
-                        if has_pairs_to_drop() {
-                            attempt(false, 0, None, gave_up)
-                        } else {
-                            Err(refused)
+                    attempt(true, true, 0, None, gave_up).or_else(|refused| {
+                        if !has_pairs_to_drop() {
+                            return Err(refused);
                         }
+                        if has_companions_to_drop()
+                            && let Ok(res) = attempt(true, false, 0, None, gave_up)
+                        {
+                            return Ok(res);
+                        }
+                        attempt(false, false, 0, None, gave_up)
                     })
                 };
                 let chosen: Tried = 'chain: { if opts.borrow == 8 && alone {
@@ -612,7 +658,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     let f = &fs[0];
                     let extra: u32 = if f.product_count > 0 { 16 } else { 0 };
                     let top_for_8 = if extra > 0 { Some(f.highest + extra) } else { None };
-                    match attempt(false, 3, top_for_8, &empty_gave_up) {
+                    match attempt(false, false, 3, top_for_8, &empty_gave_up) {
                         Ok(d) => Ok(d),
                         Err(ref e) => {
                             eprintln!("level 3 failed for {}: {}", fs[0].name, e.0);
@@ -631,8 +677,8 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             let original_msg = original_why.0.clone();
                             // Try levels 1, 2, 3 in order.
                             let mut done = None;
-                            for (do_p, bl) in [(true, 1u32), (true, 2), (false, 3)] {
-                                match attempt(do_p, bl, None, &gave_up) {
+                            for (do_p, do_c, bl) in [(true, true, 1u32), (true, true, 2), (false, false, 3)] {
+                                match attempt(do_p, do_c, bl, None, &gave_up) {
                                     Ok(d) => { done = Some(d); break; }
                                     Err(e) => { gave_up.push(e.0); }
                                 }
@@ -662,8 +708,8 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         // layout when a second placement could change how those sites are rewritten.
                         if normal[0].1.count > limit && !relocations.contains_key(&indices[0]) && f.tables.is_empty() {
                             let top = limit.saturating_sub(3).saturating_sub(saves);
-                            for (pairs, level, bound) in [(true, 1, None), (true, 2, None), (false, 3, Some(top))] {
-                                if let Ok(candidate) = attempt(pairs, level, bound, &gave_up)
+                            for (pairs, do_c, level, bound) in [(true, true, 1, None), (true, true, 2, None), (false, false, 3, Some(top))] {
+                                if let Ok(candidate) = attempt(pairs, do_c, level, bound, &gave_up)
                                     && candidate[0].1.count <= limit
                                 {
                                     // Attributes and symbols may point at any original instruction. Preserve
@@ -694,15 +740,15 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             gave_up.push(original_why.0.clone());
                             let original_msg = original_why.0.clone();
                             // Try levels 1, 2, 3 in order.
-                            match attempt(true, 1, None, &gave_up) {
+                            match attempt(true, true, 1, None, &gave_up) {
                                 Ok(d) => Ok(d),
                                 Err(e1) => {
                                     gave_up.push(e1.0);
-                                    match attempt(true, 2, None, &gave_up) {
+                                    match attempt(true, true, 2, None, &gave_up) {
                                         Ok(d) => Ok(d),
                                         Err(e2) => {
                                             gave_up.push(e2.0);
-                                            match attempt(false, 3, None, &gave_up) {
+                                            match attempt(false, false, 3, None, &gave_up) {
                                                 Ok(d) => Ok(d),
                                                 Err(e3) => {
                                                     gave_up.push(e3.0);
@@ -762,7 +808,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     }
                     if !best.as_ref().is_some_and(|b| b.within) {
                         // Level 1.
-                        match attempt(true, 1, None, &gave_up) {
+                        match attempt(true, true, 1, None, &gave_up) {
                             Ok(d) => {
                                 let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
                                 if count <= budget {
@@ -779,7 +825,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     }
                     if !best.as_ref().is_some_and(|b| b.within) {
                         // Level 2.
-                        match attempt(true, 2, None, &gave_up) {
+                        match attempt(true, true, 2, None, &gave_up) {
                             Ok(d) => {
                                 let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
                                 if count <= budget {
@@ -796,7 +842,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     }
                     if !best.as_ref().is_some_and(|b| b.within) {
                         // Level 3.
-                        match attempt(false, 3, top_for_l3, &gave_up) {
+                        match attempt(false, false, 3, top_for_l3, &gave_up) {
                             Ok(d) => {
                                 let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
                                 if count <= budget {
@@ -819,9 +865,9 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                                 // attempt made it).
                                 b.result = match b.level {
                                     0 => plain(&mut attempt, &gave_up)?,
-                                    1 => attempt(true, 1, None, &gave_up)?,
-                                    2 => attempt(true, 2, None, &gave_up)?,
-                                    3 => attempt(false, 3, top_for_l3, &gave_up)?,
+                                    1 => attempt(true, true, 1, None, &gave_up)?,
+                                    2 => attempt(true, true, 2, None, &gave_up)?,
+                                    3 => attempt(false, false, 3, top_for_l3, &gave_up)?,
                                     _ => unreachable!(),
                                 };
                             }
@@ -838,7 +884,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                 } else if opts.borrow >= 3 && alone {
                     // For tests: everything at the instruction first, every uniform register
                     // in memory.
-                    match attempt(false, 3, None, &empty_gave_up) {
+                    match attempt(false, false, 3, None, &empty_gave_up) {
                         Ok(d) => Ok(d),
                         Err(ref e) => {
                             eprintln!("level 3 failed for {}: {}", fs[0].name, e.0);
@@ -850,7 +896,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     // and when that is refused too, for the reason it was refused before.
                     match usual(&mut attempt) {
                         Ok(d) => Ok(d),
-                        Err(original_why) => match attempt(false, 3, None, &empty_gave_up) {
+                        Err(original_why) => match attempt(false, false, 3, None, &empty_gave_up) {
                             Ok(d) => Ok(d),
                             Err(also) => {
                                 if std::env::var("VF_BORROW_SAY").is_ok() {
@@ -883,8 +929,8 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                 }
                 if opts.borrow > 0 && alone {
                     let top = limit.saturating_sub(3).saturating_sub(saves);
-                    for (pairs, level, bound) in [(true, 1, None), (true, 2, None), (false, 3, Some(top))] {
-                        if let Ok(candidate) = attempt(pairs, level, bound, &empty_gave_up)
+                    for (pairs, do_c, level, bound) in [(true, true, 1, None), (true, true, 2, None), (false, false, 3, Some(top))] {
+                        if let Ok(candidate) = attempt(pairs, do_c, level, bound, &empty_gave_up)
                             && count(&candidate) <= limit
                         {
                             return Ok(candidate);

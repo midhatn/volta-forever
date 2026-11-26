@@ -1482,7 +1482,9 @@ KEPT = [
     'SHF.L.U32 {odd}, {lane}, 0x1f, RZ',
     'SHF.R.S32.HI {odd}, RZ, 0x1f, {odd}',
 ]
-AROUND = ('wait', 'save', 'restore', 'lane', 'kept', 'settled', 'to pairs', 'from pairs', 'held: back', 'held: kept', 'late predicate')   # what is put around an instruction, and is not what it became
+AROUND = ('wait', 'save', 'restore', 'lane', 'kept', 'settled', 'to pairs', 'from pairs', 'companion', 'companion: lane', 'held: back', 'held: kept', 'late predicate')   # what is put around an instruction, and is not what it became
+MIRRORED_COMP = {'LOP3', 'IMAD', 'LEA', 'IADD3', 'SHF', 'MOV'}
+CONTROL_OPS = {'req_bit_set', 'dst_wr_sb', 'src_rel_sb', 'usched_info'}
 MEM_RE = re.compile(r'^mem: ')    # level 3: instructions around the core for the frame
 
 
@@ -1578,7 +1580,172 @@ def run_on_lanes(lines, state, written=None):
     return None
 
 
-def rows_loaded(lines, source, kept, highest, uniform):
+def _unguarded_75(d):
+    ops = d.ops
+    return ops.get('Pg', 7) == 7 and not ops.get('Pg@not', 0) and ops.get('UPg', 7) == 7 and not ops.get('UPg@not', 0)
+
+
+def _may_write_reg75(mc, code75, ta, at, reg_num):
+    """Whether original instruction at byte offset `at` may write register `reg_num`,
+    including calls or undecodable instructions."""
+    t = ta[at // 16] or ''
+    body = t.split(' ', 1)[1] if t.startswith('@') else t
+    if body.startswith(('CALL', 'JCAL')):
+        return True
+    d = mc.decode(75, int.from_bytes(code75[at:at + 16], 'little'))
+    if d is None:
+        return True
+    return any(l == 'R' and r == reg_num for l, r in d.writes)
+
+
+def find_reaching_made(mc, code75, ta, leads, anywhere, load_old, ra_num, root_r):
+    """Find the single reaching plain unguarded MIRRORED instruction `made` that computes
+    R`ra_num` from R`root_r` alone with no write of R`root_r` between `made` and `load_old`,
+    or return an error string."""
+    n = len(code75) // 16
+    if anywhere:
+        return 'a branch through a register may lead anywhere in the function'
+    decoded = [mc.decode(75, int.from_bytes(code75[16 * i:16 * i + 16], 'little')) for i in range(n)]
+    # Backward/forward reaching definitions of ra_num; 0 is ENTRY.
+    def kills(i):
+        d = decoded[i]
+        return d is not None and _unguarded_75(d) and any(l == 'R' and r == ra_num for l, r in d.writes)
+    def writes_ra(i):
+        t = ta[i] or ''
+        body = t.split(' ', 1)[1] if t.startswith('@') else t
+        if body.startswith(('CALL', 'JCAL')):
+            return True
+        d = decoded[i]
+        return d is None or any(l == 'R' and r == ra_num for l, r in d.writes)
+    reach_in = [set() for _ in range(n)]
+    reach_in[0] = {'ENTRY'}
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            if not reach_in[i]:
+                continue
+            out = {16 * i} if writes_ra(i) and kills(i) else ((reach_in[i] | ({16 * i} if writes_ra(i) else set())))
+            for to in leads.get(16 * i, ()):
+                ti = to // 16
+                if ti < n and not out <= reach_in[ti]:
+                    reach_in[ti] |= out
+                    changed = True
+    defs = reach_in[load_old // 16]
+    if 'ENTRY' in defs or len(defs) != 1:
+        return 'its address register does not have one reaching definition from a root'
+    made_old = next(iter(defs))
+    d = decoded[made_old // 16]
+    t_made = ta[made_old // 16] or ''
+    body_made = t_made.split(' ', 1)[1] if t_made.startswith('@') else t_made
+    read = {(l, x) for l, x, *_ in d.reads} if d is not None else set()
+    if (d is None or d.mnemonic not in MIRRORED_COMP or not _unguarded_75(d)
+            or body_made.startswith(('BRA', 'JMP', 'BRX', 'JMX', 'CALL', 'JCAL', 'RET', 'EXIT'))
+            or d.writes != [('R', ra_num)] or read != {('R', root_r)}
+            or mc.decode(70, d.word) is None):
+        return 'the definition of its address register at 0x%x is not one to do again on a companion' % made_old
+    # Check no way from made_old to load_old (without passing made_old again) writes root_r.
+    ahead, work = set(), [x for x in leads.get(made_old, ()) if x != made_old]
+    while work:
+        k = work.pop()
+        if k in ahead or k == made_old:
+            continue
+        ahead.add(k)
+        work.extend(leads.get(k, ()))
+    preds = collections.defaultdict(list)
+    for p, tos in leads.items():
+        for to in tos:
+            preds[to].append(p)
+    behind, work = set(), [p for p in preds.get(load_old, ()) if p != made_old]
+    while work:
+        k = work.pop()
+        if k in behind or k == made_old:
+            continue
+        behind.add(k)
+        work.extend(preds.get(k, ()))
+    if any(_may_write_reg75(mc, code75, ta, k, root_r) for k in ahead & behind):
+        return 'its root R%d is written between 0x%x and the load' % (root_r, made_old)
+    return made_old
+
+
+def _matches_again(mc, w_got, d75_word, root_r, comp_r, to_r):
+    d_got = mc.decode(70, w_got)
+    d_src = mc.decode(70, d75_word)
+    if d_got is None or d_src is None or d_got.c.name != d_src.c.name:
+        return False
+    if d_got.ops.get('Rd') != to_r:
+        return False
+    for k, v in d_src.ops.items():
+        if k in CONTROL_OPS or k.startswith('TABLES_opex'):
+            continue
+        want = to_r if k == 'Rd' else (comp_r if k in ('Ra', 'Rb', 'Rc') and v == root_r else v)
+        if d_got.ops.get(k) != want:
+            return False
+    for k in d_got.ops:
+        if k not in CONTROL_OPS and not k.startswith('TABLES_opex') and k not in d_src.ops:
+            return False
+    return True
+
+
+def companion_lane_kind(vec):
+    """Return ('BT', k) or (role, k) if 32-tuple `vec` matches one of the row lanes, else None."""
+    if vec == tuple(ROW_VALUES['kA']): return ('A', 0)
+    if vec == tuple(ROW_VALUES['kA2']): return ('A', 1)
+    if vec == tuple(ROW_VALUES['kB']): return ('B', 0)
+    if vec == tuple(ROW_VALUES['kB2']): return ('B', 1)
+    for k, f in enumerate((0, 4, 16, 20)):
+        if vec == tuple(x + f for x in ROW_VALUES['kBT']):
+            return ('BT', k)
+    return None
+
+
+def companions_stand(mc, code75, ta, leads, anywhere, companion_makers, comp_loads):
+    """Verify independently on original CFG that for every companion load (old, root_r, used_comps),
+    every used companion register stands along every path from entry with no intervening write of root_r."""
+    if not comp_loads:
+        return []
+    n = len(code75) // 16
+    if anywhere:
+        return ['a function with companions has a branch through a register that may lead anywhere']
+    problems = []
+    # Collect all distinct (comp_r, root_r) pairs used in loads.
+    needed = {(c_r, root_r) for root_r, comps in comp_loads.values() for c_r in comps}
+    for comp_r, root_r in sorted(needed):
+        before_make = {old for (old, side), entries in companion_makers.items() if side == 'before'
+                       for cr, rr, _ in entries if cr == comp_r and rr == root_r}
+        after_make = {old for (old, side), entries in companion_makers.items() if side == 'after'
+                      for cr, rr, _ in entries if cr == comp_r and rr == root_r}
+        writes = [16 * i for i in range(n) if _may_write_reg75(mc, code75, ta, 16 * i, root_r)]
+        write_set = set(writes)
+        # bare_entry[i]: some path reaches BEFORE old=16*i (before before_make) without comp_r standing.
+        # bare_body[i]: some path reaches body of old=16*i (after before_make) without comp_r standing.
+        bare_entry = [i == 0 for i in range(n)]
+        bare_body = [bare_entry[i] and (16 * i not in before_make) for i in range(n)]
+        changed = True
+        while changed:
+            changed = False
+            for i in range(n):
+                at = 16 * i
+                bb = bare_entry[i] and (at not in before_make)
+                if bb != bare_body[i]:
+                    bare_body[i] = bb
+                    changed = True
+                after_inst = bare_body[i] or (at in write_set)
+                for to in leads.get(at, ()):
+                    ti = to // 16
+                    if ti >= n:
+                        continue
+                    eb = False if (to == at + 16 and at in after_make) else after_inst
+                    if eb and not bare_entry[ti]:
+                        bare_entry[ti] = True
+                        changed = True
+        for load_old, (rr, comps) in sorted(comp_loads.items()):
+            if rr == root_r and comp_r in comps and bare_body[load_old // 16]:
+                problems.append((load_old, comp_r, root_r))
+    return problems
+
+
+def rows_loaded(lines, source, kept, highest, uniform, word_list=None, mc=None, comp_init=None, again_info=None):
     """What the instructions `lines` load for the matrix load `source`, as rows: (role, {(fragment
     or pair, half of k): the first of its two registers}), or a sentence that says what is wrong.
     `kept`: {name of ROW_VALUES: register}; `uniform`: the register that stands for the uniform
@@ -1590,12 +1757,40 @@ def rows_loaded(lines, source, kept, highest, uniform):
     state = {ra: [('row', lane, 0, 0) for lane in range(32)]}
     for name, register in kept.items():
         state[register] = list(ROW_VALUES[name])
+    if comp_init:
+        for comp_name, lane_vec in comp_init.items():
+            state[comp_name] = [('row', lane_vec[l], 0, 0) for l in range(32)]
     if uniform is not None:
         state[uniform] = [('row', None, 0, 1)] * 32
     written = set()
-    at = run_on_lanes(lines, state, written)
-    if at is not None:
-        return 'instruction %d of it is not one of a whole-row load' % at
+    if again_info is not None:
+        root_r, d75_word, comp_lanes = again_info
+        saw_again = 0
+        for k, line in enumerate(lines):
+            w70 = word_list[k]
+            d70 = mc.decode(70, w70)
+            read_comps = {r for l, r, *_ in d70.reads if l == 'R' and ('R%d' % r) in comp_lanes} if d70 else set()
+            if read_comps:
+                if len(read_comps) != 1 or d70 is None or len(d70.writes) != 1 or d70.writes[0][0] != 'R':
+                    return 'instruction %d of it is not an address done again on a companion' % k
+                comp_r = next(iter(read_comps))
+                to_r = d70.writes[0][1]
+                if to_r <= highest or not _matches_again(mc, w70, d75_word, root_r, comp_r, to_r):
+                    return 'instruction %d of it does not match the address instruction on the companion' % k
+                lane_vec = comp_lanes['R%d' % comp_r]
+                state['R%d' % to_r] = [('row', lane_vec[l], 0, 0) for l in range(32)]
+                written.add('R%d' % to_r)
+                saw_again += 1
+            else:
+                at = run_on_lanes([line], state, written)
+                if at is not None:
+                    return 'instruction %d of it is not one of a whole-row load' % k
+        if saw_again != len(comp_lanes):
+            return 'does not recompute every row address from the companions'
+    else:
+        at = run_on_lanes(lines, state, written)
+        if at is not None:
+            return 'instruction %d of it is not one of a whole-row load' % at
     parts = 1 if m.group(4) else 0
     loaded = {r: state[r] for r in written if all(isinstance(x, tuple) and x[0] == 'word' for x in state[r])}
     for role in ('BT',) if transposed else ('A', 'B'):
@@ -1875,13 +2070,14 @@ def rows_schedule(mc, words, after, named):
     shuffles = [k for k, d in enumerate(decoded) if d is not None and d.mnemonic == 'SHFL']
     loads = [k for k, d in enumerate(decoded) if d is not None and d.mnemonic == 'LDS']
     waits = lambda w, board: ((w >> WAIT) & 63) >> board & 1
-    if not shuffles or not loads or shuffles[-1] > loads[0]:
+    if not loads or (shuffles and shuffles[-1] > loads[0]):
         return [(0, 'not shuffles of addresses, then loads')]
-    boards = {(words[k] >> WRITE_BARRIER) & 7 for k in shuffles}
-    if len(boards) != 1 or 7 in boards:
-        out.append((shuffles[0], 'the shuffles of addresses do not say on one scoreboard when they are there'))
-    elif not waits(words[shuffles[-1] + 1], next(iter(boards))):
-        out.append((shuffles[-1] + 1, 'reads a shuffled address without waiting for the shuffles'))
+    if shuffles:
+        boards = {(words[k] >> WRITE_BARRIER) & 7 for k in shuffles}
+        if len(boards) != 1 or 7 in boards:
+            out.append((shuffles[0], 'the shuffles of addresses do not say on one scoreboard when they are there'))
+        elif not waits(words[shuffles[-1] + 1], next(iter(boards))):
+            out.append((shuffles[-1] + 1, 'reads a shuffled address without waiting for the shuffles'))
     reads = {(words[k] >> READ_BARRIER) & 7 for k in loads}
     if len(reads) != 1 or 7 in reads:
         out.append((loads[0], 'the loads of rows do not say on one scoreboard when they have read their address'))
@@ -3438,7 +3634,7 @@ def main():
         for new, old, what in listing:
             if stands[old] & {'group', 'neighbour', 'halves swapped'} and what not in AROUND and not is_mem(what) and not is_room(what):
                 sequences.add(new)
-            if what in ('settled', 'to pairs', 'from pairs', 'half of a pair') or what.startswith('whole row'):
+            if what in ('settled', 'to pairs', 'from pairs', 'companion', 'companion: lane', 'half of a pair') or what.startswith('whole row'):
                 sequences.add(new)
         # ---- level 3: per-function frame checks (rules A1, A2) ----
         frame_slots = borrow_slots.get(name, {})
@@ -3529,6 +3725,7 @@ def main():
         # [(old offset, accumulators x and y, register of A, register of B, B by rows)]; the
         # conversions [(old offset, 'before' or 'after', register, 'Q' or 'T')].
         rows_kept, row_loads, halves, conversions, row_scratch = {}, {}, [], [], set()
+        companion_makers, companion_defs, companion_regs, comp_loads = collections.defaultdict(list), {}, set(), {}
         for old, parts in by_origin.items():
             source = ta[old // 16]
             checked += len(parts)
@@ -3687,8 +3884,9 @@ def main():
             # and stalls: `pairs_schedule`), then one shuffle a register, in place, by the kept
             # permutation or its inverse. Where they are, and which registers, is the plan's
             # (checked for the whole function, below).
-            moves = ('settled', 'to pairs', 'from pairs')
+            moves = ('settled', 'to pairs', 'from pairs', 'companion', 'companion: lane')
             body = [k for k, (new, w) in enumerate(parts) if w not in moves and w not in ('wait', 'save', 'restore')]
+            lane_state_comp = {reg: list(ROW_VALUES[vn]) for vn, reg in rows_kept.items()}
             for k, (new, w) in enumerate(parts):
                 if w not in moves:
                     continue
@@ -3697,8 +3895,36 @@ def main():
                 if side is None:
                     say(new, old, w, 'a conversion in the middle of what the instruction became')
                 elif w == 'settled':
-                    if t != 'NOP' or (k + 1 < len(parts) and parts[k + 1][1] not in ('to pairs', 'from pairs')) or k + 1 == len(parts):
+                    lane_state_comp = {reg: list(ROW_VALUES[vn]) for vn, reg in rows_kept.items()}
+                    if t != 'NOP' or k + 1 == len(parts) or parts[k + 1][1] not in ('to pairs', 'from pairs', 'companion', 'companion: lane'):
                         say(new, old, w, 'not a NOP before conversions')
+                elif w == 'companion: lane':
+                    m = re.match(r'IADD3 (R\d+), (R\d+), (0x[0-9a-f]+), RZ$', unreused(t))
+                    if k == 0 or parts[k - 1][1] not in moves:
+                        say(new, old, w, 'companions that do not start with the instruction that waits for everything')
+                    elif (not m or int(m.group(1)[1:]) <= highest or m.group(2) != rows_kept.get('kBT')
+                            or int(m.group(3), 16) not in (4, 16, 20)
+                            or m.group(1) in (({lane} if lane else set()) | set((lanes_kept or {}).values()) | set(rows_kept.values()))):
+                        say(new, old, w, 'not a row lane offset of a companion computed into a new register')
+                    else:
+                        lane_state_comp[m.group(1)] = [x + int(m.group(3), 16) for x in ROW_VALUES['kBT']]
+                        row_scratch.add(m.group(1))
+                elif w == 'companion':
+                    m = re.match(r'SHFL\.IDX PT, (R\d+), (R\d+), (R\d+), 0x1f$', unreused(t))
+                    if k == 0 or parts[k - 1][1] not in moves:
+                        say(new, old, w, 'companions that do not start with the instruction that waits for everything')
+                    elif (not m or int(m.group(1)[1:]) <= highest or int(m.group(2)[1:]) > highest
+                            or m.group(3) not in lane_state_comp
+                            or companion_lane_kind(tuple(lane_state_comp[m.group(3)])) is None):
+                        say(new, old, w, 'not a companion of a program register for a row of the design')
+                    else:
+                        comp_r, root_r = int(m.group(1)[1:]), int(m.group(2)[1:])
+                        lvec = tuple(lane_state_comp[m.group(3)])
+                        if companion_defs.setdefault(comp_r, (root_r, lvec)) != (root_r, lvec):
+                            say(new, old, w, 'companion R%d reused for another root or row' % comp_r)
+                        else:
+                            companion_makers[(old, side)].append((comp_r, root_r, lvec))
+                            companion_regs.add(m.group(1))
                 else:
                     m = re.match(r'SHFL\.IDX PT, (R\d+), (R\d+), (R\d+), 0x1f$', t)
                     key = rows_kept.get('pi' if w == 'to pairs' else 'inv')
@@ -3855,13 +4081,33 @@ def main():
                 lines = [unreused(g) for g in got[:len(mine)]]
                 under = re.search(r'\+(UR\d+)', unreused(source))
                 stand, why = None, 'its instructions are not in one piece'
+                has_shfl = any(line.startswith('SHFL.IDX ') for line in lines)
+                if not companion_defs and any(w in ('companion', 'companion: lane') for _, _, w in listing):
+                    # Ensure companion_defs is populated even if a loop load has smaller offset than its companion maker.
+                    for o2, p2 in by_origin.items():
+                        ls2 = {reg: list(ROW_VALUES[vn]) for vn, reg in rows_kept.items()}
+                        for kk, (nn2, ww2) in enumerate(p2):
+                            tt2 = tb[nn2 // 16] or ''
+                            if ww2 == 'settled':
+                                ls2 = {reg: list(ROW_VALUES[vn]) for vn, reg in rows_kept.items()}
+                            elif ww2 == 'companion: lane':
+                                m2 = re.match(r'IADD3 (R\d+), (R\d+), (0x[0-9a-f]+), RZ$', unreused(tt2))
+                                if m2 and m2.group(2) == rows_kept.get('kBT') and int(m2.group(3), 16) in (4, 16, 20):
+                                    ls2[m2.group(1)] = [x + int(m2.group(3), 16) for x in ROW_VALUES['kBT']]
+                            elif ww2 == 'companion':
+                                m2 = re.match(r'SHFL\.IDX PT, (R\d+), (R\d+), (R\d+), 0x1f$', unreused(tt2))
+                                if m2 and int(m2.group(1)[1:]) > highest and int(m2.group(2)[1:]) <= highest and m2.group(3) in ls2:
+                                    lvec2 = tuple(ls2[m2.group(3)])
+                                    if companion_lane_kind(lvec2) is not None:
+                                        companion_defs.setdefault(int(m2.group(1)[1:]), (int(m2.group(2)[1:]), lvec2))
+                                        companion_regs.add(m2.group(1))
                 if under and ok:
                     # The register that stands for the uniform part of the address: the one
                     # register these instructions add that they did not make and that is neither
-                    # kept of the lane nor the address register.
+                    # kept of the lane, the address register, nor a companion.
                     made = {x.group(1) for x in (re.match(r'\S+ (?:PT, )?(R\d+),', line) for line in lines) if x}
                     added = {r for line in lines if line.startswith('IADD3 ') for r in REG.findall(line)[1:] if r != 'RZ'}
-                    known = set(rows_kept.values()) | {'R' + re.search(r'\[R(\d+)', source).group(1)}
+                    known = set(rows_kept.values()) | {'R' + re.search(r'\[R(\d+)', source).group(1)} | companion_regs
                     candidates = added - made - known
                     stand = next(iter(candidates)) if len(candidates) == 1 else None
                     stand_r = int(stand[1:]) if stand is not None else -1
@@ -3869,7 +4115,47 @@ def main():
                     if ok and stand_r <= highest:
                         borrowed_regs.add(stand_r)
                     why = 'the uniform part of its address is not added once from the register that stands for it'
-                found = rows_loaded(lines, unreused(source), rows_kept, highest, stand) if ok else why
+                comp_init, again_info = None, None
+                if ok and not has_shfl:
+                    # Companion-based whole-row load: every companion register read in `lines` must belong
+                    # to one root, cover one role's rows, and either be the address register or `again`.
+                    src_m = re.match(r'LDSM\.16\.(M88|MT88)\.4 R(\d+), \[R(\d+)', unreused(source))
+                    if not src_m:
+                        ok, why = False, 'not a load of four matrices under no predicate'
+                    else:
+                        want_trans = src_m.group(1) == 'MT88'
+                        ra_num = int(src_m.group(3))
+                        word_list = [int.from_bytes(b.data[parts[k][0]:parts[k][0] + 16], 'little') for k in range(len(mine))]
+                        used_comps = set()
+                        for w70 in word_list:
+                            d70 = mc.decode(70, w70)
+                            if d70 is not None:
+                                for l, r, *_ in d70.reads:
+                                    if l == 'R' and r in companion_defs:
+                                        used_comps.add(r)
+                        roots = {companion_defs[r][0] for r in used_comps}
+                        kinds_c = [companion_lane_kind(companion_defs[r][1]) for r in used_comps]
+                        need_roles = {('BT', 0), ('BT', 1), ('BT', 2), ('BT', 3)} if want_trans else None
+                        valid_roles = (set(kinds_c) == need_roles) if want_trans else (
+                            set(kinds_c) == {('A', 0), ('A', 1)} or set(kinds_c) == {('B', 0), ('B', 1)})
+                        if not used_comps or len(roots) != 1 or len(kinds_c) != len(used_comps) or not valid_roles:
+                            ok, why = False, 'reads neither shuffles of addresses nor valid companions'
+                        else:
+                            root_r = next(iter(roots))
+                            comp_lanes = {'R%d' % r: list(companion_defs[r][1]) for r in used_comps}
+                            comp_loads[old] = (root_r, set(used_comps))
+                            if root_r == ra_num:
+                                comp_init = comp_lanes
+                            else:
+                                made_res = find_reaching_made(mc, original_code, ta, leads, anywhere, old, ra_num, root_r)
+                                if isinstance(made_res, str):
+                                    ok, why = False, made_res
+                                else:
+                                    d75_word = int.from_bytes(original_code[made_res:made_res + 16], 'little')
+                                    again_info = (root_r, d75_word, comp_lanes)
+                found = rows_loaded(lines, unreused(source), rows_kept, highest, stand,
+                                    word_list=([int.from_bytes(b.data[parts[k][0]:parts[k][0] + 16], 'little') for k in range(len(mine))] if again_info else None),
+                                    mc=mc, comp_init=comp_init, again_info=again_info) if ok else why
                 if isinstance(found, str):
                     say(new, old, 'whole rows', found)
                 else:
@@ -3922,7 +4208,7 @@ def main():
                     words = [int.from_bytes(b.data[x:x + 16], 'little') for x in span]
                     halves.append((old, to[0], to[2], int(steps[0].group(3)), int(steps[0].group(4)), steps[0].group(5) == 'ROW',
                                    int(m.group(2)), int(m.group(3)), int(m.group(1)), (words[3] >> WRITE_BARRIER) & 7,
-                                   onto[0], onto[2], None if m.group(4) == 'RZ' else int(m.group(4)[1:])))
+                                   onto[0], onto[2], None if m.group(4) == 'RZ' else int(m.group(4)[1:]), (words[0] >> WAIT) & 63))
                     for k, what in halves_schedule(words):
                         problems.append('%s+0x%x (from 0x%x): %s: %s' % (name[:40], span[k], old, what, tb[span[k] // 16]))
                     kinds['(pairs) products done as halves of pairs'] += 1
@@ -4424,41 +4710,131 @@ def main():
         # product, a Triton tl.dot in float32 whose epilogue loads with LDSM and names 252
         # registers, was objected to here for that alone.)
         if frame_bytes == 0 and not has_level3_products:
-            if ((scratch - borrowed_by_loads) | apart | row_registers) & (set(registers.values()) | pool | savers) or apart & scratch or row_registers & (scratch | apart):
-                problems.append('%s: a register of the matrix sequences, the lane, what is kept of it or a row is used for something else too' % name[:40])
-        if row_loads or halves or conversions:
+            if (((scratch - borrowed_by_loads) | apart | row_registers | companion_regs) & (set(registers.values()) | pool | savers)
+                    or apart & (scratch | companion_regs) or row_registers & (scratch | apart | companion_regs)
+                    or companion_regs & scratch):
+                problems.append('%s: a register of the matrix sequences, the lane, what is kept of it, a row or a companion is used for something else too' % name[:40])
+        if companion_defs:
+            code_c = result.section('.text.' + name).data
+            comp_held = set(companion_defs)
+            for new, old, what in listing:
+                d70 = mc.decode(70, int.from_bytes(code_c[new:new + 16], 'little'))
+                if what != 'companion' and d70 is not None and any(letter == 'R' and register in comp_held for letter, register in d70.writes):
+                    problems.append('%s+0x%x: writes a companion register, and is not companion: %s' % (name[:40], new, tb[new // 16]))
+            for load_old, comp_r, root_r in companions_stand(mc, original_code, ta, leads, anywhere, companion_makers, comp_loads):
+                problems.append('%s (from 0x%x): companion R%d of R%d does not stand on every way to the load' % (name[:40], load_old, comp_r, root_r))
+        if row_loads or halves or conversions or companion_defs:
             code = result.section('.text.' + name).data
             held = {int(r[1:]) for r in row_registers}
             for new, old, what in listing:
                 d70 = mc.decode(70, int.from_bytes(code[new:new + 16], 'little'))
                 if what != 'whole row' and d70 is not None and any(letter == 'R' and register in held for letter, register in d70.writes):
                     problems.append('%s+0x%x: writes a register that holds a row, and is no load of a row: %s' % (name[:40], new, tb[new // 16]))
-            # One scoreboard for the halves of pairs: each waits for the ones before it on it; a
-            # load whose program's load named none says there that its rows have arrived. The
-            # instruction that does nothing before conversions waits for every scoreboard,
-            # fifteen cycles before the first shuffle: a conversion reads a register where
-            # nothing of the program did, so no wait of the program is known to cover it, and
-            # fifteen cycles is the longest an instruction that names no scoreboard is waited
-            # for (and more than the eight after which a product's result can be read by
-            # something else). The shuffles say on a scoreboard when they are done
-            # and what follows them waits for it.
-            boards = {half[9] for half in halves}
-            if len(boards) > 1:
-                problems.append('%s: the halves of pairs do not all say on one scoreboard when their result is there' % name[:40])
-            board = next(iter(boards)) if len(boards) == 1 else None
-            for old, (role, destination, where, also, arrive) in row_loads.items():
-                if arrive and arrive != {board}:
-                    problems.append('%s (from 0x%x): a whole-row load whose program\'s load named no scoreboard does not say its rows are there where the halves of pairs wait' % (name[:40], old))
+            # One scoreboard per interfering accumulator group of halves of pairs: halves sharing
+            # accumulators or reading operand registers written by another group share a scoreboard
+            # (or all share one scoreboard), and each half waits for that scoreboard on STEP0.
+            # Whole-row loads whose program load named no scoreboard say on one scoreboard where
+            # their rows arrive, and every half reading from such a load waits for it on STEP0.
+            if halves:
+                parent_h = list(range(len(halves)))
+                def find_h(u):
+                    while parent_h[u] != u:
+                        parent_h[u] = parent_h[parent_h[u]]
+                        u = parent_h[u]
+                    return u
+                wr_h, acc_h, src_h = [], [], []
+                for h in halves:
+                    wr = set(range(h[1], h[1] + 4)) | set(range(h[2], h[2] + 4))
+                    acc = set(wr)
+                    if h[10] is not None: acc.update(range(h[10], h[10] + 4))
+                    if h[11] is not None: acc.update(range(h[11], h[11] + 4))
+                    da, db = h[6] - h[6] % 4, h[7] - h[7] % 4
+                    wr_h.append(wr); acc_h.append(acc); src_h.append(set(range(da, da + 4)) | set(range(db, db + 2)))
+                for u in range(len(halves)):
+                    for v in range(u + 1, len(halves)):
+                        if (acc_h[u] & acc_h[v]) or (src_h[u] & wr_h[v]) or (src_h[v] & wr_h[u]):
+                            ru, rv = find_h(u), find_h(v)
+                            if ru != rv:
+                                parent_h[rv] = ru
+                groups_h = collections.defaultdict(list)
+                for u, h in enumerate(halves):
+                    groups_h[find_h(u)].append(h)
+                for grp in groups_h.values():
+                    if len({h[9] for h in grp}) > 1:
+                        problems.append('%s: interfering halves of pairs do not all say on one scoreboard when their result is there' % name[:40])
+                        break
+            arrive_loads = {old: arrive for old, (role, destination, where, also, arrive) in row_loads.items() if arrive}
+            for old, arrive in arrive_loads.items():
+                if len(arrive) != 1 or 7 in arrive:
+                    problems.append('%s (from 0x%x): a whole-row load whose program\'s load named no scoreboard does not say its rows arrive on one scoreboard' % (name[:40], old))
+            if arrive_loads and halves:
+                # Find which whole-row loads with `arrive` reach each half's operand registers.
+                watch_arr = set()
+                for h in halves:
+                    da, db = h[6] - h[6] % 4, h[7] - h[7] % 4
+                    watch_arr.update(range(da, da + 4)); watch_arr.update(range(db, db + 2))
+                for lold in arrive_loads:
+                    rd_l = row_loads[lold][1]
+                    watch_arr.update(range(rd_l, rd_l + 4))
+                # Forward reaching definitions on original_code for watched registers.
+                n_a = len(original_code) // 16
+                dec_a = [mc.decode(75, int.from_bytes(original_code[16 * ii:16 * ii + 16], 'little')) for ii in range(n_a)]
+                reach_a = [{r: set() for r in watch_arr} if ii == 0 else None for ii in range(n_a)]
+                if reach_a[0] is not None:
+                    for r in watch_arr:
+                        reach_a[0][r].add(-1)
+                wk_a, in_a = [0], {0}
+                while wk_a:
+                    ii = wk_a.pop(); in_a.discard(ii)
+                    cur_a = reach_a[ii]
+                    if cur_a is None: continue
+                    nxt_a = {r: set(s) for r, s in cur_a.items()}
+                    d_i = dec_a[ii]
+                    at_i = 16 * ii
+                    if d_i is not None:
+                        ug_i = _unguarded_75(d_i)
+                        for ll, rr in d_i.writes:
+                            if ll == 'R' and rr in watch_arr:
+                                nxt_a[rr] = {at_i} if ug_i else (nxt_a[rr] | {at_i})
+                    body_a = (ta[ii] or '').split(' ', 1)[1] if (ta[ii] or '').startswith('@') else (ta[ii] or '')
+                    if body_a.startswith(('CALL', 'JCAL')):
+                        for rr in watch_arr:
+                            nxt_a[rr].add(at_i)
+                    for to in leads.get(at_i, ()):
+                        ti = to // 16
+                        if ti >= n_a: continue
+                        if reach_a[ti] is None:
+                            reach_a[ti] = {r: set(s) for r, s in nxt_a.items()}
+                            wk_a.append(ti); in_a.add(ti)
+                        else:
+                            chg = False
+                            for r in watch_arr:
+                                if not nxt_a[r] <= reach_a[ti][r]:
+                                    reach_a[ti][r] |= nxt_a[r]; chg = True
+                            if chg and ti not in in_a:
+                                wk_a.append(ti); in_a.add(ti)
+                for h in halves:
+                    st_h = reach_a[h[0] // 16]
+                    if st_h is None: continue
+                    da, db = h[6] - h[6] % 4, h[7] - h[7] % 4
+                    rd_regs = set(range(da, da + 4)) | set(range(db, db + 2))
+                    for rr in rd_regs:
+                        for lold in st_h.get(rr, ()):
+                            if lold in arrive_loads:
+                                arr = arrive_loads[lold]
+                                if len(arr) == 1 and 7 not in arr and not ((h[13] >> next(iter(arr))) & 1):
+                                    problems.append('%s (from 0x%x): a half of a pair does not wait for the scoreboard where whole-row load 0x%x says its rows arrive' % (name[:40], h[0], lold))
             for k, (new, old, what) in enumerate(listing):
                 if what != 'settled':
                     continue
                 word = int.from_bytes(code[new:new + 16], 'little')
-                last = next((j for j in range(k + 1, len(listing)) if listing[j][2] not in ('to pairs', 'from pairs')), len(listing)) - 1
+                last = next((j for j in range(k + 1, len(listing)) if listing[j][2] not in ('to pairs', 'from pairs', 'companion', 'companion: lane')), len(listing)) - 1
                 follows = int.from_bytes(code[listing[last][0] + 16:listing[last][0] + 32], 'little') if listing[last][0] + 32 <= len(code) else 0
-                said = {(int.from_bytes(code[listing[j][0]:listing[j][0] + 16], 'little') >> WRITE_BARRIER) & 7 for j in range(k + 1, last + 1)}
+                shfl_indices = [j for j in range(k + 1, last + 1) if listing[j][2] in ('to pairs', 'from pairs', 'companion')]
+                said = {(int.from_bytes(code[listing[j][0]:listing[j][0] + 16], 'little') >> WRITE_BARRIER) & 7 for j in shfl_indices}
                 if (word >> WAIT) & 63 != 63 or (word >> USCHED) & 15 != 15:
                     problems.append('%s+0x%x: conversions that do not wait for every scoreboard, fifteen cycles before the first shuffle' % (name[:40], new))
-                if last == k or len(said) != 1 or 7 in said or not ((follows >> WAIT) & 63) >> next(iter(said)) & 1:
+                if not shfl_indices or len(said) != 1 or 7 in said or not ((follows >> WAIT) & 63) >> next(iter(said)) & 1:
                     problems.append('%s+0x%x: what follows conversions does not wait for them' % (name[:40], new))
             # The plan, read back from the result: which load holds which rows where, which
             # product is which half of which pair, which registers are converted where. Whether
@@ -4478,7 +4854,7 @@ def main():
                 same = [d for d, other in by_destination.items() if {r for q, r in other.items() if r > highest} & {r for q, r in where.items() if r > highest}]
                 plan['share'][destination] = min(same) if same else destination
             reads_of = {}
-            for old, x, y, a_reg, b_reg, by_rows, ra, rb, rd, said, cx, cy, rc in halves:
+            for old, x, y, a_reg, b_reg, by_rows, ra, rb, rd, said, cx, cy, rc, step0_wait in halves:
                 reads_of[old // 16] = (rd, rc, cx, cy)
                 # (Destinations are multiples of four: the one of an operand register is known.)
                 found, da, db = None, ra - ra % 4, rb - rb % 4

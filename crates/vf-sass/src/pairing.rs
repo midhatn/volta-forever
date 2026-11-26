@@ -6,8 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::decode::{Decoded, LETTER_P, LETTER_R};
+use crate::decode::{Decoded, Decoder, LETTER_P, LETTER_R};
 use crate::field;
+use crate::generated::special::{READ_BARRIER, WRITE_BARRIER};
 
 const LOADS: &[&str] = &["ldsm__sImmOffset", "ldsm__URsIR"];
 const PRODUCT: &str = "hmma_x8_";
@@ -46,12 +47,25 @@ pub struct LoadEntry {
     pub also: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LoadRole {
     A,
     B,
     BT,
 }
+
+impl LoadRole {
+    /// How many rows a load of this role takes (one companion for each).
+    pub fn rows(self) -> u32 {
+        match self {
+            Self::A | Self::B => 2,
+            Self::BT => 4,
+        }
+    }
+}
+
+const ROLES: [LoadRole; 3] = [LoadRole::A, LoadRole::B, LoadRole::BT];
+const MIRRORED: &[&str] = &["LOP3", "IMAD", "LEA", "IADD3", "SHF", "MOV"];
 
 /// A product-of-a-pair entry in the plan.
 #[derive(Debug, Clone)]
@@ -82,6 +96,12 @@ pub struct Plan {
     pub share: BTreeMap<u32, u32>,
     pub before: BTreeMap<usize, Vec<Conversion>>,
     pub after: BTreeMap<usize, Vec<Conversion>>,
+    pub roots: BTreeMap<u32, Vec<LoadRole>>,
+    pub through: BTreeMap<usize, (u32, Option<usize>)>,
+    pub made_before: BTreeMap<usize, Vec<u32>>,
+    pub made_after: BTreeMap<usize, Vec<u32>>,
+    pub site_sb: BTreeMap<usize, u32>,
+    pub site_seq_wait: BTreeSet<usize>,
 }
 
 impl Plan {
@@ -92,7 +112,21 @@ impl Plan {
             share: BTreeMap::new(),
             before: BTreeMap::new(),
             after: BTreeMap::new(),
+            roots: BTreeMap::new(),
+            through: BTreeMap::new(),
+            made_before: BTreeMap::new(),
+            made_after: BTreeMap::new(),
+            site_sb: BTreeMap::new(),
+            site_seq_wait: BTreeSet::new(),
         }
+    }
+
+    /// {root: how many registers of the translation its companions take}.
+    pub fn companion_registers(&self) -> BTreeMap<u32, u32> {
+        self.roots
+            .iter()
+            .map(|(&root, roles)| (root, roles.iter().map(|r| r.rows()).sum()))
+            .collect()
     }
 
     /// {destination of whole-row loads: how many registers of the translation its rows take}.
@@ -763,6 +797,18 @@ impl Flow {
 
 /// Compute the plan for a function, or None when it has nothing to do as pairs.
 pub fn plan(src: &[Decoded], tables: &[(u64, Vec<u64>)], entries: &Option<HashSet<usize>>) -> Option<Plan> {
+    let mut dec70 = Decoder::new(70);
+    plan_with_companions(src, tables, entries, true, &mut dec70)
+}
+
+/// Compute the plan for a function, optionally hoisting loop-invariant address shuffles (`companions`).
+pub fn plan_with_companions(
+    src: &[Decoded],
+    tables: &[(u64, Vec<u64>)],
+    entries: &Option<HashSet<usize>>,
+    with_companions: bool,
+    dec70: &mut Decoder,
+) -> Option<Plan> {
     let _n = src.len();
     if !src.iter().any(|d| d.name == PRODUCT) {
         return None;
@@ -798,6 +844,10 @@ pub fn plan(src: &[Decoded], tables: &[(u64, Vec<u64>)], entries: &Option<HashSe
                 return None;
             }
             sharing(&mut p, &flow, src);
+            assign_scoreboards(&mut p, src);
+            if with_companions {
+                companions(&mut p, &flow, src, dec70);
+            }
             return Some(p);
         }
         excluded.extend(r.bad.unwrap().iter().copied());
@@ -1078,6 +1128,23 @@ fn attempt(
         })
         .collect();
 
+    for (&i, s) in &out.sites {
+        let mut regs = vec![s.ra + 2 * s.a, s.ra + 2 * s.a + 1, s.rb + 2 * s.p];
+        if s.half == 0 {
+            regs.push(s.rb + 2 * s.p + 1);
+        }
+        let needs_seq = regs.into_iter().any(|k| {
+            reach[i].as_ref().and_then(|m| m.get(&k)).is_some_and(|defs| {
+                defs.iter()
+                    .flatten()
+                    .any(|&j| out.loads.contains_key(&j) && ((src[j].word >> WRITE_BARRIER) & 7) == 7)
+            })
+        });
+        if needs_seq {
+            out.site_seq_wait.insert(i);
+        }
+    }
+
     if out.sites.is_empty() {
         return PlanWithBad { plan: out, bad: None };
     }
@@ -1355,6 +1422,362 @@ fn attempt(
     }
 
     PlanWithBad { plan: out, bad: None }
+}
+
+/// Assign hardware scoreboards from `{0..=3}` per interfering accumulator group (preferring
+/// scoreboards unused by the function or whole-row loads), keeping `ARRIVES (4)` and `SEQUENCE (5)`
+/// for whole-row address shuffles, un-barriered loads, conversions, and companions.
+fn assign_scoreboards(plan: &mut Plan, src: &[Decoded]) {
+    let sites: Vec<usize> = plan.sites.keys().copied().collect();
+    if sites.is_empty() {
+        return;
+    }
+    let mut parent: Vec<usize> = (0..sites.len()).collect();
+    fn find(parent: &mut [usize], mut a: usize) -> usize {
+        while parent[a] != a {
+            parent[a] = parent[parent[a]];
+            a = parent[a];
+        }
+        a
+    }
+    let union = |parent: &mut [usize], a: usize, b: usize| {
+        let ra = find(parent, a);
+        let rb = find(parent, b);
+        if ra != rb {
+            parent[rb] = ra;
+        }
+    };
+    let mut wr_regs: Vec<[u8; 32]> = Vec::with_capacity(sites.len());
+    let mut acc_regs: Vec<[u8; 32]> = Vec::with_capacity(sites.len());
+    let mut src_regs: Vec<[u8; 32]> = Vec::with_capacity(sites.len());
+    let set_bit = |bs: &mut [u8; 32], r: u32| {
+        bs[(r / 8) as usize] |= 1u8 << (r % 8);
+    };
+    let overlaps = |a: &[u8; 32], b: &[u8; 32]| -> bool { (0..32).any(|k| (a[k] & b[k]) != 0) };
+    for &i in &sites {
+        let s = &plan.sites[&i];
+        let mut wr = [0u8; 32];
+        for b in [s.x, s.y] {
+            for k in 0..4 {
+                set_bit(&mut wr, b + k);
+            }
+        }
+        let mut acc = wr;
+        for b in [s.cx, s.cy].into_iter().flatten() {
+            for k in 0..4 {
+                set_bit(&mut acc, b + k);
+            }
+        }
+        let mut sr = [0u8; 32];
+        for k in 0..4 {
+            set_bit(&mut sr, s.ra + k);
+        }
+        for k in 0..2 {
+            set_bit(&mut sr, s.rb + k);
+        }
+        wr_regs.push(wr);
+        acc_regs.push(acc);
+        src_regs.push(sr);
+    }
+    for idx in 0..sites.len() {
+        for jdx in (idx + 1)..sites.len() {
+            if overlaps(&acc_regs[idx], &acc_regs[jdx])
+                || overlaps(&src_regs[idx], &wr_regs[jdx])
+                || overlaps(&src_regs[jdx], &wr_regs[idx])
+            {
+                union(&mut parent, idx, jdx);
+            }
+        }
+    }
+    let mut lds_used = 0u8;
+    for &j in plan.loads.keys() {
+        let wb = ((src[j].word >> WRITE_BARRIER) & 7) as u32;
+        if wb != 7 {
+            lds_used |= 1u8 << wb;
+        }
+    }
+    let mut prog_used = 0u8;
+    for d in src {
+        let wb = ((d.word >> WRITE_BARRIER) & 7) as u32;
+        let rb = ((d.word >> READ_BARRIER) & 7) as u32;
+        if wb != 7 {
+            prog_used |= 1u8 << wb;
+        }
+        if rb != 7 {
+            prog_used |= 1u8 << rb;
+        }
+    }
+    let mut avail = Vec::with_capacity(4);
+    for tier in 0..3 {
+        for sb in [3u32, 2, 1, 0] {
+            let p = (prog_used >> sb) & 1 != 0;
+            let l = (lds_used >> sb) & 1 != 0;
+            let match_tier = match tier {
+                0 => !p,
+                1 => p && !l,
+                _ => p && l,
+            };
+            if match_tier {
+                avail.push(sb);
+            }
+        }
+    }
+    let mut comp_idx = 0usize;
+    let mut rep_sb: HashMap<usize, u32> = HashMap::new();
+    for (idx, &site_i) in sites.iter().enumerate() {
+        let rep = find(&mut parent, idx);
+        let sb = *rep_sb.entry(rep).or_insert_with(|| {
+            let s = avail[comp_idx % avail.len()];
+            comp_idx += 1;
+            s
+        });
+        plan.site_sb.insert(site_i, sb);
+    }
+}
+
+/// Which whole-row loads take their rows' addresses from companions, of which registers, and
+/// where the companions are made (`docs/pairs.md`, section 12).
+fn companions(plan: &mut Plan, flow: &Flow, src: &[Decoded], dec70: &mut Decoder) {
+    let n = flow.n;
+    let loads: Vec<usize> = plan.loads.keys().copied().collect();
+    if loads.is_empty() {
+        return;
+    }
+    let mut address: BTreeMap<usize, u32> = BTreeMap::new();
+    for &i in &loads {
+        let ra = src[i].op_or_name("Ra", 255);
+        address.insert(i, ra);
+    }
+    let accumulators: HashSet<u32> = plan
+        .sites
+        .values()
+        .flat_map(|s| [Some(s.x), Some(s.y), s.cx, s.cy].into_iter().flatten())
+        .flat_map(|base| base..base + 4)
+        .collect();
+    let mut writers: HashMap<u32, HashSet<usize>> = HashMap::new();
+    let mut get_written = |x: u32| -> HashSet<usize> {
+        writers
+            .entry(x)
+            .or_insert_with(|| (0..n).filter(|&i| flow.writes_reg(src, i, x)).collect())
+            .clone()
+    };
+    let turns = |load: usize, stop: &HashSet<usize>| -> bool {
+        if stop.contains(&load) {
+            return false;
+        }
+        let mut seen = HashSet::new();
+        let mut work = flow.succ[load].clone();
+        while let Some(k) = work.pop() {
+            if k == load {
+                return true;
+            }
+            if seen.contains(&k) || stop.contains(&k) {
+                continue;
+            }
+            seen.insert(k);
+            work.extend_from_slice(&flow.succ[k]);
+        }
+        false
+    };
+    let between = |made: usize, load: usize, stop: &HashSet<usize>| -> bool {
+        let mut ahead = HashSet::new();
+        let mut work = flow.succ[made].clone();
+        while let Some(k) = work.pop() {
+            if ahead.contains(&k) || k == made {
+                continue;
+            }
+            ahead.insert(k);
+            work.extend_from_slice(&flow.succ[k]);
+        }
+        let mut behind = HashSet::new();
+        let mut work = flow.pred[load].clone();
+        while let Some(k) = work.pop() {
+            if behind.contains(&k) || k == made {
+                continue;
+            }
+            behind.insert(k);
+            work.extend_from_slice(&flow.pred[k]);
+        }
+        ahead.intersection(&behind).any(|k| stop.contains(k))
+    };
+    let usable = |x: u32| x != 255 && !accumulators.contains(&x);
+    let watch: BTreeSet<u32> = address.values().copied().collect();
+    let reach = flow.reaching(src, &watch);
+    let mut candidates: BTreeMap<usize, Vec<(u32, Option<usize>)>> = BTreeMap::new();
+    for &i in &loads {
+        let ra = address[&i];
+        let mut found = Vec::new();
+        if usable(ra) {
+            let stop_ra = get_written(ra);
+            if turns(i, &stop_ra) {
+                found.push((ra, None));
+            }
+        }
+        if let Some(defs) = reach[i].as_ref().and_then(|m| m.get(&ra))
+            && defs.len() == 1
+            && !defs.contains(&None)
+        {
+            let made = defs.iter().next().unwrap().unwrap();
+            let d = &src[made];
+            let read: BTreeSet<(u8, u32)> = d.reads.iter().map(|&(l, x, _)| (l, x)).collect();
+            if MIRRORED.contains(&d.mnemonic)
+                && unguarded(d)
+                && flow.kind[made] == "plain"
+                && d.writes == [(LETTER_R, ra)]
+                && read.len() == 1
+                && dec70.decode(d.word).is_some()
+            {
+                let &(letter, x) = read.iter().next().unwrap();
+                if letter == LETTER_R && x != ra && usable(x) {
+                    let stop_x = get_written(x);
+                    if turns(i, &stop_x) && !between(made, i, &stop_x) {
+                        found.push((x, Some(made)));
+                    }
+                }
+            }
+        }
+        if !found.is_empty() {
+            candidates.insert(i, found);
+        }
+    }
+    let mut left = candidates;
+    while !left.is_empty() {
+        let mut serves: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (&i, found) in &left {
+            for &(x, _) in found {
+                serves.entry(x).or_default().push(i);
+            }
+        }
+        let root = *serves
+            .iter()
+            .min_by_key(|&(&x, list)| (std::cmp::Reverse(list.len()), x))
+            .unwrap()
+            .0;
+        let load_list = serves.remove(&root).unwrap();
+        for &i in &load_list {
+            let entries = left.remove(&i).unwrap();
+            let chosen = entries.into_iter().find(|&(x, _)| x == root).unwrap();
+            plan.through.insert(i, chosen);
+        }
+        let roles: Vec<LoadRole> = ROLES
+            .iter()
+            .copied()
+            .filter(|&r| load_list.iter().any(|i| plan.loads[i].role == r))
+            .collect();
+        plan.roots.insert(root, roles);
+    }
+    let places = |stop: &HashSet<usize>, users: &BTreeSet<usize>| -> (Vec<usize>, Vec<usize>) {
+        let mut want = vec![false; n];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for i in (0..n).rev() {
+                let new = users.contains(&i) || (!stop.contains(&i) && flow.succ[i].iter().any(|&t| want[t]));
+                if new != want[i] {
+                    want[i] = new;
+                    changed = true;
+                }
+            }
+        }
+        let first = |i: usize| want[i] && flow.whole[i];
+        let mut bare: Vec<bool> = (0..n).map(|i| i == 0 || flow.pred[i].is_empty()).collect();
+        let leaves_bare = |q: usize, bare: &[bool]| stop.contains(&q) || (bare[q] && !first(q));
+        let mut work: Vec<usize> = (0..n).filter(|&i| bare[i]).chain(stop.iter().copied()).collect();
+        while let Some(q) = work.pop() {
+            if !leaves_bare(q, &bare) {
+                continue;
+            }
+            for &t in &flow.succ[q] {
+                if !bare[t] {
+                    bare[t] = true;
+                    work.push(t);
+                }
+            }
+        }
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for i in 0..n {
+            if !(first(i) && bare[i]) {
+                continue;
+            }
+            let bad: Vec<usize> = flow.pred[i]
+                .iter()
+                .copied()
+                .filter(|&q| leaves_bare(q, &bare))
+                .collect();
+            if i != 0
+                && flow.pred[i].len() >= 2
+                && bad == [i - 1]
+                && flow.kind[i - 1] == "plain"
+                && flow.goes_whole(src, i - 1)
+            {
+                after.push(i - 1);
+            } else {
+                before.push(i);
+            }
+        }
+        (before, after)
+    };
+    let round_without = |load: usize, place: usize| -> bool {
+        let mut seen = HashSet::new();
+        let mut work = flow.succ[load].clone();
+        while let Some(k) = work.pop() {
+            if k == load {
+                return true;
+            }
+            if seen.contains(&k) || k == place {
+                continue;
+            }
+            seen.insert(k);
+            work.extend_from_slice(&flow.succ[k]);
+        }
+        false
+    };
+    let roots_sorted: Vec<u32> = plan.roots.keys().copied().collect();
+    for root in roots_sorted {
+        let stop_root = get_written(root);
+        let mut users: BTreeSet<usize> = plan
+            .through
+            .iter()
+            .filter_map(|(&i, &(x, _))| (x == root).then_some(i))
+            .collect();
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        while !users.is_empty() {
+            (before, after) = places(&stop_root, &users);
+            let lost: BTreeSet<usize> = users
+                .iter()
+                .copied()
+                .filter(|&i| {
+                    before
+                        .iter()
+                        .chain(after.iter())
+                        .any(|&q| i == q || !round_without(i, q))
+                })
+                .collect();
+            if lost.is_empty() {
+                break;
+            }
+            for i in lost {
+                users.remove(&i);
+            }
+        }
+        plan.through.retain(|&i, &mut (x, _)| x != root || users.contains(&i));
+        if users.is_empty() {
+            plan.roots.remove(&root);
+            continue;
+        }
+        let roles: Vec<LoadRole> = ROLES
+            .iter()
+            .copied()
+            .filter(|&r| users.iter().any(|i| plan.loads[i].role == r))
+            .collect();
+        plan.roots.insert(root, roles);
+        for i in before {
+            plan.made_before.entry(i).or_default().push(root);
+        }
+        for i in after {
+            plan.made_after.entry(i).or_default().push(root);
+        }
+    }
 }
 
 fn sharing(plan: &mut Plan, flow: &Flow, _src: &[Decoded]) {

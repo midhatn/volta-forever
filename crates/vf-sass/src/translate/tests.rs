@@ -42,8 +42,21 @@ fn a_batch_does_not_become_marks_of_reuse() {
 #[test]
 fn a_product_has_seventeen_registers() {
     for base in [10u32, 11] {
-        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _) =
-            placement(base, &[], &[], false, 0, true, MATRIX_SCRATCH, true, None, &[], &[]).unwrap();
+        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _, _) = placement(
+            base,
+            &[],
+            &[],
+            false,
+            0,
+            true,
+            MATRIX_SCRATCH,
+            true,
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .unwrap();
         let (lane, kept, gathered, scratch) = (lane.unwrap(), kept.unwrap(), gathered.unwrap(), scratch.unwrap());
         assert_eq!(free - base, 1 + KEPT + GATHERED + MATRIX_SCRATCH);
         assert!(gathered % 2 == 0 && scratch % 2 == 0);
@@ -240,8 +253,21 @@ fn the_schedule_goes_on_through_a_label() {
 #[test]
 fn loads_alone_keep_nothing() {
     for base in [10u32, 11] {
-        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _) =
-            placement(base, &[], &[], false, 0, true, MATRIX_SCRATCH, false, None, &[], &[]).unwrap();
+        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _, _) = placement(
+            base,
+            &[],
+            &[],
+            false,
+            0,
+            true,
+            MATRIX_SCRATCH,
+            false,
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .unwrap();
         assert_eq!(free - base, 1 + MATRIX_SCRATCH);
         assert!(lane.is_some() && kept.is_none() && gathered.is_none() && scratch.unwrap() % 2 == 0);
     }
@@ -1431,4 +1457,78 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
     // A writer earlier in the code that goes on to that place.
     let through = ends(&[with_stall(board(DSETP, 0), 2, false), nop, nop], &[32], true);
     assert_eq!(through[0] + through[1], 15, "{through:?}");
+}
+
+#[test]
+fn paired_hmma_uses_no_yield_reuse_disjoint_scoreboards_and_companions() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let result = translate_with_options(original, true, &Options::default()).unwrap();
+    let elf = crate::elf::Elf::parse(&result.bytes).unwrap();
+    let sec = elf.section(".text.p_basic").unwrap();
+    let code = &elf.sections[sec].data;
+    let map = result.map.as_ref().unwrap();
+
+    let half_offsets: Vec<usize> = map
+        .iter()
+        .filter(|(name, _, _, what)| name == "p_basic" && what == "half of a pair")
+        .map(|(_, new, _, _)| *new as usize)
+        .collect();
+    assert!(!half_offsets.is_empty());
+    assert_eq!(half_offsets.len() % 4, 0);
+
+    let mut boards = std::collections::HashSet::new();
+    for steps in half_offsets.as_chunks::<4>().0 {
+        let word_at = |off: usize| u128::from_le_bytes(code[off..off + 16].try_into().unwrap());
+        let w0 = word_at(steps[0]);
+        let w3 = word_at(steps[3]);
+        for &off in &steps[..3] {
+            let w = word_at(off);
+            assert_eq!((w >> USCHED) & 31, 18, "STEP0..2 must set NO_YIELD + stall 2");
+            assert_ne!(w & REUSE, 0, "STEP0..2 must mark Ra/Rb .reuse");
+        }
+        assert_eq!(w3 & REUSE, 0, "STEP3 must not mark .reuse");
+        let sb = ((w3 >> WRITE_BARRIER) & 7) as u32;
+        assert!(sb < 4, "disjoint accumulator scoreboard expected in 0..4, got {sb}");
+        boards.insert(sb);
+        let wait0 = ((w0 >> WAIT) & 63) as u32;
+        assert_ne!(wait0 & (1 << sb), 0, "STEP0 must wait on its own pair scoreboard {sb}");
+    }
+    assert!(
+        boards.len() > 1,
+        "expected > 1 disjoint accumulator scoreboard, got {boards:?}"
+    );
+
+    let comp_count = map
+        .iter()
+        .filter(|(name, _, _, what)| name == "p_call" && what == "companion")
+        .count();
+    assert!(comp_count > 0, "companions should be enabled by default");
+}
+
+#[test]
+fn companions_can_be_disabled_via_translate_with_companions() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let opts = Options::default();
+    let with_comp = translate_with_companions(original, true, &opts, true).unwrap();
+    let no_comp = translate_with_companions(original, true, &opts, false).unwrap();
+    let default_res = translate_with_options(original, true, &opts).unwrap();
+    assert_eq!(with_comp.bytes, default_res.bytes);
+
+    let added = |res: &TranslateResult| {
+        let r = res.report.iter().find(|f| f.name == "p_basic").unwrap();
+        r.after - r.before
+    };
+    assert_eq!(added(&with_comp), 93);
+    assert_eq!(added(&no_comp), 91);
+
+    let count_comp = |res: &TranslateResult| {
+        res.map
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, _, what)| what == "companion")
+            .count()
+    };
+    assert!(count_comp(&with_comp) > 0);
+    assert_eq!(count_comp(&no_comp), 0);
 }

@@ -802,7 +802,10 @@ pub(super) fn translate_matrix_product(ctx: &mut Ctx, i: usize, d: &Decoded, wai
         if let Some(r) = rel {
             ops.push(("src_rel_sb", Int(r)));
         }
-        with_stall(asm("hmma__884_f32", &ops).unwrap(), 2, false)
+        let mut word = asm("hmma__884_f32", &ops).unwrap();
+        let reuse_ab = 3u128 << REUSE.trailing_zeros();
+        word |= (18u128 << USCHED) | if n < 3 { reuse_ab } else { 0 };
+        with_stall(word, 2, n < 3)
     };
     // Registers 0 to 3 of Volta's eight in scratch registers, 4 to 7 in the destination.
     // (At level 3, sums may not be contiguous: s_all names the four registers.)
@@ -938,7 +941,10 @@ fn translate_product_in_halves(
         if let Some(r) = rel {
             ops.push(("src_rel_sb", Int(r)));
         }
-        with_stall(asm("hmma__884_f16_f16", &ops).unwrap(), 4, false)
+        let mut word = asm("hmma__884_f16_f16", &ops).unwrap();
+        let reuse_ab = 3u128 << REUSE.trailing_zeros();
+        word |= (20u128 << USCHED) | if n < 1 { reuse_ab } else { 0 };
+        with_stall(word, 4, n < 1)
     };
     // As the compiler has them: four cycles apart, thirteen after the last.
     // (Drop the add closure so we can borrow new directly for .covered.)

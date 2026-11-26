@@ -84,7 +84,7 @@ MATRIX = ('ldsm__sImmOffset', 'ldsm__URsIR', 'hmma_x8_')      # Turing's matrix 
 MATRIX_SCRATCH = 8                 # the registers that the sequence of a matrix instruction computes into
 KEPT = 4                           # the registers of what a function with a product keeps of the lane (`Function.kept`)
 GATHERED = 4                       # the registers that keep the elements of B a product gathered (`Function.matrix_product`)
-AROUND = ('wait', 'save', 'restore', 'lane', 'kept', 'settled', 'to pairs', 'from pairs')   # what the translation puts around an instruction, which is not what the instruction became
+AROUND = ('wait', 'save', 'restore', 'lane', 'kept', 'settled', 'to pairs', 'from pairs', 'companion', 'companion: lane')   # what the translation puts around an instruction, which is not what the instruction became
 # Pairs of products on whole rows (pairing.py; docs/pairs.md): the values kept of the lane
 # for them, in the order of their registers; whether the rows of a matrix load are taken to be
 # aligned on 16 bytes (the policy of the program-text lowering: wide loads then); whether any of it is done.
@@ -1900,7 +1900,9 @@ class Function:
                                           level3=level3, lane=lane if level3 else None)
         def step(n, to, a, b, c, **more):
             word = asm('hmma__884_f32', size=0, dstfmt=1, srcfmt=1, step=n, satfinite=0, Rd=to, Ra=a, tnspA=1, Rb=b, tnspB=0, Rc=c, **more)
-            return with_stall(word, 2)
+            reuse_ab = 3 << ((REUSE & -REUSE).bit_length() - 1)
+            word |= (18 << USCHED) | (reuse_ab if n < 3 else 0)
+            return with_stall(word, 2, marks=(n < 3))
         # Registers 0 to 3 of Volta's eight in scratch registers, 4 to 7 in the destination. (Each
         # step says when its result is there: the compiler says it of the last one only, and
         # keeps 32 cycles to a product that reads another's result where it does not wait.)
@@ -1952,7 +1954,9 @@ class Function:
         add(choose(Rd=sa[3], Ra=rc + 1, Rb=sa[3], Rc=pair), 'row')
         def step(n, a, b, **more):
             word = asm('hmma__884_f16_f16', size=0, dstfmt=0, srcfmt=0, step=n, satfinite=0, Rd=sa[2 * n], Ra=a, tnspA=1, Rb=b, tnspB=0, Rc=sa[2 * n], **more)
-            return with_stall(word, 4)
+            reuse_ab = 3 << ((REUSE & -REUSE).bit_length() - 1)
+            word |= (20 << USCHED) | (reuse_ab if n < 1 else 0)
+            return with_stall(word, 4, marks=(n < 1))
         # As the compiler has them: four cycles apart, thirteen after the last (`matrix_product`).
         for n in range(2):
             add(step(n, ra, b1, **({'dst_wr_sb': SEQUENCE} if n == 1 else {})), 'product', waits=n == 0)
@@ -2198,11 +2202,15 @@ class Function:
         # two products of the program read, which may be other registers than their destinations,
         # or zero; the second goes on in place.)
         onto = to if site['half'] else tuple(255 if c is None else c + k for c in (site['cx'], site['cy']) for k in (0, 2))
+        pair_sb = self.q.site_sb.get(i, SEQUENCE)
+        seq_wait = (1 << (WAIT + SEQUENCE)) if i in self.q.site_seq_wait else 0
+        reuse_ab = 3 << ((REUSE & -REUSE).bit_length() - 1)
         for n in range(4):
             word = mc.assemble('hmma__884_f32', size=0, dstfmt=1, srcfmt=1, step=n, satfinite=0, Rd=to[n], Ra=a, tnspA=0,
-                               Rb=b, tnspB=0 if site['transposed'] else 1, Rc=onto[n], **({'dst_wr_sb': SEQUENCE} if n == 3 else {}))
-            # (The program's waits and the wait for the products before: on the first step.)
-            item = Item(with_stall(word, 2) | ((wait | (1 << (WAIT + SEQUENCE))) if n == 0 else 0), i, 'half of a pair')
+                               Rb=b, tnspB=0 if site['transposed'] else 1, Rc=onto[n], **({'dst_wr_sb': pair_sb} if n == 3 else {}))
+            word |= (18 << USCHED) | (reuse_ab if n < 3 else 0)
+            # (The program's waits, the wait for products of this accumulator, and any un-barriered whole-row load: on the first step.)
+            item = Item(with_stall(word, 2, marks=(n < 3)) | ((wait | (1 << (WAIT + pair_sb)) | seq_wait) if n == 0 else 0), i, 'half of a pair')
             item.covered = n < 3
             new.append(item)
         # (What follows an instruction is as late after it as in the original: the four steps

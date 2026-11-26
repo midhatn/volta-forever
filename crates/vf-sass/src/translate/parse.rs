@@ -215,6 +215,7 @@ pub(super) type Placement = (
     u32,
     HashMap<u32, u32>,          // rows_at
     HashMap<&'static str, u32>, // kept_rows
+    HashMap<u32, u32>,          // comp_at
     HashMap<u32, u32>,          // hold_at
 );
 
@@ -230,6 +231,7 @@ pub(super) fn placement(
     product: bool,
     rows: Option<&std::collections::BTreeMap<u32, u32>>,
     row_kept: &[&'static str],
+    companions: Option<&std::collections::BTreeMap<u32, u32>>,
     held: &[u32],
 ) -> Result<Placement, Refused> {
     if pairs.iter().any(|u| pairs.contains(&(u + 1))) {
@@ -320,6 +322,13 @@ pub(super) fn placement(
             free += count;
         }
     }
+    let mut comp_at = HashMap::new();
+    if let Some(companions) = companions {
+        for (&root, &count) in companions {
+            comp_at.insert(root, free);
+            free += count;
+        }
+    }
     if free > 253 {
         // The register count is two more than the registers used, and has eight bits.
         return Err(Refused("more registers than there are".into()));
@@ -335,6 +344,7 @@ pub(super) fn placement(
         free,
         rows_at,
         kept_rows,
+        comp_at,
         hold_at,
     ))
 }
