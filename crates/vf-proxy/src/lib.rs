@@ -257,6 +257,9 @@ fn real_library() -> Option<CString> {
     if let Ok(path) = std::env::var("VF_REAL_LIBCUDA") {
         return CString::new(path).ok();
     }
+    if cfg!(test) {
+        return None;
+    }
     const DIRS: [&str; 4] = [
         "/usr/lib/x86_64-linux-gnu",
         "/usr/lib64",
