@@ -89,7 +89,7 @@ pub struct SiteEntry {
 pub type Conversion = (u32, State);
 
 /// The plan for a function.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Plan {
     pub loads: BTreeMap<usize, LoadEntry>,
     pub sites: BTreeMap<usize, SiteEntry>,
@@ -138,6 +138,16 @@ impl Plan {
             *entry = (*entry).max(count);
         }
         out
+    }
+
+    /// Return a copy of this plan without companion register hoisting.
+    pub fn without_companions(&self) -> Self {
+        let mut copy = self.clone();
+        copy.roots.clear();
+        copy.through.clear();
+        copy.made_before.clear();
+        copy.made_after.clear();
+        copy
     }
 
     /// Which values are kept from the entry of the function.
@@ -281,8 +291,80 @@ pub(crate) type CallEffect = Option<(BTreeSet<u32>, BTreeSet<u32>)>;
 /// The form of a product: (Rd, Ra, Rb, Rc).
 type ProductForm = (u32, u32, u32, Option<u32>);
 
-/// Reaching definitions of a register at an instruction.
-type ReachMap = Vec<Option<BTreeMap<u32, BTreeSet<Option<usize>>>>>;
+struct RegReach {
+    def_nodes: Vec<usize>,
+    words: usize,
+    bits: Vec<u64>,
+}
+
+/// Reaching definitions of watched registers at every instruction (dense bitsets).
+struct DenseReach {
+    reachable: Vec<bool>,
+    map_low: [u16; 256],
+    extra: Vec<(u32, usize)>,
+    regs: Vec<RegReach>,
+}
+
+impl DenseReach {
+    fn reg(&self, r: u32) -> Option<&RegReach> {
+        if (r as usize) < 256 {
+            let idx = self.map_low[r as usize];
+            (idx != u16::MAX).then(|| &self.regs[idx as usize])
+        } else {
+            self.extra
+                .binary_search_by_key(&r, |&(k, _)| k)
+                .ok()
+                .map(|pos| &self.regs[self.extra[pos].1])
+        }
+    }
+
+    fn unique_def(&self, i: usize, r: u32) -> Option<usize> {
+        if !self.reachable[i] {
+            return None;
+        }
+        let rr = self.reg(r)?;
+        let slice = &rr.bits[i * rr.words..(i + 1) * rr.words];
+        if (slice[0] & 1) != 0 {
+            return None;
+        }
+        let mut found = None;
+        for (wi, &w) in slice.iter().enumerate() {
+            if w == 0 {
+                continue;
+            }
+            if w.count_ones() != 1 || found.is_some() {
+                return None;
+            }
+            let bit = wi * 64 + w.trailing_zeros() as usize;
+            found = Some(rr.def_nodes[bit - 1]);
+        }
+        found
+    }
+
+    fn defs_at(&self, i: usize, r: u32, mut f: impl FnMut(Option<usize>) -> bool) {
+        if !self.reachable[i] {
+            return;
+        }
+        let Some(rr) = self.reg(r) else {
+            return;
+        };
+        let slice = &rr.bits[i * rr.words..(i + 1) * rr.words];
+        if (slice[0] & 1) != 0 && !f(None) {
+            return;
+        }
+        for (wi, &word) in slice.iter().enumerate() {
+            let mut w = if wi == 0 { word & !1 } else { word };
+            while w != 0 {
+                let b = w.trailing_zeros() as usize;
+                w &= w - 1;
+                let j = rr.def_nodes[wi * 64 + b - 1];
+                if !f(Some(j)) {
+                    return;
+                }
+            }
+        }
+    }
+}
 
 // ---- Flow ----
 
@@ -726,70 +808,141 @@ impl Flow {
         false
     }
 
-    fn reaching(&self, src: &[Decoded], watch: &BTreeSet<u32>) -> ReachMap {
+    fn reaching(&self, src: &[Decoded], watch: &BTreeSet<u32>) -> DenseReach {
         let n = self.n;
-        let watch_sorted: Vec<u32> = watch.iter().copied().collect();
-        let writes_at: Vec<Vec<u32>> = (0..n)
-            .map(|i| {
-                watch_sorted
-                    .iter()
-                    .copied()
-                    .filter(|&r| self.writes_reg(src, i, r))
-                    .collect()
-            })
-            .collect();
-        let mut into: ReachMap = vec![None; n];
-        let initial: BTreeMap<u32, BTreeSet<Option<usize>>> = watch_sorted
-            .iter()
-            .map(|&r| {
-                let mut s = BTreeSet::new();
-                s.insert(None);
-                (r, s)
-            })
-            .collect();
-        into[0] = Some(initial);
-        let mut work = vec![0usize];
-        while let Some(i) = work.pop() {
-            let state = into[i].as_ref().unwrap().clone();
-            let out = if writes_at[i].is_empty() {
-                state.clone()
-            } else {
-                let mut out = state.clone();
-                for &r in &writes_at[i] {
-                    if self.kind[i] == "call" {
-                        out.get_mut(&r).unwrap().insert(None);
-                    } else if self.all_of(src, i, r) {
-                        let mut s = BTreeSet::new();
-                        s.insert(Some(i));
-                        out.insert(r, s);
-                    } else {
-                        out.get_mut(&r).unwrap().insert(Some(i));
-                    }
-                }
-                out
-            };
-            for &s in &self.succ[i] {
-                if into[s].is_none() {
-                    into[s] = Some(out.clone());
-                    work.push(s);
-                } else {
-                    let current = into[s].as_ref().unwrap();
-                    let merged: BTreeMap<u32, BTreeSet<Option<usize>>> = watch_sorted
-                        .iter()
-                        .map(|&r| {
-                            let mut combined = current[&r].clone();
-                            combined.extend(out[&r].iter().copied());
-                            (r, combined)
-                        })
-                        .collect();
-                    if merged != *current {
-                        into[s] = Some(merged);
-                        work.push(s);
+        let mut reachable = vec![false; n];
+        if n > 0 {
+            let mut stack = vec![0usize];
+            reachable[0] = true;
+            while let Some(i) = stack.pop() {
+                for &s in &self.succ[i] {
+                    if !reachable[s] {
+                        reachable[s] = true;
+                        stack.push(s);
                     }
                 }
             }
         }
-        into
+        let mut map_low = [u16::MAX; 256];
+        let mut extra = Vec::new();
+        for (wi, &r) in watch.iter().enumerate() {
+            if (r as usize) < 256 {
+                map_low[r as usize] = wi as u16;
+            } else {
+                extra.push((r, wi));
+            }
+        }
+        let lookup = |r: u32| -> Option<usize> {
+            if (r as usize) < 256 {
+                let idx = map_low[r as usize];
+                (idx != u16::MAX).then_some(idx as usize)
+            } else {
+                extra.binary_search_by_key(&r, |&(k, _)| k).ok().map(|p| extra[p].1)
+            }
+        };
+        let nw = watch.len();
+        let mut reg_writers: Vec<Vec<(usize, bool)>> = vec![Vec::new(); nw];
+        let mut reg_calls: Vec<Vec<usize>> = vec![Vec::new(); nw];
+        let mut opaque_calls: Vec<usize> = Vec::new();
+        for i in 0..n {
+            if !reachable[i] {
+                continue;
+            }
+            if self.kind[i] == "call" {
+                match self.called.get(&i) {
+                    Some(Some((_, w))) => {
+                        for &r in w {
+                            if let Some(wi) = lookup(r) {
+                                reg_calls[wi].push(i);
+                            }
+                        }
+                    }
+                    _ => opaque_calls.push(i),
+                }
+            } else {
+                let kill = unguarded(&src[i]);
+                for &(l, r) in &src[i].writes {
+                    if l == LETTER_R
+                        && let Some(wi) = lookup(r)
+                        && reg_writers[wi].last().is_none_or(|&(prev_i, _)| prev_i != i)
+                    {
+                        reg_writers[wi].push((i, kill));
+                    }
+                }
+            }
+        }
+        const OP_NOP: u32 = u32::MAX;
+        const OP_CALL: u32 = u32::MAX - 1;
+        const KILL_BIT: u32 = 1 << 31;
+        let mut ops = vec![OP_NOP; n];
+        let mut work = Vec::new();
+        let mut in_work = vec![false; n];
+        let mut out_buf = Vec::new();
+        let mut regs = Vec::with_capacity(nw);
+        for wi in 0..nw {
+            let m = reg_writers[wi].len();
+            let words = (m + 1).div_ceil(64);
+            let mut bits = vec![0u64; n * words];
+            ops.fill(OP_NOP);
+            for &c in &opaque_calls {
+                ops[c] = OP_CALL;
+            }
+            for &c in &reg_calls[wi] {
+                ops[c] = OP_CALL;
+            }
+            let mut def_nodes = Vec::with_capacity(m);
+            for (k, &(i, kill)) in reg_writers[wi].iter().enumerate() {
+                def_nodes.push(i);
+                ops[i] = if kill { (k as u32) | KILL_BIT } else { k as u32 };
+            }
+            if n > 0 {
+                bits[0] = 1;
+                out_buf.resize(words, 0);
+                work.clear();
+                in_work.fill(false);
+                work.push(0);
+                in_work[0] = true;
+                while let Some(i) = work.pop() {
+                    in_work[i] = false;
+                    let base = i * words;
+                    out_buf.copy_from_slice(&bits[base..base + words]);
+                    let op = ops[i];
+                    if op == OP_CALL {
+                        out_buf[0] |= 1;
+                    } else if op != OP_NOP {
+                        let k = (op & !KILL_BIT) as usize;
+                        let bit = k + 1;
+                        if (op & KILL_BIT) != 0 {
+                            out_buf.fill(0);
+                        }
+                        out_buf[bit / 64] |= 1u64 << (bit % 64);
+                    }
+                    for &s in &self.succ[i] {
+                        let s_base = s * words;
+                        let mut changed = false;
+                        for w in 0..words {
+                            let old = bits[s_base + w];
+                            let new = old | out_buf[w];
+                            if new != old {
+                                bits[s_base + w] = new;
+                                changed = true;
+                            }
+                        }
+                        if changed && !in_work[s] {
+                            in_work[s] = true;
+                            work.push(s);
+                        }
+                    }
+                }
+            }
+            regs.push(RegReach { def_nodes, words, bits });
+        }
+        DenseReach {
+            reachable,
+            map_low,
+            extra,
+            regs,
+        }
     }
 }
 
@@ -865,7 +1018,7 @@ fn attempt(
     flow: &Flow,
     forms: &BTreeMap<usize, Option<ProductForm>>,
     loads: &BTreeMap<usize, (u32, bool)>,
-    reach: &ReachMap,
+    reach: &DenseReach,
     excluded: &BTreeSet<usize>,
 ) -> PlanWithBad {
     let n = src.len();
@@ -873,21 +1026,37 @@ fn attempt(
 
     // Which products could be half of a pair.
     let source = |i: usize, registers: &[u32]| -> Option<(u32, bool)> {
-        let mut found: BTreeSet<(u32, bool)> = BTreeSet::new();
-        for &k in registers {
-            let defs = reach[i].as_ref()?.get(&k)?;
-            if defs.is_empty() || defs.contains(&None) {
-                return None;
-            }
-            if defs.iter().any(|j| j.is_some_and(|j| !loads.contains_key(&j))) {
-                return None;
-            }
-            found.extend(defs.iter().filter_map(|&j| j.map(|j| loads[&j])));
-        }
-        if found.len() != 1 {
+        if !reach.reachable[i] {
             return None;
         }
-        let &(rd, transposed) = found.iter().next().unwrap();
+        let mut found: Option<(u32, bool)> = None;
+        for &k in registers {
+            let rr = reach.reg(k)?;
+            let slice = &rr.bits[i * rr.words..(i + 1) * rr.words];
+            if (slice[0] & 1) != 0 {
+                return None;
+            }
+            let mut non_empty = false;
+            for (wi, &word) in slice.iter().enumerate() {
+                let mut w = word;
+                while w != 0 {
+                    non_empty = true;
+                    let b = w.trailing_zeros() as usize;
+                    w &= w - 1;
+                    let j = rr.def_nodes[wi * 64 + b - 1];
+                    let &val = loads.get(&j)?;
+                    match found {
+                        None => found = Some(val),
+                        Some(prev) if prev == val => {}
+                        Some(_) => return None,
+                    }
+                }
+            }
+            if !non_empty {
+                return None;
+            }
+        }
+        let (rd, transposed) = found?;
         if registers.iter().all(|&k| rd <= k && k <= rd + 3) {
             Some((rd, transposed))
         } else {
@@ -1044,26 +1213,23 @@ fn attempt(
             ];
             for (registers, as_) in &operands {
                 for &k in registers {
-                    if let Some(reach_at) = reach[u].as_ref()
-                        && let Some(defs) = reach_at.get(&k)
-                    {
-                        for &j in defs {
-                            if let Some(j) = j {
-                                // Three states: absent (not in map), Some(role) (seen
-                                // in one role), None (seen in two roles: stays None).
-                                match role.get(&j) {
-                                    None => {
-                                        role.insert(j, Some(*as_));
-                                    }
-                                    Some(Some(prev)) if *prev == *as_ => {}
-                                    Some(Some(_)) => {
-                                        role.insert(j, None);
-                                    }
-                                    Some(None) => {} // already two roles: stays None
+                    reach.defs_at(u, k, |j| {
+                        if let Some(j) = j {
+                            // Three states: absent (not in map), Some(role) (seen
+                            // in one role), None (seen in two roles: stays None).
+                            match role.get(&j) {
+                                None => {
+                                    role.insert(j, Some(*as_));
                                 }
+                                Some(Some(prev)) if *prev == *as_ => {}
+                                Some(Some(_)) => {
+                                    role.insert(j, None);
+                                }
+                                Some(None) => {} // already two roles: stays None
                             }
                         }
-                    }
+                        true
+                    });
                 }
             }
         }
@@ -1085,14 +1251,17 @@ fn attempt(
             ];
             for (registers, want) in &operands {
                 let bad = registers.iter().any(|&k| {
-                    if let Some(reach_at) = reach[i].as_ref()
-                        && let Some(defs) = reach_at.get(&k)
-                    {
-                        return defs
-                            .iter()
-                            .any(|&j| j.is_some_and(|j| whole.get(&j).is_none_or(|r| !want.contains(r))));
-                    }
-                    false
+                    let mut found_bad = false;
+                    reach.defs_at(i, k, |j| {
+                        if let Some(j) = j
+                            && whole.get(&j).is_none_or(|r| !want.contains(r))
+                        {
+                            found_bad = true;
+                            return false;
+                        }
+                        true
+                    });
+                    found_bad
                 });
                 if bad {
                     gone.insert(i);
@@ -1134,11 +1303,18 @@ fn attempt(
             regs.push(s.rb + 2 * s.p + 1);
         }
         let needs_seq = regs.into_iter().any(|k| {
-            reach[i].as_ref().and_then(|m| m.get(&k)).is_some_and(|defs| {
-                defs.iter()
-                    .flatten()
-                    .any(|&j| out.loads.contains_key(&j) && ((src[j].word >> WRITE_BARRIER) & 7) == 7)
-            })
+            let mut needs = false;
+            reach.defs_at(i, k, |j| {
+                if let Some(j) = j
+                    && out.loads.contains_key(&j)
+                    && ((src[j].word >> WRITE_BARRIER) & 7) == 7
+                {
+                    needs = true;
+                    return false;
+                }
+                true
+            });
+            needs
         });
         if needs_seq {
             out.site_seq_wait.insert(i);
@@ -1535,8 +1711,187 @@ fn assign_scoreboards(plan: &mut Plan, src: &[Decoded]) {
     }
 }
 
+struct CompanionScratch {
+    seen_a: Vec<u32>,
+    seen_b: Vec<u32>,
+    epoch: u32,
+    work: Vec<usize>,
+    want: Vec<bool>,
+    bare_init: Vec<bool>,
+    bare: Vec<bool>,
+}
+
+impl CompanionScratch {
+    fn new(flow: &Flow) -> Self {
+        let n = flow.n;
+        let bare_init = (0..n).map(|i| i == 0 || flow.pred[i].is_empty()).collect();
+        Self {
+            seen_a: vec![0; n],
+            seen_b: vec![0; n],
+            epoch: 0,
+            work: Vec::new(),
+            want: vec![false; n],
+            bare_init,
+            bare: vec![false; n],
+        }
+    }
+
+    fn turns(&mut self, flow: &Flow, load: usize, stop: &[bool]) -> bool {
+        if stop[load] {
+            return false;
+        }
+        self.epoch += 1;
+        let ep = self.epoch;
+        self.work.clear();
+        self.work.extend_from_slice(&flow.succ[load]);
+        while let Some(k) = self.work.pop() {
+            if k == load {
+                return true;
+            }
+            if self.seen_a[k] == ep || stop[k] {
+                continue;
+            }
+            self.seen_a[k] = ep;
+            self.work.extend_from_slice(&flow.succ[k]);
+        }
+        false
+    }
+
+    fn round_without(&mut self, flow: &Flow, load: usize, place: usize) -> bool {
+        self.epoch += 1;
+        let ep = self.epoch;
+        self.work.clear();
+        self.work.extend_from_slice(&flow.succ[load]);
+        while let Some(k) = self.work.pop() {
+            if k == load {
+                return true;
+            }
+            if self.seen_a[k] == ep || k == place {
+                continue;
+            }
+            self.seen_a[k] = ep;
+            self.work.extend_from_slice(&flow.succ[k]);
+        }
+        false
+    }
+
+    fn between(&mut self, flow: &Flow, made: usize, load: usize, stop: &[bool]) -> bool {
+        self.epoch += 1;
+        let ep = self.epoch;
+        self.work.clear();
+        self.work.extend_from_slice(&flow.succ[made]);
+        while let Some(k) = self.work.pop() {
+            if self.seen_a[k] == ep || k == made {
+                continue;
+            }
+            self.seen_a[k] = ep;
+            self.work.extend_from_slice(&flow.succ[k]);
+        }
+        self.work.clear();
+        self.work.extend_from_slice(&flow.pred[load]);
+        while let Some(k) = self.work.pop() {
+            if self.seen_b[k] == ep || k == made {
+                continue;
+            }
+            self.seen_b[k] = ep;
+            if stop[k] && self.seen_a[k] == ep {
+                return true;
+            }
+            self.work.extend_from_slice(&flow.pred[k]);
+        }
+        false
+    }
+
+    fn places(
+        &mut self,
+        flow: &Flow,
+        src: &[Decoded],
+        stop: &[bool],
+        users: &BTreeSet<usize>,
+        before: &mut Vec<usize>,
+        after: &mut Vec<usize>,
+    ) {
+        let n = flow.n;
+        self.want.fill(false);
+        self.work.clear();
+        for &u in users {
+            self.want[u] = true;
+            self.work.push(u);
+        }
+        while let Some(t) = self.work.pop() {
+            for &p in &flow.pred[t] {
+                if !self.want[p] && !stop[p] {
+                    self.want[p] = true;
+                    self.work.push(p);
+                }
+            }
+        }
+        self.bare.copy_from_slice(&self.bare_init);
+        let first = |i: usize, want: &[bool]| want[i] && flow.whole[i];
+        let leaves_bare = |q: usize, bare: &[bool], want: &[bool]| stop[q] || (bare[q] && !first(q, want));
+        self.work.clear();
+        for i in 0..n {
+            if self.bare[i] || stop[i] {
+                self.work.push(i);
+            }
+        }
+        while let Some(q) = self.work.pop() {
+            if !leaves_bare(q, &self.bare, &self.want) {
+                continue;
+            }
+            for &t in &flow.succ[q] {
+                if !self.bare[t] {
+                    self.bare[t] = true;
+                    self.work.push(t);
+                }
+            }
+        }
+        before.clear();
+        after.clear();
+        for i in 0..n {
+            if !(first(i, &self.want) && self.bare[i]) {
+                continue;
+            }
+            let mut single_bad = None;
+            let mut many_bad = false;
+            for &q in &flow.pred[i] {
+                if leaves_bare(q, &self.bare, &self.want) {
+                    if single_bad.is_some() {
+                        many_bad = true;
+                        break;
+                    }
+                    single_bad = Some(q);
+                }
+            }
+            if i != 0
+                && flow.pred[i].len() >= 2
+                && !many_bad
+                && single_bad == Some(i - 1)
+                && flow.kind[i - 1] == "plain"
+                && flow.goes_whole(src, i - 1)
+            {
+                after.push(i - 1);
+            } else {
+                before.push(i);
+            }
+        }
+    }
+}
+
 /// Which whole-row loads take their rows' addresses from companions, of which registers, and
 /// where the companions are made (`docs/pairs.md`, section 12).
+fn written_set<'a>(
+    writers: &'a mut HashMap<u32, Vec<bool>>,
+    flow: &Flow,
+    src: &[Decoded],
+    n: usize,
+    x: u32,
+) -> &'a [bool] {
+    writers
+        .entry(x)
+        .or_insert_with(|| (0..n).map(|i| flow.writes_reg(src, i, x)).collect())
+}
+
 fn companions(plan: &mut Plan, flow: &Flow, src: &[Decoded], dec70: &mut Decoder) {
     let n = flow.n;
     let loads: Vec<usize> = plan.loads.keys().copied().collect();
@@ -1554,52 +1909,8 @@ fn companions(plan: &mut Plan, flow: &Flow, src: &[Decoded], dec70: &mut Decoder
         .flat_map(|s| [Some(s.x), Some(s.y), s.cx, s.cy].into_iter().flatten())
         .flat_map(|base| base..base + 4)
         .collect();
-    let mut writers: HashMap<u32, HashSet<usize>> = HashMap::new();
-    let mut get_written = |x: u32| -> HashSet<usize> {
-        writers
-            .entry(x)
-            .or_insert_with(|| (0..n).filter(|&i| flow.writes_reg(src, i, x)).collect())
-            .clone()
-    };
-    let turns = |load: usize, stop: &HashSet<usize>| -> bool {
-        if stop.contains(&load) {
-            return false;
-        }
-        let mut seen = HashSet::new();
-        let mut work = flow.succ[load].clone();
-        while let Some(k) = work.pop() {
-            if k == load {
-                return true;
-            }
-            if seen.contains(&k) || stop.contains(&k) {
-                continue;
-            }
-            seen.insert(k);
-            work.extend_from_slice(&flow.succ[k]);
-        }
-        false
-    };
-    let between = |made: usize, load: usize, stop: &HashSet<usize>| -> bool {
-        let mut ahead = HashSet::new();
-        let mut work = flow.succ[made].clone();
-        while let Some(k) = work.pop() {
-            if ahead.contains(&k) || k == made {
-                continue;
-            }
-            ahead.insert(k);
-            work.extend_from_slice(&flow.succ[k]);
-        }
-        let mut behind = HashSet::new();
-        let mut work = flow.pred[load].clone();
-        while let Some(k) = work.pop() {
-            if behind.contains(&k) || k == made {
-                continue;
-            }
-            behind.insert(k);
-            work.extend_from_slice(&flow.pred[k]);
-        }
-        ahead.intersection(&behind).any(|k| stop.contains(k))
-    };
+    let mut writers: HashMap<u32, Vec<bool>> = HashMap::new();
+    let mut scratch = CompanionScratch::new(flow);
     let usable = |x: u32| x != 255 && !accumulators.contains(&x);
     let watch: BTreeSet<u32> = address.values().copied().collect();
     let reach = flow.reaching(src, &watch);
@@ -1608,31 +1919,39 @@ fn companions(plan: &mut Plan, flow: &Flow, src: &[Decoded], dec70: &mut Decoder
         let ra = address[&i];
         let mut found = Vec::new();
         if usable(ra) {
-            let stop_ra = get_written(ra);
-            if turns(i, &stop_ra) {
+            let stop_ra = written_set(&mut writers, flow, src, n, ra);
+            if scratch.turns(flow, i, stop_ra) {
                 found.push((ra, None));
             }
         }
-        if let Some(defs) = reach[i].as_ref().and_then(|m| m.get(&ra))
-            && defs.len() == 1
-            && !defs.contains(&None)
-        {
-            let made = defs.iter().next().unwrap().unwrap();
+        if let Some(made) = reach.unique_def(i, ra) {
             let d = &src[made];
-            let read: BTreeSet<(u8, u32)> = d.reads.iter().map(|&(l, x, _)| (l, x)).collect();
-            if MIRRORED.contains(&d.mnemonic)
+            let mut single_read: Option<(u8, u32)> = None;
+            let mut one_read = true;
+            for &(l, x, _) in &d.reads {
+                match single_read {
+                    None => single_read = Some((l, x)),
+                    Some(prev) if prev == (l, x) => {}
+                    Some(_) => {
+                        one_read = false;
+                        break;
+                    }
+                }
+            }
+            if one_read
+                && let Some((letter, x)) = single_read
+                && MIRRORED.contains(&d.mnemonic)
                 && unguarded(d)
                 && flow.kind[made] == "plain"
                 && d.writes == [(LETTER_R, ra)]
-                && read.len() == 1
+                && letter == LETTER_R
+                && x != ra
+                && usable(x)
                 && dec70.decode(d.word).is_some()
             {
-                let &(letter, x) = read.iter().next().unwrap();
-                if letter == LETTER_R && x != ra && usable(x) {
-                    let stop_x = get_written(x);
-                    if turns(i, &stop_x) && !between(made, i, &stop_x) {
-                        found.push((x, Some(made)));
-                    }
+                let stop_x = written_set(&mut writers, flow, src, n, x);
+                if scratch.turns(flow, i, stop_x) && !scratch.between(flow, made, i, stop_x) {
+                    found.push((x, Some(made)));
                 }
             }
         }
@@ -1666,97 +1985,32 @@ fn companions(plan: &mut Plan, flow: &Flow, src: &[Decoded], dec70: &mut Decoder
             .collect();
         plan.roots.insert(root, roles);
     }
-    let places = |stop: &HashSet<usize>, users: &BTreeSet<usize>| -> (Vec<usize>, Vec<usize>) {
-        let mut want = vec![false; n];
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for i in (0..n).rev() {
-                let new = users.contains(&i) || (!stop.contains(&i) && flow.succ[i].iter().any(|&t| want[t]));
-                if new != want[i] {
-                    want[i] = new;
-                    changed = true;
-                }
-            }
-        }
-        let first = |i: usize| want[i] && flow.whole[i];
-        let mut bare: Vec<bool> = (0..n).map(|i| i == 0 || flow.pred[i].is_empty()).collect();
-        let leaves_bare = |q: usize, bare: &[bool]| stop.contains(&q) || (bare[q] && !first(q));
-        let mut work: Vec<usize> = (0..n).filter(|&i| bare[i]).chain(stop.iter().copied()).collect();
-        while let Some(q) = work.pop() {
-            if !leaves_bare(q, &bare) {
-                continue;
-            }
-            for &t in &flow.succ[q] {
-                if !bare[t] {
-                    bare[t] = true;
-                    work.push(t);
-                }
-            }
-        }
-        let (mut before, mut after) = (Vec::new(), Vec::new());
-        for i in 0..n {
-            if !(first(i) && bare[i]) {
-                continue;
-            }
-            let bad: Vec<usize> = flow.pred[i]
-                .iter()
-                .copied()
-                .filter(|&q| leaves_bare(q, &bare))
-                .collect();
-            if i != 0
-                && flow.pred[i].len() >= 2
-                && bad == [i - 1]
-                && flow.kind[i - 1] == "plain"
-                && flow.goes_whole(src, i - 1)
-            {
-                after.push(i - 1);
-            } else {
-                before.push(i);
-            }
-        }
-        (before, after)
-    };
-    let round_without = |load: usize, place: usize| -> bool {
-        let mut seen = HashSet::new();
-        let mut work = flow.succ[load].clone();
-        while let Some(k) = work.pop() {
-            if k == load {
-                return true;
-            }
-            if seen.contains(&k) || k == place {
-                continue;
-            }
-            seen.insert(k);
-            work.extend_from_slice(&flow.succ[k]);
-        }
-        false
-    };
     let roots_sorted: Vec<u32> = plan.roots.keys().copied().collect();
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    let mut lost = Vec::new();
     for root in roots_sorted {
-        let stop_root = get_written(root);
+        let stop_root = written_set(&mut writers, flow, src, n, root);
         let mut users: BTreeSet<usize> = plan
             .through
             .iter()
             .filter_map(|(&i, &(x, _))| (x == root).then_some(i))
             .collect();
-        let (mut before, mut after) = (Vec::new(), Vec::new());
         while !users.is_empty() {
-            (before, after) = places(&stop_root, &users);
-            let lost: BTreeSet<usize> = users
-                .iter()
-                .copied()
-                .filter(|&i| {
-                    before
-                        .iter()
-                        .chain(after.iter())
-                        .any(|&q| i == q || !round_without(i, q))
-                })
-                .collect();
+            scratch.places(flow, src, stop_root, &users, &mut before, &mut after);
+            lost.clear();
+            for &i in &users {
+                if before
+                    .iter()
+                    .chain(after.iter())
+                    .any(|&q| i == q || !scratch.round_without(flow, i, q))
+                {
+                    lost.push(i);
+                }
+            }
             if lost.is_empty() {
                 break;
             }
-            for i in lost {
+            for &i in &lost {
                 users.remove(&i);
             }
         }
@@ -1771,10 +2025,10 @@ fn companions(plan: &mut Plan, flow: &Flow, src: &[Decoded], dec70: &mut Decoder
             .filter(|&r| users.iter().any(|i| plan.loads[i].role == r))
             .collect();
         plan.roots.insert(root, roles);
-        for i in before {
+        for &i in &before {
             plan.made_before.entry(i).or_default().push(root);
         }
-        for i in after {
+        for &i in &after {
             plan.made_after.entry(i).or_default().push(root);
         }
     }

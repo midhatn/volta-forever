@@ -1,5 +1,11 @@
 # Changes
 
+## Unreleased
+
+### Changed
+
+- Translated `sm_75` FP16 tensor-core pairs on whole rows (`VF_PAIRS=1`) now enable companion register hoisting for loop-invariant load addresses by default (`VF_COMPANIONS=1`, `0` to disable), allow per-group disjoint HMMA accumulator scoreboards with `WAIT`/`YIELD` scheduling instead of barrier stalls, and preserve `.reuse` hints on source operands (`docs/pairs.md`, section 12).
+
 ## 0.1.6 (2026-11-25)
 
 ### Fixed

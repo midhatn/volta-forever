@@ -1512,7 +1512,13 @@ fn companions_can_be_disabled_via_translate_with_companions() {
     let with_comp = translate_with_companions(original, true, &opts, true).unwrap();
     let no_comp = translate_with_companions(original, true, &opts, false).unwrap();
     let default_res = translate_with_options(original, true, &opts).unwrap();
+    let opts_no_comp = Options {
+        companions: false,
+        ..opts
+    };
+    let opt_no_comp = translate_with_options(original, true, &opts_no_comp).unwrap();
     assert_eq!(with_comp.bytes, default_res.bytes);
+    assert_eq!(no_comp.bytes, opt_no_comp.bytes);
 
     let added = |res: &TranslateResult| {
         let r = res.report.iter().find(|f| f.name == "p_basic").unwrap();

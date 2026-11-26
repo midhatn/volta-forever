@@ -33,10 +33,6 @@ pub use self::util::find_relative_decoded;
 pub use ampere::{Word as AmpereWord, described as ampere_class, word as ampere_word};
 pub use cubin::{translate, translate_with_companions, translate_with_options};
 
-pub(super) fn companions_enabled() -> bool {
-    std::env::var_os("VF_COMPANIONS").is_none_or(|v| v != "0")
-}
-
 // ---- Error type ----
 #[derive(Debug)]
 struct Refused(String);
@@ -320,6 +316,8 @@ pub struct Options {
     /// with tensor-core products may be translated at level 3 (the lane read at the product,
     /// its registers taken at the instruction). 8: level 3 first for every kernel, for tests.
     /// 9: try to preserve the source kernel’s register-limited maximum CTA size on GV100.
+    /// Compute companion registers before loops for whole-row matrix load addresses (`VF_COMPANIONS`).
+    pub companions: bool,
     pub borrow: u32,
 }
 
@@ -336,13 +334,14 @@ impl Default for Options {
         Self {
             pairs: true,
             aligned_rows: true,
+            companions: true,
             borrow: BORROW_DEFAULT,
         }
     }
 }
 
 impl Options {
-    /// Read `VF_PAIRS`, `VF_ALIGNED_ROWS` and `VF_BORROW` from the environment.
+    /// Read `VF_PAIRS`, `VF_ALIGNED_ROWS`, `VF_COMPANIONS` and `VF_BORROW` from the environment.
     pub fn from_environment() -> Self {
         let mut opts = Self::default();
         if let Ok(v) = std::env::var("VF_PAIRS") {
@@ -350,6 +349,9 @@ impl Options {
         }
         if let Ok(v) = std::env::var("VF_ALIGNED_ROWS") {
             opts.aligned_rows = v != "0";
+        }
+        if let Ok(v) = std::env::var("VF_COMPANIONS") {
+            opts.companions = v != "0";
         }
         opts.borrow = borrow_from(std::env::var("VF_BORROW").ok().as_deref());
         opts

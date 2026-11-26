@@ -25,7 +25,7 @@ pub fn translate(data: &[u8], want_map: bool) -> Result<TranslateResult, String>
 
 /// Translate an sm_75 or supported sm_80 cubin to sm_70 with the given options.
 pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Result<TranslateResult, String> {
-    translate_with_companions(data, want_map, opts, super::companions_enabled())
+    translate_with_companions(data, want_map, opts, opts.companions)
 }
 
 /// Translate an sm_75 or supported sm_80 cubin with explicit options and companion-hoisting switch.
@@ -36,7 +36,7 @@ pub fn translate_with_companions(
     companions: bool,
 ) -> Result<TranslateResult, String> {
     let mut dec75 = Decoder::new(75);
-    let mut dec70 = Decoder::new(70);
+    let dec70 = std::cell::RefCell::new(Decoder::new(70));
     let mut e = Elf::parse(data)?;
     let arch = super::ampere::source(&e.header)?;
     let symbols = e.symbols()?;
@@ -314,8 +314,8 @@ pub fn translate_with_companions(
                 let saves = predicates.iter().map(|p| p.save_slots).max().unwrap_or(0);
                 // A function's pairing plan depends on the original instructions and control
                 // flow. Register-placement retries and budget alternatives can reuse it.
-                let make_plans = |with_comp: bool| -> Vec<Option<crate::pairing::Plan>> {
-                    let mut pdec70 = Decoder::new(70);
+                let paired_comp = std::cell::LazyCell::new(|| -> Vec<Option<crate::pairing::Plan>> {
+                    let mut pdec70 = dec70.borrow_mut();
                     fs.iter()
                         .map(|f| {
                             if opts.pairs && f.needs_lane && !f.entered_inside {
@@ -323,7 +323,7 @@ pub fn translate_with_companions(
                                     &f.src,
                                     &f.tables,
                                     &self::entries(f),
-                                    with_comp,
+                                    companions,
                                     &mut pdec70,
                                 )
                             } else {
@@ -331,9 +331,13 @@ pub fn translate_with_companions(
                             }
                         })
                         .collect()
-                };
-                let paired_comp = std::cell::LazyCell::new(|| make_plans(companions));
-                let paired_nocomp = std::cell::LazyCell::new(|| make_plans(false));
+                });
+                let paired_nocomp = std::cell::LazyCell::new(|| -> Vec<Option<crate::pairing::Plan>> {
+                    paired_comp
+                        .iter()
+                        .map(|p| p.as_ref().map(crate::pairing::Plan::without_companions))
+                        .collect()
+                });
                 let unpaired: Vec<_> = fs.iter().map(|_| None).collect();
                 // `borrow_level`: 2, the uniform registers that find a home in the function's
                 // own registers have it and the pool is taken there at each instruction; 1, the
@@ -461,7 +465,7 @@ pub fn translate_with_companions(
                         let si = indices[0];
                         let place_map: HashMap<u32, u32> = b.homes.clone();
                         match translate_function(
-                            &mut dec70,
+                            &mut dec70.borrow_mut(),
                             &functions[&si],
                             &predicates[0],
                             &place_map,
@@ -568,7 +572,7 @@ pub fn translate_with_companions(
                             }
                         }
                         match translate_function(
-                            &mut dec70,
+                            &mut dec70.borrow_mut(),
                             &functions[&si],
                             predicates,
                             &place,
