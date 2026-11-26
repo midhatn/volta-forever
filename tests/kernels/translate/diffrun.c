@@ -949,6 +949,18 @@ int main(int argc, char** argv) {
         test_same_output("k_uniform_float", rm, tm, N * 4, (void*[]){&da, &n, &few, &scale, &bias}, 5);
     }
 
+    // k_uimad.cu: sm_75 UIMAD with immediate addend (uimad__URURsI_URURI) and UIMAD.WIDE pair reads.
+    {
+        uint32_t a = 3u, b = 5u, stride = 8u, n = N;
+        uint64_t d = 0x123456789abcdef0ull, e = 0x0fedcba987654321ull;
+        int rounds = getenv("DIFFRUN_ROUNDS") ? atoi(getenv("DIFFRUN_ROUNDS")) : 40;
+        CUdeviceptr dw = dalloc(N * 8);
+        CK(cuMemcpyHtoD_v2(da, ha, N * 4));
+        test_same_output("k_uimad_stride", rm, tm, N * 4, (void*[]){&da, &a, &b, &stride, &n}, 5);
+        test_same_output("k_uimad_wide_hi", rm, tm, N * 4, (void*[]){&dw, &da, &a, &b, &d, &e, &rounds, &n}, 8);
+        cuMemFree_v2(dw);
+    }
+
     // k_switch.cu: jump tables (a table of code offsets in the constants, a branch through a register).
     {
         int n = N;
