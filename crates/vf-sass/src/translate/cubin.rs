@@ -9,7 +9,7 @@ use crate::elf::Elf;
 use crate::generated::special::*;
 
 use super::attributes::{check_attributes, find_exits, rewrite_attributes, strip_attributes, strip_attrs_by_kind};
-use super::borrowed::Borrowed;
+use super::borrowed::{BorrowPrep, Borrowed};
 use super::context::{Predicates, entries, stand_ins};
 use super::function::{follow, translate_function};
 use super::parse::{FuncData, parse_function, placement, tables_of};
@@ -316,12 +316,21 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         .collect::<Vec<_>>()
                 });
                 let unpaired: Vec<_> = fs.iter().map(|_| None).collect();
-                // `borrow_level`: 2, the uniform registers that find a home in the function's
-                // own registers have it and the pool is taken there at each instruction; 1, the
-                // homes only, the pool above; 0, everything above, as it was.
-                let mut attempt = |do_pairs: bool, borrow_level: u32, top_override: Option<u32>, gave_up: &[String]| -> Result<Vec<(usize, TransResult)>, Refused> {
-                    let plans = if do_pairs { &*paired } else { &unpaired };
-                    // has_product when not in a pair site.
+                struct Layout {
+                    has_product_flags: Vec<bool>,
+                    any_has_product: bool,
+                    rows: std::collections::BTreeMap<u32, u32>,
+                    shares: HashMap<u32, u32>,
+                    row_kept: Vec<&'static str>,
+                    held_preds: Vec<u32>,
+                    all_uniform: Vec<u32>,
+                    all_pairs: Vec<u32>,
+                    any_needs_pool: bool,
+                    any_needs_lane: bool,
+                    max_scratch: u32,
+                    max_highest: u32,
+                }
+                let compute_layout = |plans: &[Option<crate::pairing::Plan>]| -> Layout {
                     let has_product_flags: Vec<bool> = fs
                         .iter()
                         .zip(plans.iter())
@@ -335,7 +344,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                                 .any(|(i, d)| d.name == "hmma_x8_" && !sites.contains(&i))
                         })
                         .collect();
-                    // The rows and their sharing.
+                    let any_has_product = has_product_flags.iter().any(|&hp| hp);
                     let mut rows: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
                     let mut shares: HashMap<u32, u32> = HashMap::new();
                     for plan in plans.iter().flatten() {
@@ -369,8 +378,34 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         s.sort();
                         s
                     };
-                    // When borrowing: compute Borrowed for the single kernel.
-                    let mut borrowed = if borrow_level > 0 {
+                    let mut all_uniform: Vec<u32> = fs.iter().flat_map(|f| f.uniform.iter().copied()).collect();
+                    all_uniform.sort_unstable();
+                    all_uniform.dedup();
+                    let mut all_pairs: Vec<u32> = fs.iter().flat_map(|f| f.pairs.iter().copied()).collect();
+                    all_pairs.sort_unstable();
+                    all_pairs.dedup();
+                    Layout {
+                        has_product_flags,
+                        any_has_product,
+                        rows,
+                        shares,
+                        row_kept,
+                        held_preds,
+                        all_uniform,
+                        all_pairs,
+                        any_needs_pool: fs.iter().any(|f| f.needs_pool),
+                        any_needs_lane: fs.iter().any(|f| f.needs_lane),
+                        max_scratch: fs.iter().map(|f| f.scratch_need).max().unwrap_or(0),
+                        max_highest: fs.iter().map(|f| f.highest).max().unwrap(),
+                    }
+                };
+                // `borrow_level`: 2, homes + pool at instruction; 1, homes only; 0, everything above.
+                let mut attempt = |do_pairs: bool, borrow_level: u32, top_override: Option<u32>, pre_borrowed: Option<Borrowed>, gave_up: &[String]| -> Result<Vec<(usize, TransResult)>, Refused> {
+                    let plans = if do_pairs { &*paired } else { &unpaired };
+                    let layout = compute_layout(plans);
+                    let mut borrowed = if let Some(b) = pre_borrowed {
+                        Some(b)
+                    } else if borrow_level > 0 {
                         let all_in_memory = borrow_level == 3 && (opts.borrow == 3 || opts.borrow == 8);
                         Some(Borrowed::new(fs[0], all_in_memory, top_override)?)
                     } else {
@@ -478,38 +513,27 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         .as_ref()
                         .and_then(|b| b.used.iter().copied().max())
                         .unwrap_or(0);
-                    let base = fs.iter().map(|f| f.highest).max().unwrap().max(max_borrowed) + 1;
-                    // Uniform registers with unhomed webs still need placement above.
-                    let uniform_for_placement: Vec<u32> = {
-                        let mut all: Vec<u32> = fs.iter().flat_map(|f| f.uniform.iter().copied()).collect();
-                        all.sort_unstable();
-                        all.dedup();
-                        match borrowed.as_ref() {
-                            Some(b) => all.into_iter().filter(|u| b.unhomed_u.contains(u)).collect(),
-                            None => all,
-                        }
+                    let base = layout.max_highest.max(max_borrowed) + 1;
+                    let uniform_for_placement: Vec<u32> = match borrowed.as_ref() {
+                        Some(b) => layout.all_uniform.iter().copied().filter(|u| b.unhomed_u.contains(u)).collect(),
+                        None => layout.all_uniform.clone(),
                     };
-                    let pairs_for_placement: Vec<u32> = {
-                        let mut all: Vec<u32> = fs.iter().flat_map(|f| f.pairs.iter().copied()).collect();
-                        all.sort_unstable();
-                        all.dedup();
-                        match borrowed.as_ref() {
-                            Some(b) => all.into_iter().filter(|u| b.unhomed_pairs.contains(u)).collect(),
-                            None => all,
-                        }
+                    let pairs_for_placement: Vec<u32> = match borrowed.as_ref() {
+                        Some(b) => layout.all_pairs.iter().copied().filter(|u| b.unhomed_pairs.contains(u)).collect(),
+                        None => layout.all_pairs.clone(),
                     };
                     let placed = placement(
                         base,
                         &uniform_for_placement,
                         &pairs_for_placement,
-                        fs.iter().any(|f| f.needs_pool) && borrow_level != 2,
+                        layout.any_needs_pool && borrow_level != 2,
                         saves,
-                        fs.iter().any(|f| f.needs_lane),
-                        fs.iter().map(|f| f.scratch_need).max().unwrap_or(0),
-                        fs.iter().zip(has_product_flags.iter()).any(|(_, &hp)| hp),
-                        if rows.is_empty() { None } else { Some(&rows) },
-                        &row_kept,
-                        &held_preds,
+                        layout.any_needs_lane,
+                        layout.max_scratch,
+                        layout.any_has_product,
+                        if layout.rows.is_empty() { None } else { Some(&layout.rows) },
+                        &layout.row_kept,
+                        &layout.held_preds,
                     )?;
                     let (
                         place,
@@ -531,7 +555,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         let mut func_rows_at = HashMap::new();
                         if let Some(plan) = plan {
                             for &rd in plan.rows().keys() {
-                                let to = shares.get(&rd).copied().unwrap_or(rd);
+                                let to = layout.shares.get(&rd).copied().unwrap_or(rd);
                                 if let Some(&at) = rows_at_base.get(&to) {
                                     func_rows_at.insert(rd, at);
                                 }
@@ -553,7 +577,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             func_rows_at,
                             kept_rows_base.clone(),
                             opts.aligned_rows,
-                            has_product_flags[k],
+                            layout.has_product_flags[k],
                             &hold_at,
                             borrowed.as_mut(),
                         ) {
@@ -571,7 +595,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             "  registers\t{}\t{}\t{}\tlevel {}\tuniform {}\thomed {}\tpool {}\tsaves {}\theld {}\tproducts {}\tgave up: {}",
                             f.name, f.registers, count, borrow_level,
                             f.uniform.len(), n_homes, pool_count,
-                            saves, held_preds.len(), f.product_count,
+                            saves, layout.held_preds.len(), f.product_count,
                             gu
                         );
                     }
@@ -580,20 +604,20 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                 let alone = fs.len() == 1 && indices.iter().any(|si| entries.contains(si));
                 let has_pairs_to_drop = || paired.iter().any(Option::is_some);
                 type Tried = Result<Vec<(usize, TransResult)>, Refused>;
-                type AttemptFn<'a> = dyn FnMut(bool, u32, Option<u32>, &[String]) -> Tried + 'a;
+                type AttemptFn<'a> = dyn FnMut(bool, u32, Option<u32>, Option<Borrowed>, &[String]) -> Tried + 'a;
                 let empty_gave_up: Vec<String> = Vec::new();
                 // usual(): the chain of attempts (levels 2, 1, 0, pairs fallback).
                 let usual = |attempt: &mut AttemptFn<'_>| {
                     let r = if opts.borrow > 0 && alone {
-                        attempt(true, 2, None, &[])
-                            .or_else(|_| attempt(true, 1, None, &[]))
-                            .or_else(|_| attempt(true, 0, None, &[]))
+                        attempt(true, 2, None, None, &[])
+                            .or_else(|_| attempt(true, 1, None, None, &[]))
+                            .or_else(|_| attempt(true, 0, None, None, &[]))
                     } else {
-                        attempt(true, 0, None, &[])
+                        attempt(true, 0, None, None, &[])
                     };
                     r.or_else(|refused| {
                         if has_pairs_to_drop() {
-                            attempt(false, 0, None, &[])
+                            attempt(false, 0, None, None, &[])
                         } else {
                             Err(refused)
                         }
@@ -601,9 +625,9 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                 };
                 // plain(): level 0 with pairs fallback but no borrow (for the budget).
                 let plain = |attempt: &mut AttemptFn<'_>, gave_up: &[String]| {
-                    attempt(true, 0, None, gave_up).or_else(|refused| {
+                    attempt(true, 0, None, None, gave_up).or_else(|refused| {
                         if has_pairs_to_drop() {
-                            attempt(false, 0, None, gave_up)
+                            attempt(false, 0, None, None, gave_up)
                         } else {
                             Err(refused)
                         }
@@ -618,7 +642,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     let f = &fs[0];
                     let extra: u32 = if f.product_count > 0 { 16 } else { 0 };
                     let top_for_8 = if extra > 0 { Some(f.highest + extra) } else { None };
-                    match attempt(false, 3, top_for_8, &empty_gave_up) {
+                    match attempt(false, 3, top_for_8, None, &empty_gave_up) {
                         Ok(d) => Ok(d),
                         Err(ref e) => {
                             eprintln!("level 3 failed for {}: {}", fs[0].name, e.0);
@@ -627,112 +651,190 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     }
                 } else if matches!(opts.borrow, 7 | 9) && alone {
                     // What 6 does, and a function with products may be translated at level 3.
-                    // The chain: plain; levels 1, 2; level 3 with room and with products.
+                    // Before running full level-0 codegen, check whether the function crosses a
+                    // GV100 occupancy cliff and can recover a warp tier via a single BorrowPrep
+                    // pass at level 1 or level 2 without running wasted intermediate codegens.
                     let mut gave_up: Vec<String> = Vec::new();
-                    let plain_result = plain(&mut attempt, &gave_up);
-                    let mut normal = match plain_result {
-                        Ok(d) => Ok(d),
-                        Err(original_why) if original_why.0 == "more registers than there are" => {
-                            gave_up.push(original_why.0.clone());
-                            let original_msg = original_why.0.clone();
-                            // Try levels 1, 2, 3 in order.
-                            let mut done = None;
-                            for (do_p, bl) in [(true, 1u32), (true, 2), (false, 3)] {
-                                match attempt(do_p, bl, None, &gave_up) {
-                                    Ok(d) => { done = Some(d); break; }
-                                    Err(e) => { gave_up.push(e.0); }
-                                }
-                            }
-                            match done {
-                                Some(d) => Ok(d),
-                                None => {
-                                    if std::env::var("VF_BORROW_SAY").is_ok() {
-                                        eprintln!(
-                                            "  refused\t{}\t{}\tand with borrowed registers: {}",
-                                            fs[0].name, original_msg,
-                                            gave_up[1..].join("; ")
-                                        );
-                                    }
-                                    Err(Refused(original_msg))
-                                }
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }?;
-                    // When level 0 crosses a GV100 warp occupancy cliff vs the source declaration,
-                    // recover occupancy via zero-spill level 1 / level 2 (without local-memory spills).
-                    {
-                        let f = fs[0];
-                        let info = e.section(&format!(".nv.info.{}", f.name))
-                            .map_or(&[][..], |i| e.sections[i].data.as_slice());
-                        let occ_limit = super::block_registers::occupancy_target(f.registers, info);
-                        let normal_count = normal[0].1.count;
-                        let mut best_warps = super::block_registers::occupancy_warps(normal_count, info);
-                        let min_possible = f.highest + 3 + saves;
-                        if normal_count > occ_limit
-                            && super::block_registers::occupancy_warps(min_possible, info) > best_warps
-                            && !relocations.contains_key(&indices[0])
-                            && f.tables.is_empty()
-                        {
-                            let old_keys: std::collections::BTreeSet<u64> =
-                                normal[0].1.new_of.keys().copied().collect();
-                            let min_tier = super::block_registers::occupancy_target(min_possible, info);
-                            let mut tier = occ_limit.max(min_tier);
-                            let mut tried_eff = std::collections::HashSet::new();
-                            'tiers: loop {
-                                let pool_extra = if f.needs_pool { 2 } else { 0 };
-                                let top_l2 = tier.saturating_sub(3).saturating_sub(saves);
-                                let top_l1 = top_l2.saturating_sub(pool_extra);
-                                for (level, bound) in [(1u32, top_l1), (2u32, top_l2)] {
-                                    let mut try_bounds = vec![bound];
-                                    let mut idx = 0;
-                                    while idx < try_bounds.len() {
-                                        let bnd = try_bounds[idx];
-                                        idx += 1;
-                                        if !tried_eff.insert((level, bnd.max(f.highest))) {
-                                            continue;
-                                        }
-                                        if let Ok(candidate) = attempt(true, level, Some(bnd), &gave_up) {
-                                            let c_count = candidate[0].1.count;
-                                            let c_warps = super::block_registers::occupancy_warps(c_count, info);
-                                            if c_warps > best_warps
-                                                && candidate[0].1.new_of.len() == old_keys.len()
-                                                && old_keys.iter().all(|k| candidate[0].1.new_of.contains_key(k))
-                                            {
-                                                normal = candidate;
+                    let f = fs[0];
+                    let info = e.section(&format!(".nv.info.{}", f.name))
+                        .map_or(&[][..], |i| e.sections[i].data.as_slice());
+                    let occ_limit = super::block_registers::occupancy_target(f.registers, info);
+                    let target_warps = super::block_registers::occupancy_warps(occ_limit, info);
+                    let mut cliff_best: Option<Vec<(usize, TransResult)>> = None;
+
+                    if !relocations.contains_key(&indices[0]) && f.tables.is_empty() {
+                        let layout = compute_layout(&paired);
+                        let rows_opt = if layout.rows.is_empty() { None } else { Some(&layout.rows) };
+                        let l0_placed = placement(
+                            layout.max_highest + 1,
+                            &layout.all_uniform,
+                            &layout.all_pairs,
+                            layout.any_needs_pool,
+                            saves,
+                            layout.any_needs_lane,
+                            layout.max_scratch,
+                            layout.any_has_product,
+                            rows_opt,
+                            &layout.row_kept,
+                            &layout.held_preds,
+                        );
+                        if let Ok(l0_p) = l0_placed {
+                            let l0_count = l0_p.7 + 2;
+                            let mut best_warps = super::block_registers::occupancy_warps(l0_count, info);
+                            let l2_floor = placement(
+                                layout.max_highest + 1,
+                                &[],
+                                &[],
+                                false,
+                                saves,
+                                layout.any_needs_lane,
+                                layout.max_scratch,
+                                layout.any_has_product,
+                                rows_opt,
+                                &layout.row_kept,
+                                &layout.held_preds,
+                            )
+                            .map_or(255, |p| p.7 + 2);
+                            if l0_count > occ_limit
+                                && super::block_registers::occupancy_warps(l2_floor, info) > best_warps
+                                && let Ok(prep) = BorrowPrep::new(f, f.needs_pool, false)
+                            {
+                                let sol = prep.solve_homes(false, None);
+                                let base = layout.max_highest.max(sol.max_borrowed) + 1;
+                                let u_pl: Vec<u32> = layout
+                                    .all_uniform
+                                    .iter()
+                                    .copied()
+                                    .filter(|u| sol.unhomed_u.contains(u))
+                                    .collect();
+                                let p_pl: Vec<u32> = layout
+                                    .all_pairs
+                                    .iter()
+                                    .copied()
+                                    .filter(|u| sol.unhomed_pairs.contains(u))
+                                    .collect();
+                                let c_l1_warps = placement(
+                                    base,
+                                    &u_pl,
+                                    &p_pl,
+                                    layout.any_needs_pool,
+                                    saves,
+                                    layout.any_needs_lane,
+                                    layout.max_scratch,
+                                    layout.any_has_product,
+                                    rows_opt,
+                                    &layout.row_kept,
+                                    &layout.held_preds,
+                                )
+                                .map_or(0, |p| super::block_registers::occupancy_warps(p.7 + 2, info));
+                                let try_l1 = c_l1_warps > best_warps;
+                                let c_l2_warps = if layout.any_needs_pool && c_l1_warps < target_warps {
+                                    placement(
+                                        base,
+                                        &u_pl,
+                                        &p_pl,
+                                        false,
+                                        saves,
+                                        layout.any_needs_lane,
+                                        layout.max_scratch,
+                                        layout.any_has_product,
+                                        rows_opt,
+                                        &layout.row_kept,
+                                        &layout.held_preds,
+                                    )
+                                    .map_or(0, |p| super::block_registers::occupancy_warps(p.7 + 2, info))
+                                } else {
+                                    0
+                                };
+                                let want_l2_after_l1 = layout.any_needs_pool && c_l2_warps > c_l1_warps.max(best_warps);
+                                let expected_keys = f.src.len() + 1;
+                                if try_l1 || c_l2_warps > best_warps {
+                                    let mut b_opt = Some(prep.into_borrowed(f, sol, false));
+                                    if try_l1 {
+                                        let b_l1 = if want_l2_after_l1 {
+                                            let b = b_opt.as_ref().unwrap();
+                                            Borrowed {
+                                                top: b.top,
+                                                highest: b.highest,
+                                                busy: b.busy.clone(),
+                                                taken: b.taken.clone(),
+                                                touch: Vec::new(),
+                                                never: b.never,
+                                                late_read_counts: b.late_read_counts,
+                                                board_costs: b.board_costs,
+                                                home_at_insn: b.home_at_insn.clone(),
+                                                web_homes: b.web_homes.clone(),
+                                                unhomed_u: b.unhomed_u.clone(),
+                                                unhomed_pairs: b.unhomed_pairs.clone(),
+                                                used: b.used.clone(),
+                                                everything: false,
+                                                slots: HashMap::new(),
+                                                predicate_slots: HashMap::new(),
+                                                frame_bytes: 0,
+                                                depth: Vec::new(),
+                                                r1_fixed: false,
+                                                room: false,
+                                                from_r1: false,
+                                                spill: 0,
+                                            }
+                                        } else {
+                                            b_opt.take().unwrap()
+                                        };
+                                        if let Ok(cand) = attempt(true, 1, None, Some(b_l1), &gave_up) {
+                                            let c_warps = super::block_registers::occupancy_warps(cand[0].1.count, info);
+                                            if c_warps > best_warps && cand[0].1.new_of.len() == expected_keys {
                                                 best_warps = c_warps;
-                                                if c_count <= occ_limit {
-                                                    break 'tiers;
-                                                }
-                                            }
-                                            if c_count > tier
-                                                && idx == 1
-                                                && c_count - tier <= bnd
-                                            {
-                                                let tighter = bnd - (c_count - tier);
-                                                if !try_bounds.contains(&tighter) {
-                                                    try_bounds.push(tighter);
-                                                }
+                                                cliff_best = Some(cand);
                                             }
                                         }
                                     }
-                                }
-                                let mut next_tier = None;
-                                let mut probe = tier + 1;
-                                while probe < normal_count {
-                                    if super::block_registers::occupancy_warps(probe, info) > best_warps {
-                                        next_tier = Some(super::block_registers::occupancy_target(probe, info));
-                                        break;
+                                    if layout.any_needs_pool
+                                        && best_warps < target_warps
+                                        && c_l2_warps > best_warps
+                                        && let Ok(cand) = attempt(true, 2, None, b_opt.take(), &gave_up)
+                                    {
+                                        let c_warps = super::block_registers::occupancy_warps(cand[0].1.count, info);
+                                        if c_warps > best_warps && cand[0].1.new_of.len() == expected_keys {
+                                            cliff_best = Some(cand);
+                                        }
                                     }
-                                    probe += 1;
-                                }
-                                match next_tier {
-                                    Some(nt) if nt > tier && nt < normal_count => tier = nt,
-                                    _ => break 'tiers,
                                 }
                             }
                         }
                     }
+
+                    let normal = if let Some(d) = cliff_best {
+                        d
+                    } else {
+                        match plain(&mut attempt, &gave_up) {
+                            Ok(d) => Ok(d),
+                            Err(original_why) if original_why.0 == "more registers than there are" => {
+                                gave_up.push(original_why.0.clone());
+                                let original_msg = original_why.0.clone();
+                                let mut done = None;
+                                for (do_p, bl) in [(true, 1u32), (true, 2), (false, 3)] {
+                                    match attempt(do_p, bl, None, None, &gave_up) {
+                                        Ok(d) => { done = Some(d); break; }
+                                        Err(e) => { gave_up.push(e.0); }
+                                    }
+                                }
+                                match done {
+                                    Some(d) => Ok(d),
+                                    None => {
+                                        if std::env::var("VF_BORROW_SAY").is_ok() {
+                                            eprintln!(
+                                                "  refused\t{}\t{}\tand with borrowed registers: {}",
+                                                fs[0].name, original_msg,
+                                                gave_up[1..].join("; ")
+                                            );
+                                        }
+                                        Err(Refused(original_msg))
+                                    }
+                                }
+                            }
+                            Err(e) => Err(e),
+                        }?
+                    };
                     if opts.borrow == 9 {
                         let f = fs[0];
                         let info = e.section(&format!(".nv.info.{}", f.name))
@@ -743,7 +845,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         if normal[0].1.count > limit && !relocations.contains_key(&indices[0]) && f.tables.is_empty() {
                             let top = limit.saturating_sub(3).saturating_sub(saves);
                             for (pairs, level, bound) in [(true, 1, None), (true, 2, None), (false, 3, Some(top))] {
-                                if let Ok(candidate) = attempt(pairs, level, bound, &gave_up)
+                                if let Ok(candidate) = attempt(pairs, level, bound, None, &gave_up)
                                     && candidate[0].1.count <= limit
                                 {
                                     // Attributes and symbols may point at any original instruction. Preserve
@@ -774,15 +876,15 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             gave_up.push(original_why.0.clone());
                             let original_msg = original_why.0.clone();
                             // Try levels 1, 2, 3 in order.
-                            match attempt(true, 1, None, &gave_up) {
+                            match attempt(true, 1, None, None, &gave_up) {
                                 Ok(d) => Ok(d),
                                 Err(e1) => {
                                     gave_up.push(e1.0);
-                                    match attempt(true, 2, None, &gave_up) {
+                                    match attempt(true, 2, None, None, &gave_up) {
                                         Ok(d) => Ok(d),
                                         Err(e2) => {
                                             gave_up.push(e2.0);
-                                            match attempt(false, 3, None, &gave_up) {
+                                            match attempt(false, 3, None, None, &gave_up) {
                                                 Ok(d) => Ok(d),
                                                 Err(e3) => {
                                                     gave_up.push(e3.0);
@@ -842,7 +944,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     }
                     if !best.as_ref().is_some_and(|b| b.within) {
                         // Level 1.
-                        match attempt(true, 1, None, &gave_up) {
+                        match attempt(true, 1, None, None, &gave_up) {
                             Ok(d) => {
                                 let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
                                 if count <= budget {
@@ -859,7 +961,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     }
                     if !best.as_ref().is_some_and(|b| b.within) {
                         // Level 2.
-                        match attempt(true, 2, None, &gave_up) {
+                        match attempt(true, 2, None, None, &gave_up) {
                             Ok(d) => {
                                 let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
                                 if count <= budget {
@@ -876,7 +978,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     }
                     if !best.as_ref().is_some_and(|b| b.within) {
                         // Level 3.
-                        match attempt(false, 3, top_for_l3, &gave_up) {
+                        match attempt(false, 3, top_for_l3, None, &gave_up) {
                             Ok(d) => {
                                 let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
                                 if count <= budget {
@@ -899,9 +1001,9 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                                 // attempt made it).
                                 b.result = match b.level {
                                     0 => plain(&mut attempt, &gave_up)?,
-                                    1 => attempt(true, 1, None, &gave_up)?,
-                                    2 => attempt(true, 2, None, &gave_up)?,
-                                    3 => attempt(false, 3, top_for_l3, &gave_up)?,
+                                    1 => attempt(true, 1, None, None, &gave_up)?,
+                                    2 => attempt(true, 2, None, None, &gave_up)?,
+                                    3 => attempt(false, 3, top_for_l3, None, &gave_up)?,
                                     _ => unreachable!(),
                                 };
                             }
@@ -918,7 +1020,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                 } else if opts.borrow >= 3 && alone {
                     // For tests: everything at the instruction first, every uniform register
                     // in memory.
-                    match attempt(false, 3, None, &empty_gave_up) {
+                    match attempt(false, 3, None, None, &empty_gave_up) {
                         Ok(d) => Ok(d),
                         Err(ref e) => {
                             eprintln!("level 3 failed for {}: {}", fs[0].name, e.0);
@@ -930,7 +1032,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     // and when that is refused too, for the reason it was refused before.
                     match usual(&mut attempt) {
                         Ok(d) => Ok(d),
-                        Err(original_why) => match attempt(false, 3, None, &empty_gave_up) {
+                        Err(original_why) => match attempt(false, 3, None, None, &empty_gave_up) {
                             Ok(d) => Ok(d),
                             Err(also) => {
                                 if std::env::var("VF_BORROW_SAY").is_ok() {
@@ -964,7 +1066,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                 if opts.borrow > 0 && alone {
                     let top = limit.saturating_sub(3).saturating_sub(saves);
                     for (pairs, level, bound) in [(true, 1, None), (true, 2, None), (false, 3, Some(top))] {
-                        if let Ok(candidate) = attempt(pairs, level, bound, &empty_gave_up)
+                        if let Ok(candidate) = attempt(pairs, level, bound, None, &empty_gave_up)
                             && count(&candidate) <= limit
                         {
                             return Ok(candidate);

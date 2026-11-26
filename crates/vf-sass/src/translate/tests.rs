@@ -639,6 +639,8 @@ fn free_at_skips_given() {
         taken: vec![regset_empty()],
         touch: vec![regset_empty()],
         never: regset_empty(),
+        late_read_counts: [0u32; 256],
+        board_costs: [0u32; 256],
         home_at_insn: vec![Vec::new()],
         web_homes: Vec::new(),
         unhomed_u: HashSet::new(),
@@ -685,6 +687,8 @@ fn free_at_returns_none_when_full() {
         taken: vec![regset_empty()],
         touch: vec![regset_empty()],
         never: regset_empty(),
+        late_read_counts: [0u32; 256],
+        board_costs: [0u32; 256],
         home_at_insn: vec![Vec::new()],
         web_homes: Vec::new(),
         unhomed_u: HashSet::new(),
@@ -1775,4 +1779,150 @@ fn borrowed_exact_call_rel_preserves_caller_live_out_registers() {
     );
     assert_eq!(b.home_at(4, 4), Some(10));
     assert_eq!(b.home_at(5, 4), Some(10));
+}
+
+/// Pool allocation via `free_at` skips registers heavily read late (`MioFast`/`MioSlow`/`FMALITE`/
+/// `HMMA` with `rb == 7`), and stays within `highest.min(top)` at level 1/2 instead of escaping
+/// above `highest`.
+#[test]
+fn free_at_avoids_late_read_and_exceeding_highest() {
+    let mut b = Borrowed {
+        top: 61,
+        highest: 5,
+        busy: vec![regset_empty()],
+        taken: vec![regset_empty()],
+        touch: vec![regset_empty()],
+        never: regset_empty(),
+        late_read_counts: [0u32; 256],
+        board_costs: [0u32; 256],
+        home_at_insn: vec![Vec::new()],
+        web_homes: Vec::new(),
+        unhomed_u: HashSet::new(),
+        unhomed_pairs: HashSet::new(),
+        used: HashSet::new(),
+        everything: false,
+        slots: HashMap::new(),
+        predicate_slots: HashMap::new(),
+        frame_bytes: 0,
+        depth: vec![None],
+        r1_fixed: true,
+        room: false,
+        from_r1: false,
+        spill: 0,
+    };
+    b.late_read_counts[2] = 10;
+    b.late_read_counts[3] = 10;
+    // R4:R5 has zero late reads and lies within highest=5 (must pick R4 over late-read R2 and >highest R6).
+    assert_eq!(b.free_at(0, 2, &regset_empty()), Some(4));
+    // Once R4:R5 is busy, level 2 (!everything) must NOT jump above highest=5 (returns R2 instead of R6).
+    regset_set(&mut b.busy[0], 4);
+    assert_eq!(b.free_at(0, 2, &regset_empty()), Some(2));
+    // And in k_pairs::p_callee, dynamic pool borrowing must avoid heavily late-read R2:R3
+    // (keeping LDG/STG instructions reading R2 free of injected read scoreboards).
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let result = translate_with_options(original, false, &Options::default()).unwrap();
+    let out = crate::elf::Elf::parse(&result.bytes).unwrap();
+    let text = &out.sections[out.section(".text.p_callee").unwrap()];
+    let mut dec70 = Decoder::new(70);
+    let mut r2_late_readers = 0usize;
+    let mut r2_rb_injected = 0usize;
+    for chunk in text.data.as_chunks::<16>().0 {
+        let word = u128::from_le_bytes(*chunk);
+        if let Some(d) = dec70.decode(word)
+            && d.kind.is_late()
+            && d.reads.iter().any(|&(l, r, _)| l == LETTER_R && r == 2)
+        {
+            r2_late_readers += 1;
+            let rb = ((word >> crate::generated::special::READ_BARRIER) & 7) as u32;
+            if rb != 7 {
+                r2_rb_injected += 1;
+            }
+        }
+    }
+    assert!(r2_late_readers >= 30, "expected >= 30 late readers of R2 in p_callee");
+    // Before preferring non-late registers, pool-borrowing R2:R3 injected read barriers on all 33
+    // LDG/STG readers of R2. Now R25 is chosen instead, so only the single STG reading R25 gets rb != 7.
+    assert!(
+        r2_rb_injected <= 1,
+        "p_callee should avoid R2:R3 for pool borrowing (had {r2_rb_injected} R2 readers with rb != 7)"
+    );
+}
+
+/// `Borrowed::free_at` skips scoreboard-bound registers (especially `MioSlow` writers) when a
+/// zero-wait register pair is available, even when `late_read_counts` is zero for both.
+#[test]
+fn free_at_avoids_scoreboard_bound_registers() {
+    let mut dec75 = Decoder::new(75);
+    let nop_word: u128 = 0x000fc00000000000_0000000000007918;
+    let mut ldg = dec75.decode(nop_word).unwrap();
+    ldg.kind = Kind::MioSlow;
+    ldg.word = (nop_word & !(7u128 << crate::generated::special::WRITE_BARRIER))
+        | (5u128 << crate::generated::special::WRITE_BARRIER);
+    ldg.writes = vec![(LETTER_R, 2)];
+
+    let mut plain = dec75.decode(nop_word).unwrap();
+    plain.writes = vec![(LETTER_R, 5)];
+
+    let mut read_r5 = dec75.decode(nop_word).unwrap();
+    read_r5.reads = vec![(LETTER_R, 5, 0)];
+
+    let nop = dec75.decode(nop_word).unwrap();
+    let fd = FuncData {
+        name: "test_board_costs".into(),
+        registers: 10,
+        tables: vec![],
+        src: vec![ldg, nop, plain, read_r5],
+        uniform: vec![],
+        pairs: vec![],
+        needs_pool: true,
+        uniform_predicates: vec![],
+        highest: 5,
+        scratch_need: 0,
+        needs_lane: false,
+        product_count: 0,
+        entered_inside: false,
+        ampere: false,
+        ampere_ops: HashMap::new(),
+    };
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    assert_eq!(
+        b.free_at(1, 2, &regset_empty()),
+        Some(4),
+        "free_at should pick zero-wait R4:R5 over MioSlow-written R2:R3"
+    );
+}
+
+/// First writes to borrowed pool registers wait only on scoreboards that write or late-read those
+/// specific registers (excluding unrelated scoreboards and immediate `rb` announcements on the
+/// translated instruction itself such as `on the product`).
+#[test]
+fn borrowed_pool_wait_excludes_unrelated_scoreboards() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let result = translate_with_options(original, false, &Options::default()).unwrap();
+    let out = crate::elf::Elf::parse(&result.bytes).unwrap();
+    let text = &out.sections[out.section(".text.p_callee").unwrap()];
+    let mut dec70 = Decoder::new(70);
+    let words: Vec<u128> = text
+        .data
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|c| u128::from_le_bytes(*c))
+        .collect();
+    // At 0x01d0 (`SHF` borrowing R25 before `STS` `on the product`), the wait must include only
+    // scoreboards touching R25 (`0b111000`), not unrelated SB0..SB2 or the immediate `STS` `rb=0`.
+    let idx = 0x01d0 / 16;
+    let d = dec70.decode(words[idx]).unwrap();
+    assert_eq!(d.mnemonic, "SHF");
+    let wait_mask = ((words[idx] >> crate::generated::special::WAIT) & 63) as u32;
+    assert_ne!(wait_mask, 63, "borrow wait must not serialize on all 6 scoreboards");
+    assert!(
+        d.writes.iter().any(|&(l, r)| l == LETTER_R && r == 25),
+        "expected p_callee+0x01d0 SHF to write borrowed R25, got {:?}",
+        d.writes
+    );
+    assert_eq!(
+        wait_mask, 0b111000,
+        "p_callee+0x01d0 wait mask must cover only R25's scoreboards (excluding SB0..SB2)"
+    );
 }

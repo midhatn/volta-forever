@@ -1996,7 +1996,7 @@ def waited_after(code, at, board):
     return False, at
 
 
-def schedule(mc, code, highest, sequences=frozenset(), borrowed=frozenset(), added=frozenset()):
+def schedule(mc, code, highest, sequences=frozenset(), borrowed=frozenset(), added=frozenset(), immediate_reads=frozenset()):
     """What does not hold of the schedule of the translated `code` of a function whose original uses
     registers up to `highest`: (offset, what) for each, and how many late readers were looked at.
     `sequences`: the offsets of the instructions that stand for matrix instructions, whose late
@@ -2028,7 +2028,7 @@ def schedule(mc, code, highest, sequences=frozenset(), borrowed=frozenset(), add
         # without the wait, unseen; the control `nowait` changed two Triton cubins so and was
         # objected to in neither. Not the rule below, the next instruction waiting: the homes of
         # uniform registers are read late and written again only much later.)
-        if d is not None and d.kind in machine.LATE and 16 * k in added and not any(
+        if d is not None and d.kind in machine.LATE and 16 * k in added and 16 * k not in immediate_reads and not any(
                 letter == 'R' and register > highest for letter, register, role in d.reads):
             mine = {register for letter, register, role in d.reads if letter == 'R' and register in borrowed}
             boards = {sb for sb in ((w >> WRITE_BARRIER) & 7, (w >> READ_BARRIER) & 7) if sb != 7}
@@ -2043,8 +2043,8 @@ def schedule(mc, code, highest, sequences=frozenset(), borrowed=frozenset(), add
                     late += 1
                     out.append((16 * k, 'reads late a register that the translation borrows, and the instruction at 0x%x writes it before a wait until it has read' % (16 * j)))
                     break
-        if d is not None and d.kind in machine.LATE and any(
-                letter == 'R' and register > highest for letter, register, role in d.reads):
+        if d is not None and d.kind in machine.LATE and (
+                16 * k in immediate_reads or any(letter == 'R' and register > highest for letter, register, role in d.reads)):
             late += 1
             # (Instructions that do nothing and do not wait may come between, where the schedule
             # needed more time than a stall count holds.)
@@ -4977,7 +4977,8 @@ def main():
                     problems.append('%s (from 0x%x): U: R%d is declared put away at this instruction, and nothing of its sequence puts it away' % (name[:40], at, r))
         # ---- schedule check (deferred from above: needs borrowed_regs) ----
         wrong, late = schedule(mc, result_code, highest, sequences, borrowed_regs,
-                               {new70 for new70, old75, what in listing if what != 'same'})
+                               {new70 for new70, old75, what in listing if what != 'same'},
+                               {new70 for new70, old75, what in listing if what in ('on the sum', 'on the uniform part', 'on the product')})
         kinds['(schedule) instructions that read late a register of the translation'] += late
         for at, what in wrong:
             problems.append('%s+0x%x: %s: %s' % (name[:40], at, what, tb[at // 16]))
@@ -5197,6 +5198,7 @@ def main():
                 # R3b: for each instruction that has a pool or home declaration, the first
                 # instruction of its sequence waits for every scoreboard any instruction of
                 # the function names for a write into, or a late read of, that register.
+                what_at_off = {n: what for n, _, what in listing}
                 boards_of = {}         # {register: set of scoreboards}
                 for k, w in enumerate(words70):
                     d70 = mc.decode(70, w)
@@ -5207,9 +5209,19 @@ def main():
                     for l, r in d70.writes:
                         if l == 'R' and r in B and wb != 7:
                             boards_of.setdefault(r, set()).add(wb)
-                    for l, r, *_ in d70.reads:
-                        if l == 'R' and r in B and rb != 7:
-                            boards_of.setdefault(r, set()).add(rb)
+                    what_k = what_at_off.get(16 * k)
+                    immediate_late = (
+                        what_k is not None
+                        and what_k != 'same'
+                        and d70.kind != 'BRU'
+                        and rb != 7
+                        and waited_after(result_code, 16 * k, rb)[0]
+                        and (what_k in ('on the sum', 'on the uniform part', 'on the product', 'ordinary registers') or is_mem(what_k) or is_room(what_k))
+                    )
+                    if rb != 7 and not immediate_late:
+                        for l, r, *_ in d70.reads:
+                            if l == 'R' and r in B:
+                                boards_of.setdefault(r, set()).add(rb)
                 borrows_at_old = {}       # {sm_75 offset: set of borrowed registers}
                 for u, r, offsets in homes_declared:
                     for at in offsets:

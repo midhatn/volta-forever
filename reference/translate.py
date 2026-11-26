@@ -27,7 +27,7 @@ For each function (a `.text` section):
 MAP, if given, receives one line per instruction of the result (function, new offset, old offset,
 what was done), for validate.py.
 """
-import collections, os, re, struct, sys
+import collections, copy, os, re, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import elf
 import ampere
@@ -42,7 +42,7 @@ class Refused(Exception):
 
 class Item:
     """One instruction of the result."""
-    __slots__ = ('word', 'origin', 'first', 'changed', 'what', 'target', 'fix', 'd', 'late', 'then', 'also', 'says', 'borrows', 'covered', 'more_reads', 'more_writes', 'anew')
+    __slots__ = ('word', 'origin', 'first', 'changed', 'what', 'target', 'fix', 'd', 'late', 'then', 'also', 'says', 'borrows', 'borrow_wait', 'covered', 'more_reads', 'more_writes', 'anew')
 
     def __init__(self, word, origin, what, changed=True, first=False):
         self.word, self.origin, self.what, self.changed, self.first = word, origin, what, changed, first
@@ -51,6 +51,7 @@ class Item:
         self.also = []          # others it waits for too (borrowed registers: `Function.translate`)
         self.says = False       # an instruction of the program made to say when it has read (the same)
         self.borrows = ()       # the borrowed registers that the sequence it is part of writes for the translation
+        self.borrow_wait = False
         self.covered = False    # its result is waited for with that of a later instruction of its sequence
         self.anew = False       # of code for sm_80: the distances that the program had are not those Volta needs
         # What it reads and writes besides what its operands say: the predicates that P2R saves
@@ -448,6 +449,24 @@ class Borrowed:
         # (`top`: the highest register that may be taken. The function's own highest; or, with
         # a budget, registers above it too, which hold nothing anywhere.)
         self.top = f.highest if top is None else max(top, f.highest)
+        late_read_counts = [0] * 256
+        board_costs = [0] * 256
+        for d in src:
+            wb = (d.word >> WRITE_BARRIER) & 7
+            rb = (d.word >> READ_BARRIER) & 7
+            w_cost = 4 if d.kind == 'MIO_SLOW' else 1
+            if wb < 7:
+                for r in {x for letter, x in d.writes if letter == 'R' and x < 255}:
+                    board_costs[r] += w_cost
+            if rb < 7:
+                for r in {x for letter, x, _ in d.reads if letter == 'R' and x < 255}:
+                    board_costs[r] += w_cost
+            if d.kind in MC.LATE and rb == 7:
+                seen = {x for letter, x, _ in d.reads if letter == 'R' and x < 255}
+                for r in seen:
+                    late_read_counts[r] += 1
+        self.late_read_counts = late_read_counts
+        self.board_costs = board_costs
         self.busy = [(b | never) & ((1 << 255) - 1) for b in busy]
         # To make room (`victims_at`): what each instruction reads or writes itself, the
         # registers that receive a result nothing announces, the function's highest register.
@@ -625,15 +644,19 @@ class Borrowed:
         return self._home_at[i].get(u) if 0 <= i < len(self._home_at) else None
 
     def free_at(self, i, width=1, given=0):
-        """The lowest register that holds nothing at instruction `i`, or the lowest run of `width`
-        registers from an even one: no home of a uniform register alive there, and not among
-        `given` (a mask: what the same instruction was given already). R0 and R1 never, and
-        nothing above the registers the function names. None when there is none."""
+        """The lowest register (or even-aligned run of `width`) holding nothing at `i`, capped at
+        min(highest, top) for levels 1/2 or `top` at level 3, avoiding late-read registers."""
         held, mask = self.busy[i] | self.taken[i] | given, (1 << width) - 1
-        for r in range(2, self.top + 2 - width, 1 if width == 1 else 2):
+        cap = self.top if self.everything else min(self.highest, self.top)
+        best = None
+        for r in range(2, cap + 2 - width, 1 if width == 1 else 2):
             if not held >> r & mask:
-                return r
-        return None
+                cost = sum(self.late_read_counts[r + k] + self.board_costs[r + k] for k in range(width))
+                if cost == 0:
+                    return r
+                if best is None or cost < best[0]:
+                    best = (cost, r)
+        return None if best is None else best[1]
 
     def victims_at(self, i, width, given=0):
         """Where no register holds nothing: the lowest register, or run of `width` from an even
@@ -1242,11 +1265,9 @@ class Function:
                         if r is not None:
                             written_homes.add(r)
             if self.borrow is not None and (i in self.pool_taken or at_instr or written_homes):
-                # It writes into a register of the program that holds nothing: what the program
-                # wrote there last may still be on its way (the words of a load that nothing
-                # reads), and would be written over what is put there now. Every
-                # scoreboard is waited for first. (Two cycles after whatever names one: `schedule`.)
-                new[0].word |= 63 << WAIT
+                # It writes into a register of the program that holds nothing: wait only for the
+                # scoreboards any instruction of the function writes or late-reads those registers on.
+                new[0].borrow_wait = True
                 mine = set(written_homes)
                 if i in self.pool_taken:
                     mine.update((self.pool_taken[i], self.pool_taken[i] + 1))
@@ -1317,6 +1338,35 @@ class Function:
             item.d = mc.decode(70, item.word)
             if item.d is None:
                 raise Refused('the translation of the instruction at 0x%x (%s) is not an sm_70 instruction: %032x' % (16 * item.origin, self.src[item.origin].c.name, item.word))
+        if self.borrow is not None and any(item.borrow_wait for item in items):
+            boards_of = [0] * 256
+            for item in items:
+                wb = (item.word >> WRITE_BARRIER) & 7
+                rb = (item.word >> READ_BARRIER) & 7
+                d70 = item.d
+                if wb < 7:
+                    bit = 1 << wb
+                    for l, r in d70.writes:
+                        if l == 'R' and r < 255:
+                            boards_of[r] |= bit
+                    if item.origin < len(self.src):
+                        for l, r in self.src[item.origin].writes:
+                            if l == 'R' and r < 255:
+                                boards_of[r] |= bit
+                if not item.late and item.what not in ('on the sum', 'on the uniform part', 'on the product') and rb < 7:
+                    bit = 1 << rb
+                    for l, r, *_ in d70.reads:
+                        if l == 'R' and r < 255:
+                            boards_of[r] |= bit
+            for item in items:
+                if item.borrow_wait:
+                    mask = 0
+                    for r in item.borrows:
+                        if r < 255:
+                            mask |= boards_of[r]
+                    if mask:
+                        item.word |= mask << WAIT
+                        item.d = mc.decode(70, item.word)
         if self.borrow is not None and self.borrow.used:
             used_regs = self.borrow.used
             for k, item in enumerate(items):
@@ -3123,7 +3173,7 @@ def translate(data, mc=None, listing=None, lives=None):
             for f in fs:
                 f.stand_ins()
             # The registers of the translation start after the last one any of them uses.
-            def attempt(pairs, companions=False, borrow=0, top=None):
+            def attempt(pairs, companions=False, borrow=0, top=None, pre_borrowed=None):
                 # (`borrow`: 2, the uniform registers that find a home in the function's own
                 # registers have it and the pool is taken there at each instruction; 1, the homes
                 # only, the pool above; 0, everything above, as it was.
@@ -3132,7 +3182,9 @@ def translate(data, mc=None, listing=None, lives=None):
                 for f in fs:
                     f.plan_pairs(pairs, companions)
                     f.borrow = None
-                if borrow:
+                if pre_borrowed is not None:
+                    fs[0].borrow = pre_borrowed
+                elif borrow:
                     # (A kernel alone: nothing else shares its registers. `Borrowed`.)
                     # (`VF_BORROW=3`, for tests: no homes, every uniform register in memory.)
                     fs[0].borrow = Borrowed(fs[0], all_in_memory=(borrow == 3 and BORROW in (3, 8)), top=top)
@@ -3278,25 +3330,7 @@ def translate(data, mc=None, listing=None, lives=None):
                     done = usual()
             elif BORROW in (7, 9) and alone:
                 # What 6 does, and a function with products may be translated at level 3.
-                # The chain: plain; levels 1, 2; level 3 with room and with products.
-                way = plain
-                try:
-                    done = way()
-                except Refused as why:
-                    if str(why) != 'more registers than there are':
-                        raise
-                    gave_up.append(str(why))
-                    done = None
-                    for way in (lambda: attempt(True, True, 1), lambda: attempt(True, True, 2), lambda: attempt(False, False, 3)):
-                        try:
-                            done = way()
-                            break
-                        except Refused as also:
-                            gave_up.append(str(also))
-                    if done is None:
-                        if os.environ.get('VF_BORROW_SAY'):
-                            print('  refused\t%s\t%s\tand with borrowed registers: %s' % (fs[0].name, why, '; '.join(gave_up[1:])), file=sys.stderr)
-                        raise why
+                # Before full L0 codegen, probe occupancy recovery once via Borrowed(f, False, None).
                 f = fs[0]
                 def snap_state(fn):
                     return (
@@ -3313,64 +3347,106 @@ def translate(data, mc=None, listing=None, lives=None):
                 def restore_state(fn, st):
                     (fn.borrow, fn.hold_at, fn.given_at, fn.spilled,
                      fn.lives, fn.held_lives, fn.items, fn.moved, fn.relocate) = st
-                best_f_state = snap_state(f)
                 info = e.section('.nv.info.' + f.name)
                 info_data = info.data if info is not None else b''
                 occ_limit = occupancy_target(f.registers, info_data)
-                normal_count = done[indices[0]][2]
-                best_warps = occupancy_warps(normal_count, info_data)
-                saves = f.save_slots
-                min_possible = f.highest + 3 + saves
-                if normal_count > occ_limit and occupancy_warps(min_possible, info_data) > best_warps and not relocations.get(indices[0]) and not f.tables:
-                    old_keys = set(done[indices[0]][1].keys())
-                    min_tier = occupancy_target(min_possible, info_data)
-                    tier = max(occ_limit, min_tier)
-                    tried_eff = set()
-                    while True:
-                        pool_extra = 2 if f.needs_pool else 0
-                        top_l2 = max(0, tier - 3 - saves)
-                        top_l1 = max(0, top_l2 - pool_extra)
-                        hit_occ_limit = False
-                        for level, bound in ((1, top_l1), (2, top_l2)):
-                            try_bounds = [bound]
-                            idx = 0
-                            while idx < len(try_bounds):
-                                bnd = try_bounds[idx]
-                                idx += 1
-                                eff_key = (level, max(bnd, f.highest))
-                                if eff_key in tried_eff:
-                                    continue
-                                tried_eff.add(eff_key)
+                target_warps = occupancy_warps(occ_limit, info_data)
+                done = None
+                best_f_state = None
+                if not relocations.get(indices[0]) and not f.tables:
+                    f.plan_pairs(True, True)
+                    rows = {}
+                    for rd, count in (f.q.rows() if f.q else {}).items():
+                        to = f.q.share.get(rd, rd)
+                        rows[to] = max(rows.get(to, 0), count)
+                    row_kept = [name for name in ROW_KEPT if f.q and name in f.q.kept()]
+                    beside = {}
+                    for root, count in (f.q.companion_registers() if f.q else {}).items():
+                        beside[root] = max(beside.get(root, 0), count)
+                    held_p = sorted(f.held_predicates)
+                    try:
+                        l0_placed = placement(f.highest + 1, sorted(f.uniform), f.pairs, f.needs_pool, f.save_slots,
+                                              f.needs_lane, f.scratch_need, f.has_product, rows, row_kept, beside, held_p)
+                    except Refused:
+                        l0_placed = None
+                    if l0_placed is not None:
+                        l0_count = l0_placed[7] + 2
+                        best_warps = occupancy_warps(l0_count, info_data)
+                        try:
+                            l2_floor = placement(f.highest + 1, [], set(), False, f.save_slots,
+                                                 f.needs_lane, f.scratch_need, f.has_product, rows, row_kept, beside, held_p)[7] + 2
+                        except Refused:
+                            l2_floor = 255
+                        if l0_count > occ_limit and occupancy_warps(l2_floor, info_data) > best_warps:
+                            try:
+                                pre_b = Borrowed(f, all_in_memory=False, top=None)
+                            except Refused:
+                                pre_b = None
+                            if pre_b is not None:
+                                max_b = max(pre_b.used, default=0)
+                                base = max(f.highest, max_b) + 1
+                                u_pl = [u for u in sorted(f.uniform) if u in pre_b.unhomed_u]
+                                p_pl = {u for u in f.pairs if u in pre_b.unhomed_pairs}
                                 try:
-                                    candidate = attempt(True, True, level, bnd)
+                                    c_l1 = placement(base, u_pl, p_pl, f.needs_pool, f.save_slots,
+                                                     f.needs_lane, f.scratch_need, f.has_product, rows, row_kept, beside, held_p)[7] + 2
+                                    w_l1 = occupancy_warps(c_l1, info_data)
                                 except Refused:
-                                    continue
-                                c_count = candidate[indices[0]][2]
-                                c_warps = occupancy_warps(c_count, info_data)
-                                if c_warps > best_warps and set(candidate[indices[0]][1].keys()) == old_keys:
-                                    done = candidate
-                                    best_warps = c_warps
-                                    best_f_state = snap_state(f)
-                                    if c_count <= occ_limit:
-                                        hit_occ_limit = True
-                                        break
-                                if c_count > tier and idx == 1 and c_count - tier <= bnd:
-                                    tighter = bnd - (c_count - tier)
-                                    if tighter not in try_bounds:
-                                        try_bounds.append(tighter)
-                            if hit_occ_limit:
+                                    w_l1 = 0
+                                if f.needs_pool and w_l1 < target_warps:
+                                    try:
+                                        c_l2 = placement(base, u_pl, p_pl, False, f.save_slots,
+                                                         f.needs_lane, f.scratch_need, f.has_product, rows, row_kept, beside, held_p)[7] + 2
+                                        w_l2 = occupancy_warps(c_l2, info_data)
+                                    except Refused:
+                                        w_l2 = 0
+                                else:
+                                    w_l2 = 0
+                                want_l2_after_l1 = f.needs_pool and w_l2 > max(w_l1, best_warps)
+                                expected_keys = len(f.src) + 1
+                                if w_l1 > best_warps:
+                                    try:
+                                        b_l1 = copy.copy(pre_b) if want_l2_after_l1 else pre_b
+                                        if want_l2_after_l1:
+                                            b_l1.used = set(pre_b.used)
+                                        cand = attempt(True, True, 1, None, b_l1)
+                                        cw = occupancy_warps(cand[indices[0]][2], info_data)
+                                        if cw > best_warps and len(cand[indices[0]][1]) == expected_keys:
+                                            done = cand
+                                            best_warps = cw
+                                            best_f_state = snap_state(f)
+                                    except Refused:
+                                        pass
+                                if f.needs_pool and best_warps < target_warps and w_l2 > best_warps:
+                                    try:
+                                        cand = attempt(True, True, 2, None, pre_b)
+                                        cw = occupancy_warps(cand[indices[0]][2], info_data)
+                                        if cw > best_warps and len(cand[indices[0]][1]) == expected_keys:
+                                            done = cand
+                                            best_warps = cw
+                                            best_f_state = snap_state(f)
+                                    except Refused:
+                                        pass
+                if done is None:
+                    way = plain
+                    try:
+                        done = way()
+                    except Refused as why:
+                        if str(why) != 'more registers than there are':
+                            raise
+                        gave_up.append(str(why))
+                        done = None
+                        for way in (lambda: attempt(True, True, 1), lambda: attempt(True, True, 2), lambda: attempt(False, False, 3)):
+                            try:
+                                done = way()
                                 break
-                        if hit_occ_limit:
-                            break
-                        next_tier = None
-                        for probe in range(tier + 1, normal_count):
-                            if occupancy_warps(probe, info_data) > best_warps:
-                                next_tier = occupancy_target(probe, info_data)
-                                break
-                        if next_tier is not None and next_tier > tier and next_tier < normal_count:
-                            tier = next_tier
-                        else:
-                            break
+                            except Refused as also:
+                                gave_up.append(str(also))
+                        if done is None:
+                            if os.environ.get('VF_BORROW_SAY'):
+                                print('  refused\t%s\t%s\tand with borrowed registers: %s' % (fs[0].name, why, '; '.join(gave_up[1:])), file=sys.stderr)
+                            raise why
+                    best_f_state = snap_state(f)
                 if BORROW == 9:
                     limit = graph_register_budget(f.registers, info_data)
                     if done[indices[0]][2] > limit and not relocations.get(indices[0]) and not f.tables:

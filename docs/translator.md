@@ -859,8 +859,8 @@ on a V100 with 510 hand-made sm_70 kernels (three runs each, one warp):
 
 **What this means for borrowed registers.** Before the translation writes into
 a register it borrows, every instruction of the program that wrote that register
-on a scoreboard must have been waited for (the first write waits for all six
-scoreboards). A register that some instruction of the function writes late under
+on a scoreboard must have been waited for (the first write waits for the
+scoreboards that write or late-read that register, rather than all six). A register that some instruction of the function writes late under
 no scoreboard, or by arithmetic on doubles, or by a matrix product, is never
 borrowed: nothing can be waited for, and the distance across a branch is not
 known. On PyTorch, 161 homes fewer of 12,109 (`reference/translate.py`,

@@ -852,9 +852,9 @@ def patched(control):
                 if u in self._mem_regs and u + 1 in self._mem_regs:
                     r = self._mem_regs[u]
                     if r % 2 == 0:
-                        # Shift to odd: use r+1 and r+2 instead of r and r+1
+                        # Shift to odd inside [2, top]: r+1..r+2 unless r+2 exceeds top.
                         old_r, old_r1 = self._mem_regs[u], self._mem_regs[u + 1]
-                        new_r = r + 1
+                        new_r = r - 1 if r + 2 > self.borrow.top and r >= 3 else r + 1
                         self._mem_regs[u] = new_r
                         self._mem_regs[u + 1] = new_r + 1
                         for item in items:
@@ -1524,9 +1524,10 @@ def run(mc, control, path, out_dir, untouched, validated=True):
         def no_wait_finish(self):
             if self.borrow is not None:
                 for item in self.items:
-                    if item.first and item.changed and (item.word >> WAIT) & 63 == 63:
+                    if item.first and item.changed and item.borrows:
                         src_wait = (self.src[item.origin].word >> WAIT) & 63
-                        item.word = (item.word & ~(63 << WAIT)) | (src_wait << WAIT)
+                        if (item.word >> WAIT) & 63 != src_wait:
+                            item.word = (item.word & ~(63 << WAIT)) | (src_wait << WAIT)
             return orig_finish_nbw(self)
         originals['finish'] = Function.finish
         Function.finish = no_wait_finish
@@ -1747,14 +1748,13 @@ def run(mc, control, path, out_dir, untouched, validated=True):
                 has_mem = any(w.startswith('mem:') for _, w in parts)
                 if has_mem:
                     continue
-                # Clear the 63-wait from every instruction of this sequence.
+                # Clear any borrow wait from every instruction of this sequence.
                 for new_off, what in sorted(parts):
                     word = int.from_bytes(data[new_off:new_off+16], 'little')
-                    if (word >> WAIT) & 63 == 63:
+                    if (word >> WAIT) & 63 != 0:
                         word &= ~(63 << WAIT)
                         data[new_off:new_off+16] = word.to_bytes(16, 'little')
                         changed = True
-                        break
                 if changed:
                     break
             if changed:
@@ -1922,10 +1922,10 @@ def run(mc, control, path, out_dir, untouched, validated=True):
                 has_mem = any(w.startswith('mem: ') for _, w in parts)
                 if not has_mem:
                     continue
-                # Clear the 63 << WAIT from EVERY instruction of the sequence.
+                # Clear borrowed waits from EVERY instruction of the sequence.
                 for new, w in sorted(parts):
                     word = int.from_bytes(data[new:new + 16], 'little')
-                    if (word >> WAIT) & 63 == 63:
+                    if (word >> WAIT) & 63 != 0:
                         word &= ~(63 << WAIT)
                         data[new:new + 16] = word.to_bytes(16, 'little')
             section.data = bytes(data)
