@@ -44,17 +44,95 @@ SEND = 60.0
 _work = {"path": None, "fd": None}
 
 
-def layer_takes(cubin):
-    """(None, False) when the layer's tool retargets the PTX that the cubin keeps, with no kernel
-    refused and no function made to trap, else (why not, whether that may be otherwise another
-    time: the tool did not run, or failed). The tool reads the switches of the layer (VF_*) as
-    the layer does."""
+_adapt_worker = {"proc": None, "key": None, "unsupported": set()}
+
+
+def _close_worker_proc(proc):
+    for s in (proc.stdin, proc.stdout, proc.stderr):
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+def _stop_adapt_worker():
+    proc = _adapt_worker.get("proc")
+    _adapt_worker["proc"] = None
+    _adapt_worker["key"] = None
+    if proc is None:
+        return
+    try:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=0.5)
+    except Exception:  # noqa: BLE001
+        try:
+            proc.kill()
+            proc.wait(timeout=0.5)
+        except Exception:  # noqa: BLE001
+            pass
+    _close_worker_proc(proc)
+
+
+def _read_exact(stream, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            raise EOFError("short read from vf-translate adapt-worker")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _ensure_adapt_worker(tool, env):
+    import subprocess
+    key = (tool, tuple(sorted(env.items())))
+    if tool in _adapt_worker["unsupported"]:
+        return None
+    proc = _adapt_worker["proc"]
+    if proc is not None and _adapt_worker["key"] == key and proc.poll() is None:
+        return proc
+    _stop_adapt_worker()
+    try:
+        proc = subprocess.Popen(
+            [tool, "adapt-worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            close_fds=True,
+        )
+        hdr = proc.stdout.read(4)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if hdr != b"VFAW":
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=0.5)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+                proc.wait(timeout=0.5)
+            except Exception:  # noqa: BLE001
+                pass
+        _close_worker_proc(proc)
+        _adapt_worker["unsupported"].add(tool)
+        return None
+    _adapt_worker["proc"] = proc
+    _adapt_worker["key"] = key
+    return proc
+
+
+def _layer_takes_oneshot(tool, env, cubin):
     import subprocess
     import tempfile
-    tool = _core._tool()
-    if tool is None:
-        return "the layer's tool vf-translate was not found", True
-    env = {k: v for k, v in os.environ.items() if k not in ("VF_LOG", "VF_LOG_LEVEL", "LD_AUDIT", "LD_PRELOAD")}
     with tempfile.TemporaryDirectory(prefix="vf-triton-") as d:
         path = os.path.join(d, "kernel.cubin")
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _client._O_CLOEXEC, 0o600)
@@ -75,6 +153,39 @@ def layer_takes(cubin):
         if s.startswith("refused") or s.startswith("trap:"):
             return "the layer would not run it all: %s" % s[:300], False
     return None, False
+
+
+def layer_takes(cubin):
+    """(None, False) when the layer's tool retargets the PTX that the cubin keeps, with no kernel
+    refused and no function made to trap, else (why not, whether that may be otherwise another
+    time: the tool did not run, or failed). The tool reads the switches of the layer (VF_*) as
+    the layer does."""
+    import struct
+    tool = _core._tool()
+    if tool is None:
+        return "the layer's tool vf-translate was not found", True
+    env = {k: v for k, v in os.environ.items() if k not in ("VF_LOG", "VF_LOG_LEVEL", "LD_AUDIT", "LD_PRELOAD")}
+    proc = _ensure_adapt_worker(tool, env)
+    if proc is None:
+        return _layer_takes_oneshot(tool, env, cubin)
+    try:
+        proc.stdin.write(struct.pack("<Q", len(cubin)))
+        proc.stdin.write(cubin)
+        proc.stdin.flush()
+        status_hdr = _read_exact(proc.stdout, 5)
+        status = status_hdr[0]
+        msg_len = struct.unpack("<I", status_hdr[1:5])[0]
+        msg = _read_exact(proc.stdout, msg_len).decode("utf-8", "replace") if msg_len else ""
+    except (OSError, EOFError, struct.error):
+        _stop_adapt_worker()
+        return _layer_takes_oneshot(tool, env, cubin)
+    if status == 0:
+        return None, False
+    if status == 1:
+        return "the layer would not run it all: %s" % msg[:300], False
+    if status == 2:
+        return "the layer's tool failed: %s" % msg[:300], True
+    return "the layer would not retarget its PTX: %s" % msg[:300], False
 
 
 def _parse(text, context, suffix):
@@ -340,6 +451,7 @@ def _end_children():
     import glob
     import signal
     import time
+    _stop_adapt_worker()
     kids = set()
     for path in glob.glob("/proc/self/task/*/children"):
         try:

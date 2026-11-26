@@ -107,28 +107,32 @@ fn extract(path: &str, dir: &str, only_sm: Option<u32>) -> Result<(), String> {
 }
 
 /// The kernels without code (`vf_adapt::Stubs`): what the layer does with each.
-fn print_stubs(stubs: &vf_adapt::Stubs) {
+fn push_stubs(stubs: &vf_adapt::Stubs, lines: &mut Vec<String>) {
     for kernel in &stubs.trap_only {
-        println!("  without code (a trap): {kernel}: given at a lookup, its launch is refused");
+        lines.push(format!(
+            "  without code (a trap): {kernel}: given at a lookup, its launch is refused"
+        ));
     }
     for kernel in &stubs.empty {
-        println!("  empty: {kernel}");
+        lines.push(format!("  empty: {kernel}"));
     }
 }
 
-fn adapt(input: &str, output: &str) -> Result<(), String> {
-    let bytes = std::fs::read(input).map_err(|e| format!("{input}: {e}"))?;
-    let policy = Policy::default().with_environment();
-    let adapted = if bytes.starts_with(&fatbin::MAGIC.to_le_bytes()) {
-        let fat = fatbin::parse(&bytes).map_err(|e| format!("{input}: {e}"))?;
-        policy.adapt_fatbin(&fat).map_err(|e| format!("{input}: {e}"))?
-    } else if fatbin::is_elf(&bytes) {
-        policy.adapt_cubin(&bytes)
+fn adapt_bytes(label: &str, bytes: &[u8], policy: &Policy) -> Result<vf_adapt::Adapted, String> {
+    if bytes.starts_with(&fatbin::MAGIC.to_le_bytes()) {
+        let fat = fatbin::parse(bytes).map_err(|e| format!("{label}: {e}"))?;
+        policy.adapt_fatbin(&fat).map_err(|e| format!("{label}: {e}"))
+    } else if fatbin::is_elf(bytes) {
+        Ok(policy.adapt_cubin(bytes))
     } else {
-        policy.adapt_ptx(&bytes)
-    };
-    match &adapted.outcome {
-        Outcome::Native => println!("{input}: already holds code for sm_{}; copied", policy.device_sm),
+        Ok(policy.adapt_ptx(bytes))
+    }
+}
+
+fn format_adapt_lines(label: &str, outcome: &Outcome, device_sm: u32) -> Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+    match outcome {
+        Outcome::Native => lines.push(format!("{label}: already holds code for sm_{device_sm}; copied")),
         Outcome::Retargeted {
             entries,
             from_sm,
@@ -141,44 +145,49 @@ fn adapt(input: &str, output: &str) -> Result<(), String> {
             reported,
             stubs,
         } => {
-            println!(
-                "{input}: PTX for sm_{from_sm} retargeted to sm_{} ({entries} modules, {tensor_rewritten} \
-                 tensor-core instructions rewritten, {tanh_expanded} tanh expanded, {} functions made to trap, \
-                 {} instructions in {} functions replaced by reported traps)",
-                policy.device_sm,
+            lines.push(format!(
+                "{label}: PTX for sm_{from_sm} retargeted to sm_{device_sm} ({entries} modules, {tensor_rewritten} tensor-core instructions rewritten, {tanh_expanded} tanh expanded, {} functions made to trap, {} instructions in {} functions replaced by reported traps)",
                 trapped.len(),
                 replaced.iter().map(|function| function.forms.len()).sum::<usize>(),
                 replaced.len()
-            );
+            ));
             for function in trapped {
-                println!("  trap: {}: {}", function.function, function.reason);
+                lines.push(format!("  trap: {}: {}", function.function, function.reason));
             }
             for kernel in refused {
-                println!(
+                lines.push(format!(
                     "  refused kernel: {} ({}: {})",
                     kernel.kernel, kernel.function, kernel.reason
-                );
+                ));
             }
             for kernel in emulated {
-                println!("  emulated in kernel: {}: {}", kernel.kernel, kernel.counts.summary());
+                lines.push(format!(
+                    "  emulated in kernel: {}: {}",
+                    kernel.kernel,
+                    kernel.counts.summary()
+                ));
             }
             for function in replaced {
                 let mut forms: Vec<&str> = function.forms.iter().map(String::as_str).collect();
                 forms.sort_unstable();
                 forms.dedup();
-                println!(
+                lines.push(format!(
                     "  reported trap: {}: {} instructions ({})",
                     function.function,
                     function.forms.len(),
                     forms.join(", ")
-                );
+                ));
             }
             for kernel in reported {
                 // What the layer gives in a process where no GPU can take part in multicast
                 // (`vf_ptx::lower::Options::reported_traps`); elsewhere the kernel is refused.
-                println!("  given with reported traps: {}: {}", kernel.kernel, kernel.summary());
+                lines.push(format!(
+                    "  given with reported traps: {}: {}",
+                    kernel.kernel,
+                    kernel.summary()
+                ));
             }
-            print_stubs(stubs);
+            push_stubs(stubs, &mut lines);
         }
         Outcome::Translated {
             entries,
@@ -189,29 +198,102 @@ fn adapt(input: &str, output: &str) -> Result<(), String> {
             stubs,
             ..
         } => {
-            println!(
-                "{input}: machine code for sm_{from_sm} translated to sm_{} ({entries} modules, {functions} \
-                 functions, {} refused, {} with instructions added)",
-                policy.device_sm,
+            lines.push(format!(
+                "{label}: machine code for sm_{from_sm} translated to sm_{device_sm} ({entries} modules, {functions} functions, {} refused, {} with instructions added)",
                 refused.len(),
                 emulated.len()
-            );
+            ));
             for kernel in refused {
-                println!("  refused: {}: {}", kernel.kernel, kernel.reason);
+                lines.push(format!("  refused: {}: {}", kernel.kernel, kernel.reason));
             }
-            print_stubs(stubs);
+            push_stubs(stubs, &mut lines);
         }
         Outcome::NotTranslated { from_sm, reason } => {
             return Err(format!(
-                "{input}: machine code for sm_{from_sm} that could not be read: {reason}"
+                "{label}: machine code for sm_{from_sm} that could not be read: {reason}"
             ));
         }
         Outcome::NeedsTranslation { lowest_sm } => {
             return Err(format!(
-                "{input}: machine code for sm_{lowest_sm} and later only: needs translation"
+                "{label}: machine code for sm_{lowest_sm} and later only: needs translation"
             ));
         }
-        Outcome::Unknown => return Err(format!("{input}: not a fat binary, a cubin or PTX text")),
+        Outcome::Unknown => return Err(format!("{label}: not a fat binary, a cubin or PTX text")),
+    }
+    Ok(lines)
+}
+
+fn check_retargeted_cubin(bytes: &[u8], policy: &Policy) -> (u8, String) {
+    let lines = match adapt_bytes("<worker>", bytes, policy)
+        .and_then(|adapted| format_adapt_lines("<worker>", &adapted.outcome, policy.device_sm))
+    {
+        Ok(lines) => lines,
+        Err(message) => return (2, format!("vf-translate: {message}")),
+    };
+    let Some(header) = lines.first() else {
+        return (2, "vf-translate: <worker>: empty outcome".to_string());
+    };
+    if !header.contains("PTX for sm_80 retargeted") {
+        return (3, lines.join("\n"));
+    }
+    for line in &lines[1..] {
+        let s = line.trim();
+        if s.starts_with("refused") || s.starts_with("trap:") {
+            return (1, s.to_string());
+        }
+    }
+    (0, String::new())
+}
+
+fn adapt_worker_io(
+    mut reader: impl std::io::Read,
+    mut writer: impl std::io::Write,
+    policy: &Policy,
+) -> Result<(), String> {
+    writer
+        .write_all(b"VFAW")
+        .map_err(|e| format!("adapt-worker stdout: {e}"))?;
+    writer.flush().map_err(|e| format!("adapt-worker stdout: {e}"))?;
+    let mut len_buf = [0u8; 8];
+    loop {
+        match reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(format!("adapt-worker stdin: {e}")),
+        }
+        let len = u64::from_le_bytes(len_buf);
+        if len > 512 * 1024 * 1024 {
+            return Err(format!("adapt-worker: input too large ({len} bytes)"));
+        }
+        let mut bytes = vec![0u8; len as usize];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|e| format!("adapt-worker stdin: {e}"))?;
+        let (status, msg) = check_retargeted_cubin(&bytes, policy);
+        let msg_bytes = msg.as_bytes();
+        let msg_len = u32::try_from(msg_bytes.len()).unwrap_or(u32::MAX);
+        writer
+            .write_all(&[status])
+            .and_then(|()| writer.write_all(&msg_len.to_le_bytes()))
+            .and_then(|()| writer.write_all(&msg_bytes[..msg_len as usize]))
+            .and_then(|()| writer.flush())
+            .map_err(|e| format!("adapt-worker stdout: {e}"))?;
+    }
+}
+
+fn adapt_worker() -> Result<(), String> {
+    let policy = Policy::default().with_environment();
+    let stdin = std::io::stdin().lock();
+    let stdout = std::io::stdout().lock();
+    adapt_worker_io(stdin, stdout, &policy)
+}
+
+fn adapt(input: &str, output: &str) -> Result<(), String> {
+    let bytes = std::fs::read(input).map_err(|e| format!("{input}: {e}"))?;
+    let policy = Policy::default().with_environment();
+    let adapted = adapt_bytes(input, &bytes, &policy)?;
+    for line in format_adapt_lines(input, &adapted.outcome, policy.device_sm)? {
+        println!("{line}");
     }
     std::fs::write(output, adapted.image.as_deref().unwrap_or(&bytes)).map_err(|e| format!("{output}: {e}"))
 }
@@ -284,6 +366,7 @@ fn main() -> ExitCode {
             Err(_) => Err(format!("{sm}: not an architecture (75 or sm_75)")),
         },
         ["adapt", input, output] => adapt(input, output),
+        ["adapt-worker"] => adapt_worker(),
         ["translate", input, output] => translate(input, output, None, None),
         ["translate", input, output, map] => translate(input, output, Some(map), None),
         ["translate", input, output, map, report] => translate(input, output, Some(map), Some(report)),
@@ -355,5 +438,62 @@ mod tests {
             "k_generic_index\t0\t2\tfree\tb0,c0,d0,e0,f0,100\nk_generic\t0\t0\tfree\t30,40,50,60,70,80\n"
         );
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn adapt_worker_checks_inputs_without_disk_io() {
+        let policy = Policy::default();
+        let fixture = include_bytes!("../../vf-fatbin/tests/data/elf75-ptx75-zstd.fatbin");
+        let fat = fatbin::parse(fixture).unwrap();
+        let ptx = fat.entries.iter().find(|e| e.kind() == KIND_PTX).unwrap();
+        let ok_ptx = b".version 8.0\n.target sm_80\n.address_size 64\n.visible .entry k() { ret; }\n";
+        let bad_ptx =
+            b".version 8.0\n.target sm_80\n.address_size 64\n.visible .entry bad() { barrier.cluster.arrive; ret; }\n";
+        let fat_ok = fatbin::build(&[NewEntry::replace(ptx, ok_ptx.to_vec(), 80, (8, 0))]);
+        let fat_bad = fatbin::build(&[NewEntry::replace(ptx, bad_ptx.to_vec(), 80, (8, 0))]);
+        let fat_75 = fatbin::build(&[NewEntry::replace(
+            ptx,
+            b".version 8.0\n.target sm_75\n.address_size 64\n.visible .entry k() { ret; }\n".to_vec(),
+            75,
+            (8, 0),
+        )]);
+
+        let empty: Vec<u8> = Vec::new();
+        let corrupt = b"\x7fELFgarbage".to_vec();
+        let sm75_cubin = include_bytes!("../../../tests/kernels/translate/k_memory.sm75.cubin").to_vec();
+        let mut req = Vec::new();
+        for item in [&empty, &fat_ok, &corrupt, &fat_bad, &fat_75, &sm75_cubin] {
+            req.extend_from_slice(&(item.len() as u64).to_le_bytes());
+            req.extend_from_slice(item);
+        }
+
+        let mut resp = Vec::new();
+        adapt_worker_io(req.as_slice(), &mut resp, &policy).unwrap();
+        assert_eq!(&resp[..4], b"VFAW");
+        let mut off = 4usize;
+        let mut results = Vec::new();
+        while off < resp.len() {
+            let status = resp[off];
+            let mlen = u32::from_le_bytes(resp[off + 1..off + 5].try_into().unwrap()) as usize;
+            let msg = std::str::from_utf8(&resp[off + 5..off + 5 + mlen]).unwrap().to_string();
+            results.push((status, msg));
+            off += 5 + mlen;
+        }
+        assert_eq!(results.len(), 6);
+        assert_eq!(results[0].0, 2);
+        assert!(results[0].1.contains("not a fat binary"), "{:?}", results[0]);
+        assert_eq!(results[1], (0, String::new()));
+        assert_eq!(results[2].0, 2);
+        assert!(results[2].1.contains("not a fat binary"), "{:?}", results[2]);
+        assert_eq!(results[3].0, 1);
+        assert!(results[3].1.starts_with("trap:"), "{:?}", results[3]);
+        assert_eq!(results[4].0, 3);
+        assert!(results[4].1.contains("PTX for sm_75 retargeted"), "{:?}", results[4]);
+        assert_eq!(results[5].0, 3);
+        assert!(
+            results[5].1.contains("machine code for sm_75 translated"),
+            "{:?}",
+            results[5]
+        );
     }
 }

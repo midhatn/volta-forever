@@ -2611,6 +2611,78 @@ class Module(Base):
             else:
                 os.environ["VOLTA_FOREVER_HOME"] = saved
 
+    def test_layer_takes_adapt_worker_reuses_process_and_stops(self):
+        import importlib.util
+        tool = ROOT / "dist/bin/vf-translate"
+        if not tool.is_file():
+            self.skipTest("vf-translate not built")
+        # Use standalone helper copy pointing at dist/bin/vf-translate.
+        (self.home / "bin/vf-translate").unlink(missing_ok=True)
+        (self.home / "bin/vf-translate").symlink_to(tool)
+        spec = importlib.util.spec_from_file_location("vft_helper_worker", str(self.home / "python/volta_forever_triton_helper.py"))
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        bad_img = b".version 8.0\n.target sm_80\n.address_size 64\n.visible .entry bad() { barrier.cluster.arrive; ret; }\n"
+        try:
+            proc = helper._ensure_adapt_worker(str(self.home / "bin/vf-translate"), dict(os.environ))
+            self.assertIsNotNone(proc)
+            pid = proc.pid
+            r1 = helper.layer_takes(bad_img)
+            self.assertIsNotNone(r1[0])
+            self.assertFalse(r1[1])
+            self.assertIs(helper._adapt_worker["proc"], proc)
+            r2 = helper.layer_takes(bad_img)
+            self.assertEqual(r1, r2)
+            self.assertEqual(helper._adapt_worker["proc"].pid, pid)
+        finally:
+            helper._end_children()
+        self.assertIsNone(helper._adapt_worker["proc"])
+
+    def test_layer_takes_worker_matches_oneshot_parity(self):
+        import importlib.util
+        tool = ROOT / "dist/bin/vf-translate"
+        if not tool.is_file():
+            self.skipTest("vf-translate not built")
+        (self.home / "bin/vf-translate").unlink(missing_ok=True)
+        (self.home / "bin/vf-translate").symlink_to(tool)
+        spec = importlib.util.spec_from_file_location("vft_helper_parity", str(self.home / "python/volta_forever_triton_helper.py"))
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        ptx_ok = b".version 8.0\n.target sm_80\n.address_size 64\n.visible .entry k() { ret; }\n"
+        ptx_75 = b".version 8.0\n.target sm_75\n.address_size 64\n.visible .entry k() { ret; }\n"
+        ptx_70 = b".version 8.0\n.target sm_70\n.address_size 64\n.visible .entry k() { ret; }\n"
+        ptx_trap_and_refused = b".version 8.8\n.target sm_80\n.address_size 64\n.visible .entry bad() { barrier.cluster.arrive; ret; }\n"
+        sm75_cubin = (ROOT / "tests/kernels/translate/k_memory.sm75.cubin").read_bytes()
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("VF_LOG", "VF_LOG_LEVEL", "LD_AUDIT", "LD_PRELOAD")}
+        cases = [
+            ("empty", b""),
+            ("corrupt_elf", b"\x7fELFgarbage"),
+            ("plain_text", b"not ptx or elf"),
+            ("ptx_sm70", ptx_70),
+            ("ptx_sm75", ptx_75),
+            ("ptx_sm80_ok", ptx_ok),
+            ("ptx_sm80_trap_precedence", ptx_trap_and_refused),
+            ("cubin_sm75", sm75_cubin),
+        ]
+        try:
+            proc = helper._ensure_adapt_worker(str(self.home / "bin/vf-translate"), clean_env)
+            self.assertIsNotNone(proc)
+            pid = proc.pid
+            for name, payload in cases:
+                oneshot = helper._layer_takes_oneshot(str(self.home / "bin/vf-translate"), clean_env, payload)
+                worker = helper.layer_takes(payload)
+                self.assertEqual(worker[0] is None, oneshot[0] is None, f"{name}: {worker} vs {oneshot}")
+                self.assertEqual(worker[1], oneshot[1], f"{name}: transient mismatch {worker} vs {oneshot}")
+                if oneshot[0] is not None:
+                    self.assertEqual(worker[0].split(":", 1)[0], oneshot[0].split(":", 1)[0], f"{name}: {worker} vs {oneshot}")
+                    if oneshot[0].startswith("the layer would not run it all: "):
+                        self.assertEqual(worker[0], oneshot[0], f"{name}: {worker} vs {oneshot}")
+                self.assertIsNotNone(helper._adapt_worker["proc"], f"{name}: worker died")
+                self.assertEqual(helper._adapt_worker["proc"].pid, pid, f"{name}: worker restarted")
+        finally:
+            helper._end_children()
+        self.assertIsNone(helper._adapt_worker["proc"])
+
 
 
 
