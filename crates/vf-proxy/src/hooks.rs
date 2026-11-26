@@ -38,7 +38,7 @@ const INPUT_CUBIN: c_int = 0;
 const INPUT_PTX: c_int = 1;
 const INPUT_FATBINARY: c_int = 2;
 
-/// NVIDIA's implementation of a function, as a pointer of the given type; the call is counted.
+/// NVIDIA's implementation of a function, as a pointer of the given type; the call is counted when statistics are asked for.
 macro_rules! real {
     ($name:ident: $ty:ty) => {{
         if crate::config().stats {

@@ -246,9 +246,69 @@ def case(proxy, directory):
         sys.exit("\n".join(wrong))
 
 
+def cross_load(proxy, directory, step):
+    """Verify that lazy `cuLibraryLoadData` -> `cuLibraryGetModule` (`ensure_adapted`) and
+    `cuModuleLoadData` keep distinct retargeted `.p` cache entries per load policy."""
+    api = c.CDLL(proxy)
+    context, later = c.c_void_p(), c.c_void_p()
+    assert api.cuInit(0) == 0
+    assert api.cuCtxCreate_v2(c.byref(later), 0, 1) == 0
+    assert api.cuCtxCreate_v2(c.byref(context), 0, 0) == 0
+    ptx75 = c.CDLL(str(directory / "ptx75.so"))
+    cudart = c.CDLL(str(directory / "runtimes/libcudart.so.13"))
+    img = IMAGES["fat75-80"]
+    data = c.create_string_buffer(img, len(img))
+
+    def ask_ptx(client, handle):
+        value = c.c_int(-1)
+        assert client.attribute(api.cuFuncGetAttribute, c.byref(value), 5, handle) == 0
+        return value.value
+
+    if step == "warm-both":
+        # `libcudart.so.13` warms `cuModuleLoadData` (told 8.0, keep_sources=false).
+        mod = c.c_void_p()
+        assert cudart.load(api.cuModuleLoadData, c.byref(mod), data) == 0
+        assert api.cuModuleUnload(mod) == 0
+        # `ptx75.so` warms lazy `cuLibraryLoadData` (told 7.5, keep_sources=true).
+        lib = c.c_void_p()
+        assert ptx75.library(api.cuLibraryLoadData, c.byref(lib), data) == 0
+        assert api.cuLibraryUnload(lib) == 0
+    elif step == "warm-lib-only":
+        lib = c.c_void_p()
+        assert ptx75.library(api.cuLibraryLoadData, c.byref(lib), data) == 0
+        assert api.cuLibraryUnload(lib) == 0
+    elif step == "materialize-lib":
+        lib = c.c_void_p()
+        assert ptx75.library(api.cuLibraryLoadData, c.byref(lib), data) == 0
+        mod, f0, f1 = c.c_void_p(), c.c_void_p(), c.c_void_p()
+        assert api.cuLibraryGetModule(c.byref(mod), lib) == 0
+        assert api.cuModuleGetFunction(c.byref(f0), mod, b"b") == 0
+        got0 = ask_ptx(ptx75, f0)
+        assert api.cuCtxSetCurrent(later) == 0
+        assert api.cuModuleGetFunction(c.byref(f1), mod, b"b") == 0
+        got1 = ask_ptx(ptx75, f1)
+        assert api.cuCtxSetCurrent(context) == 0
+        assert api.cuLibraryUnload(lib) == 0
+        if (got0, got1) != (75, 80):
+            sys.exit(f"ptx75 library module PTX versions {(got0, got1)} != (75, 80)")
+    elif step == "check-cudart-mod":
+        mod, f0 = c.c_void_p(), c.c_void_p()
+        assert cudart.load(api.cuModuleLoadData, c.byref(mod), data) == 0
+        assert api.cuModuleGetFunction(c.byref(f0), mod, b"a") == 0
+        got0 = ask_ptx(cudart, f0)
+        assert api.cuModuleUnload(mod) == 0
+        if got0 != 80:
+            sys.exit(f"libcudart module PTX version {got0} != 80")
+    else:
+        sys.exit(f"unknown step {step}")
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[3] == "--case":
         case(sys.argv[1], Path(sys.argv[2]))
+        sys.exit(0)
+    if len(sys.argv) == 5 and sys.argv[3] == "--cross-load":
+        cross_load(sys.argv[1], Path(sys.argv[2]), sys.argv[4])
         sys.exit(0)
     if len(sys.argv) != 2:
         sys.exit("usage: python3 tests/proxy/ptx_version.py LIBCUDA (the layer's, as dist/lib/libcuda.so.1)")
@@ -286,6 +346,31 @@ if __name__ == "__main__":
             print(f"{'ok  ' if ok else 'FAIL'}  {label}")
             if not ok:
                 print("    " + (done.stderr.strip() or done.stdout.strip()).replace("\n", "\n    "))
+            failed |= not ok
+        # Cross-caller isolation: `cuModuleLoadData` vs lazy `cuLibraryLoadData` with different told policies.
+        for label, steps in (
+            ("cross-load warm-both -> materialize-lib", [("warm-both", False), ("materialize-lib", False)]),
+            ("cross-load warm-lib-only -> materialize-lib -> cudart-mod", [
+                ("warm-lib-only", False), ("materialize-lib", True), ("check-cudart-mod", False),
+            ]),
+        ):
+            cache = directory / f"cache-{label.replace(' ', '_')}"
+            step_env = {**base, "VF_CAPABILITY": "8.0", "VF_LAZY": "1", "VF_PROXY_CACHE": str(cache), "VF_TIMING": "1"}
+            ok, err = True, ""
+            for step, check_cached_ptx in steps:
+                done = subprocess.run(
+                    [sys.executable, __file__, proxy, str(directory), "--cross-load", step],
+                    env=step_env, capture_output=True, text=True,
+                )
+                if done.returncode != 0:
+                    ok, err = False, f"{step}: {done.stderr.strip() or done.stdout.strip()}"
+                    break
+                if check_cached_ptx and ("retargeted from the cache" not in done.stderr or "PTX retargeted in" in done.stderr):
+                    ok, err = False, f"{step}: expected cached retargeted PTX reuse, got:\n{done.stderr.strip()}"
+                    break
+            print(f"{'ok  ' if ok else 'FAIL'}  {label}")
+            if not ok:
+                print("    " + err.replace("\n", "\n    "))
             failed |= not ok
     print("FAIL PTX and binary versions" if failed else
           "PASS PTX and binary versions: retargeted code is said to be compiled from the program's PTX, by every way")

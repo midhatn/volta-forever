@@ -11,6 +11,9 @@
 //!   architecture of the PTX that was retargeted, which the program's kernels are said to be
 //!   compiled for (`hooks::versions`);
 //! - **sub-module PTX** for each independent kernel, stored when the kernel is first extracted;
+//! - **retargeted PTX/fatbin** (`.p`), the adapted image (LZ4-compressed) and its `Retargeted`
+//!   outcome so subsequent runs reuse the adapted image when materializing a deferred library or
+//!   loading a module or fat binary without re-running PTX lowering;
 //! - for an image that has machine code only, its **translation**: the image to load in its
 //!   place, with the kernels that are refused and those that have instructions added.
 //!
@@ -69,12 +72,44 @@ const STALE_TEMPORARY: std::time::Duration = std::time::Duration::from_secs(600)
 /// Names tried for a temporary file before a write gives up.
 const TEMPORARY_NAMES: usize = 16;
 
+/// Upper bound on an uncompressed retargeted image read from `.p` (1 GiB): NCCL 2.30.7 produces
+/// ~248 MB of adapted PTX, so corrupt length prefixes cannot request multi-GiB allocations.
+const MAX_RETARGETED_IMAGE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Re-scan the directory at least every `LIMIT_SCAN_WRITES` writes even when accumulated bytes stay
+/// small, so long runs eventually observe external writers without scanning on every cache write.
+const LIMIT_SCAN_WRITES: u64 = 512;
+
 static CACHE_STATE: OnceLock<Option<CacheState>> = OnceLock::new();
+
+#[derive(Default)]
+struct LimitState {
+    scanned_total: Option<u64>,
+    added_since_scan: u64,
+    writes_since_scan: u64,
+    scanning: bool,
+}
 
 struct CacheState {
     dir: PathBuf,
     max_bytes: u64,
     uid: u32,
+    limit: std::sync::Mutex<LimitState>,
+    #[cfg(test)]
+    limit_scans: std::sync::atomic::AtomicUsize,
+}
+
+impl CacheState {
+    fn new(dir: PathBuf, max_bytes: u64, uid: u32) -> Self {
+        Self {
+            dir,
+            max_bytes,
+            uid,
+            limit: std::sync::Mutex::new(LimitState::default()),
+            #[cfg(test)]
+            limit_scans: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
 }
 
 fn state() -> Option<&'static CacheState> {
@@ -92,7 +127,7 @@ fn state() -> Option<&'static CacheState> {
                 return None;
             }
             remove_stale_temporaries(&dir, uid);
-            Some(CacheState { dir, max_bytes, uid })
+            Some(CacheState::new(dir, max_bytes, uid))
         })
         .as_ref()
 }
@@ -361,11 +396,13 @@ fn checked_read(path: &Path, key: u128, uid: u32) -> Option<Vec<u8>> {
 
 /// Enforce the size limit by deleting the least recently modified files. Races are harmless:
 /// a file that another process deleted while we enumerate is simply gone.
-fn enforce_limit(cs: &CacheState) {
+fn enforce_limit(cs: &CacheState) -> u64 {
+    #[cfg(test)]
+    cs.limit_scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut entries: Vec<(PathBuf, u64, i64)> = Vec::new(); // (path, size, mtime)
     let mut total: u64 = 0;
     let Ok(readdir) = std::fs::read_dir(&cs.dir) else {
-        return;
+        return 0;
     };
     for entry in readdir.flatten() {
         let Ok(meta) = entry.metadata() else {
@@ -379,7 +416,7 @@ fn enforce_limit(cs: &CacheState) {
         entries.push((entry.path(), size, meta.mtime()));
     }
     if total <= cs.max_bytes {
-        return;
+        return total;
     }
     // Oldest first.
     entries.sort_by_key(|e| e.2);
@@ -391,6 +428,41 @@ fn enforce_limit(cs: &CacheState) {
             total = total.saturating_sub(*size);
         }
     }
+    total
+}
+
+/// Enforce the cache directory size limit incrementally after a successful write of `written`
+/// bytes, avoiding an O(N) directory scan per write while still bounding overrun and reacting
+/// when accumulated writes approach `max_bytes`.
+fn maybe_enforce_limit(cs: &CacheState, written: u64) {
+    let mut guard = cs.limit.lock().unwrap_or_else(|e| e.into_inner());
+    guard.added_since_scan = guard.added_since_scan.saturating_add(written);
+    guard.writes_since_scan = guard.writes_since_scan.saturating_add(1);
+    if guard.scanning {
+        return;
+    }
+    let periodic_bytes = (cs.max_bytes / 16).clamp(64 * 1024, 64 * 1024 * 1024);
+    let should_scan = match guard.scanned_total {
+        None => true,
+        Some(total) => {
+            total.saturating_add(guard.added_since_scan) > cs.max_bytes
+                || guard.added_since_scan >= periodic_bytes
+                || guard.writes_since_scan >= LIMIT_SCAN_WRITES
+        }
+    };
+    if !should_scan {
+        return;
+    }
+    guard.scanning = true;
+    drop(guard);
+
+    let total_after = enforce_limit(cs);
+
+    let mut guard = cs.limit.lock().unwrap_or_else(|e| e.into_inner());
+    guard.scanned_total = Some(total_after);
+    guard.added_since_scan = 0;
+    guard.writes_since_scan = 0;
+    guard.scanning = false;
 }
 
 // ---- manifest ------------------------------------------------------------------------------------
@@ -608,17 +680,23 @@ fn decode_manifest(data: &[u8]) -> Option<CachedManifest> {
 
 // ---- public API ----------------------------------------------------------------------------------
 
-/// A cache key for a module, computed from the original image and the current policy.
+/// A cache key for a module, computed from the original image and adaptation policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CacheKey {
     pub key: u128,
+}
+
+/// Compute the cache key for the given original image bytes and an explicit adaptation policy.
+pub fn key_for_policy(image: &[u8], policy: &vf_adapt::Policy) -> CacheKey {
+    CacheKey {
+        key: cache_hash(image, policy),
+    }
 }
 
 /// Compute the cache key for the given original image bytes, adapted by the policy of the load
 /// this thread is making (`images::policy`).
 pub fn key_for(image: &[u8]) -> CacheKey {
-    CacheKey {
-        key: cache_hash(image, &crate::images::policy()),
-    }
+    key_for_policy(image, &crate::images::policy())
 }
 
 /// File path for the manifest of a module.
@@ -661,10 +739,10 @@ pub fn enabled() -> bool {
 pub fn save_manifest(ck: &CacheKey, manifest: &CachedManifest) {
     let Some(cs) = state() else { return };
     let data = encode_manifest(manifest);
-    if let Err(e) = atomic_write(&manifest_path(cs, ck.key), &data, ck.key) {
-        log::trace(format_args!("cache: failed to write manifest: {e}"));
+    match atomic_write(&manifest_path(cs, ck.key), &data, ck.key) {
+        Ok(written) => maybe_enforce_limit(cs, written),
+        Err(e) => log::trace(format_args!("cache: failed to write manifest: {e}")),
     }
-    enforce_limit(cs);
 }
 
 /// Save a sub-module PTX to the cache. Enforces the size limit afterwards.
@@ -674,10 +752,10 @@ pub fn save_submodule(ck: &CacheKey, kernel_name: &str, ptx: &[u8]) {
     data.extend_from_slice(&(kernel_name.len() as u32).to_le_bytes());
     data.extend_from_slice(kernel_name.as_bytes());
     data.extend_from_slice(ptx);
-    if let Err(e) = atomic_write(&submodule_path(cs, ck.key, kernel_name), &data, ck.key) {
-        log::trace(format_args!("cache: failed to write sub-module for {kernel_name}: {e}"));
+    match atomic_write(&submodule_path(cs, ck.key, kernel_name), &data, ck.key) {
+        Ok(written) => maybe_enforce_limit(cs, written),
+        Err(e) => log::trace(format_args!("cache: failed to write sub-module for {kernel_name}: {e}")),
     }
-    enforce_limit(cs);
 }
 
 // ---- translations --------------------------------------------------------------------------------
@@ -943,7 +1021,18 @@ pub(crate) fn decode_retargeted(data: &[u8]) -> Option<vf_adapt::Adapted> {
             functions: take_usize(data, &mut pos)?,
         });
     }
-    let image = lz4_flex::decompress_size_prepended(data.get(pos..)?).ok()?;
+    let payload = data.get(pos..)?;
+    let raw_len = u32::from_le_bytes(payload.get(..4)?.try_into().ok()?) as usize;
+    if raw_len > MAX_RETARGETED_IMAGE_BYTES {
+        return None;
+    }
+    let mut image = Vec::new();
+    image.try_reserve_exact(raw_len).ok()?;
+    image.resize(raw_len, 0);
+    let written = lz4_flex::block::decompress_into(&payload[4..], &mut image).ok()?;
+    if written != raw_len {
+        return None;
+    }
     Some(vf_adapt::Adapted {
         outcome: vf_adapt::Outcome::Retargeted {
             entries,
@@ -988,10 +1077,10 @@ fn save_encoded(path: PathBuf, ck: &CacheKey, cs: &CacheState, data: &[u8], kind
     if data.len() > u32::MAX as usize {
         return;
     }
-    if let Err(e) = atomic_write(&path, data, ck.key) {
-        log::trace(format_args!("cache: failed to write {kind}: {e}"));
+    match atomic_write(&path, data, ck.key) {
+        Ok(written) => maybe_enforce_limit(cs, written),
+        Err(e) => log::trace(format_args!("cache: failed to write {kind}: {e}")),
     }
-    enforce_limit(cs);
 }
 
 /// Keep a translation for later runs (anything else is not kept). Enforces the size limit afterwards.
@@ -1399,11 +1488,7 @@ mod tests {
     fn size_limit_evicts_old_files() {
         let dir = test_dir("sizelimit");
         let uid = unsafe { libc::geteuid() };
-        let cs = CacheState {
-            dir: dir.clone(),
-            max_bytes: 200, // very small
-            uid,
-        };
+        let cs = CacheState::new(dir.clone(), 200, uid);
         // Write several files.
         for i in 0u128..10 {
             let path = dir.join(format!("f{i}.bin"));
@@ -1543,11 +1628,7 @@ mod tests {
 
         // File-level header + checksum round-trip rejects single-byte corruption too.
         let dir = test_dir("retargeted");
-        let cs = CacheState {
-            dir: dir.clone(),
-            max_bytes: DEFAULT_MAX_BYTES,
-            uid: unsafe { libc::geteuid() },
-        };
+        let cs = CacheState::new(dir.clone(), DEFAULT_MAX_BYTES, unsafe { libc::geteuid() });
         let path = retargeted_path(&cs, 0x1234_5678_9abc_def0);
         atomic_write(&path, &encoded, 0x1234_5678_9abc_def0).unwrap();
         let read_back = checked_read(&path, 0x1234_5678_9abc_def0, cs.uid).unwrap();
@@ -1556,6 +1637,107 @@ mod tests {
         *raw.last_mut().unwrap() ^= 1;
         std::fs::write(&path, raw).unwrap();
         assert!(checked_read(&path, 0x1234_5678_9abc_def0, cs.uid).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decode_retargeted_rejects_mismatched_and_oversized_length() {
+        let adapted = vf_adapt::Adapted {
+            outcome: vf_adapt::Outcome::Retargeted {
+                entries: 1,
+                from_sm: 75,
+                tensor_rewritten: 0,
+                tanh_expanded: 0,
+                trapped: Vec::new(),
+                refused: Vec::new(),
+                emulated: Vec::new(),
+                replaced: Vec::new(),
+                reported: Vec::new(),
+                stubs: vf_adapt::Stubs::default(),
+            },
+            image: Some(b"abc".to_vec()),
+        };
+        let encoded = encode_retargeted(&adapted).expect("encode_retargeted");
+        let stream_len = lz4_flex::compress_prepend_size(b"abc").len();
+        let hdr_at = encoded.len() - stream_len;
+
+        // Declared uncompressed length larger than actual stream output (64 vs 3).
+        let mut wrong_len = encoded.clone();
+        wrong_len[hdr_at..hdr_at + 4].copy_from_slice(&64u32.to_le_bytes());
+        assert!(
+            decode_retargeted(&wrong_len).is_none(),
+            "declared length mismatch must be rejected"
+        );
+
+        // Oversized declared uncompressed length (> 1 GiB) must be rejected without allocating.
+        let mut oversized = encoded.clone();
+        oversized[hdr_at..hdr_at + 4].copy_from_slice(&((MAX_RETARGETED_IMAGE_BYTES as u32) + 1).to_le_bytes());
+        assert!(decode_retargeted(&oversized).is_none());
+
+        let mut max_u32 = encoded;
+        max_u32[hdr_at..hdr_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_retargeted(&max_u32).is_none());
+
+        // Empty retargeted image round-trips cleanly.
+        let empty = vf_adapt::Adapted {
+            outcome: adapted.outcome,
+            image: Some(Vec::new()),
+        };
+        let empty_enc = encode_retargeted(&empty).expect("encode empty");
+        let empty_dec = decode_retargeted(&empty_enc).expect("decode empty");
+        assert_eq!(empty_dec.image.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn key_for_policy_tracks_explicit_policy() {
+        let img = b"sample module bytes";
+        let mut p75 = vf_adapt::Policy::default();
+        p75.told_sm = Some(75);
+        p75.keep_sources = true;
+        let mut p80 = vf_adapt::Policy::default();
+        p80.told_sm = Some(80);
+        p80.keep_sources = false;
+        assert_ne!(key_for_policy(img, &p75), key_for_policy(img, &p80));
+        assert_ne!(key_for_policy(img, &p75), key_for(img));
+    }
+
+    #[test]
+    fn maybe_enforce_limit_avoids_rescanning_every_write() {
+        let dir = test_dir("maybelimit-2k");
+        let uid = unsafe { libc::geteuid() };
+        let cs = CacheState::new(dir.clone(), DEFAULT_MAX_BYTES, uid);
+        let payload = [0xABu8; 512];
+        for i in 0u128..2000 {
+            let path = manifest_path(&cs, i + 1);
+            let written = atomic_write(&path, &payload, i + 1).unwrap();
+            maybe_enforce_limit(&cs, written);
+        }
+        let scans = cs.limit_scans.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            scans <= 6,
+            "expected periodic scans (<= 6 across 2000 writes), got {scans}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn maybe_enforce_limit_evicts_when_writes_cross_max() {
+        let dir = test_dir("maybelimit-evict");
+        let uid = unsafe { libc::geteuid() };
+        let cs = CacheState::new(dir.clone(), 200, uid);
+        for i in 0u128..10 {
+            let path = dir.join(format!("f{i}.bin"));
+            let written = atomic_write(&path, &[0u8; 50], i).unwrap();
+            maybe_enforce_limit(&cs, written);
+        }
+        let total: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum();
+        assert!(total <= 200, "total {total} > 200");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

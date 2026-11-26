@@ -1,5 +1,12 @@
 # Changes
 
+## Unreleased
+
+### Changed
+
+- The proxy cache now stores LZ4-compressed retargeted PTX/fatbin images (`.p`) so subsequent starts skip re-adapting cached modules and libraries materialized on fallback, validates bounded decompressed lengths, keys restored lazy libraries by each load's own policy, and tracks directory size incrementally instead of rescanning on every cache write.
+- Driver hook call counters (`COUNTS`) are incremented only when statistics are asked for (`VF_STATS`).
+
 ## 0.1.6 (2026-11-25)
 
 ### Fixed
