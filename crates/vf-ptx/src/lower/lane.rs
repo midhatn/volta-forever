@@ -97,6 +97,18 @@ pub(super) enum Lane {
     /// `pi^-1(lane)`, with `bn` bit n of the lane: `16 b3 + 8 b4 + 4 b1 + 2 b0 + b2`: the index that
     /// takes a register of a pair back to Turing's layout.
     QBack,
+    /// For NVFP4 split-octet lowering: the Turing lane holding block pair `pair` (0 or 1) of
+    /// A/B operands for this split-octet lane: `(lane & 16) | ((lane & 3) << 2) | ((lane & 8) >> 3) | (2 * pair)`.
+    Nvf4Src(u32),
+    /// For FP4 block-scaled split-octet lowering: the Turing lane holding `scale_A` for this
+    /// split-octet lane's row, `(lane & 24) | ((lane & 1) << 2) | ((lane & 4) >> 2) | (2 * tid_a)`.
+    ScaledSa(u32),
+    /// For FP4 block-scaled split-octet lowering: the Turing lane holding `scale_B` for column
+    /// index `col_idx` (0..4, = 2 * parity + b1) and `thread_id_b` (0..4).
+    ScaledSb(u32, u32),
+    /// For FP4 block-scaled split-octet lowering: the Turing lane holding C registers for `b1`
+    /// (0 or 1), `(lane & 24) | ((lane & 1) << 2) | (b1 << 1) | ((lane & 2) >> 1)`.
+    ScaledC(u32),
 }
 
 impl Lane {
@@ -142,6 +154,10 @@ impl Lane {
             Lane::QColumns(first, second) => format!("%vf_yc{first}{second}"),
             Lane::QForward => "%vf_yq".to_string(),
             Lane::QBack => "%vf_yt".to_string(),
+            Lane::Nvf4Src(pair) => format!("%vf_ns{pair}"),
+            Lane::ScaledSa(tid) => format!("%vf_sa{tid}"),
+            Lane::ScaledSb(col_idx, tid) => format!("%vf_sb{col_idx}_{tid}"),
+            Lane::ScaledC(b1) => format!("%vf_sc{b1}"),
         }
     }
 
@@ -199,6 +215,14 @@ impl Lane {
             }
             Lane::QForward => vec![Lane::Id, Lane::Shift(3)],
             Lane::QBack => vec![Lane::Id, Lane::Shift(1), Lane::Half, Lane::Shift(3)],
+            Lane::Nvf4Src(0) => vec![Lane::Bit(8), Lane::PairOffset, Lane::Bit(16)],
+            Lane::Nvf4Src(_) => vec![Lane::Nvf4Src(0)],
+            Lane::ScaledSa(0) => vec![Lane::Id, Lane::Bit(4), Lane::Bit(24)],
+            Lane::ScaledSa(_) => vec![Lane::ScaledSa(0)],
+            Lane::ScaledSb(0, _) => vec![Lane::Bit(2)],
+            Lane::ScaledSb(_, tid) => vec![Lane::ScaledSb(0, tid)],
+            Lane::ScaledC(0) => vec![Lane::Id, Lane::Bit(2), Lane::Bit(24)],
+            Lane::ScaledC(_) => vec![Lane::ScaledC(0)],
         }
     }
 
@@ -325,6 +349,42 @@ impl Lane {
                 Lane::Half.name(),
                 Lane::Shift(3).name()
             ),
+            Lane::Nvf4Src(0) => format!(
+                "shr.u32 {d}, {}, 3;\n\tor.b32 {d}, {d}, {};\n\tor.b32 {d}, {d}, {};",
+                Lane::Bit(8).name(),
+                Lane::PairOffset.name(),
+                Lane::Bit(16).name(),
+            ),
+            Lane::Nvf4Src(_) => format!("or.b32 {d}, {}, 2;", Lane::Nvf4Src(0).name()),
+            Lane::ScaledSa(0) => format!(
+                "shr.u32 {d}, {}, 2;\n\tbfi.b32 {d}, {l}, {d}, 2, 1;\n\tor.b32 {d}, {d}, {};",
+                Lane::Bit(4).name(),
+                Lane::Bit(24).name(),
+            ),
+            Lane::ScaledSa(_) => format!("or.b32 {d}, {}, 2;", Lane::ScaledSa(0).name()),
+            Lane::ScaledSb(0, tid) => {
+                let base = format!("shl.b32 {d}, {}, 2;", Lane::Bit(2).name());
+                if tid == 0 {
+                    base
+                } else {
+                    format!("{base}\n\tor.b32 {d}, {d}, {tid};")
+                }
+            }
+            Lane::ScaledSb(col_idx, tid) => {
+                let col_bit = match col_idx {
+                    1 => 16,
+                    2 => 4,
+                    3 => 20,
+                    _ => unreachable!(),
+                };
+                format!("or.b32 {d}, {}, {col_bit};", Lane::ScaledSb(0, tid).name())
+            }
+            Lane::ScaledC(0) => format!(
+                "shr.u32 {d}, {}, 1;\n\tbfi.b32 {d}, {l}, {d}, 2, 1;\n\tor.b32 {d}, {d}, {};",
+                Lane::Bit(2).name(),
+                Lane::Bit(24).name(),
+            ),
+            Lane::ScaledC(_) => format!("or.b32 {d}, {}, 2;", Lane::ScaledC(0).name()),
         }
     }
 }
