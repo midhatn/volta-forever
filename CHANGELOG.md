@@ -1,5 +1,11 @@
 # Changes
 
+## Unreleased
+
+### Changed
+
+- Under `VF_ALIGNED_ROWS=0`, a forward low-zero-bits dataflow pass over the PTX control-flow graph elides the per-load runtime 16-byte alignment check on `ldmatrix` instructions whose addresses are statically proven 16-byte aligned across all paths from function entry (`docs/emulations.md`).
+
 ## 0.1.6 (2026-11-25)
 
 ### Fixed

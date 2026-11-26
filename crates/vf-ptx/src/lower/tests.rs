@@ -4206,3 +4206,126 @@ fn module_level_aligned_extern_shared_skips_runtime_alignment_diamond() {
     );
     assert!(!s.contains(", 15;"), "expected no & 15 runtime check:\n{s}");
 }
+
+#[test]
+fn guarded_branch_in_middle_of_block_propagates_state_at_branch() {
+    // Maintainer's negative example: fall-through re-establishes alignment after `@%p bra $L`,
+    // which must NOT reach `$L` along the back-edge where `%rd0` became `smem + 4`.
+    let text = "{\n\t.reg .b32 %r<4>, %a<4>, %b<2>, %d<4>;\n\t.reg .b64 %rd<3>;\n\t.reg .pred %p;\n\t.shared .align 16 .b8 smem[4096], smem_b[1024];\n\tmov.u64 %rd0, smem;\n\tmov.u64 %rd2, smem_b;\n$L:\n\tldmatrix.sync.aligned.m8n8.x4.b16 {%a0, %a1, %a2, %a3}, [%rd0];\n\tldmatrix.sync.aligned.m8n8.x2.b16 {%b0, %b1}, [%rd2];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n\tadd.u64 %rd0, %rd0, 4;\n\t@%p bra $L;\n\tmov.u64 %rd0, smem;\n\tret;\n}";
+    let lowered = lower(text);
+    assert!(
+        count(&lowered, "ld.shared.v4.u32 ") > 0,
+        "expected wide_loads path:\n{lowered}"
+    );
+    assert_eq!(
+        count(&lowered, ", 15;"),
+        1,
+        "back-edge from @%p bra $L carries smem+4 and must keep runtime alignment check:\n{lowered}"
+    );
+}
+
+#[test]
+fn barrier_red_and_mbarrier_arrive_clear_written_register_alignment() {
+    let base = "{\n\t.reg .b32 %r<6>, %a<4>, %b<2>, %d<4>;\n\t.reg .b64 %rd<4>;\n\t.reg .pred %p;\n\t.shared .align 16 .b8 smem[4096], smem_b[1024];\n\t.shared .align 8 .b64 mbar;\n\tmov.u32 %r0, smem;\n\tmov.u64 %rd0, smem;\n\tmov.u64 %rd3, smem_b;\n\t{WRITE}\n\tldmatrix.sync.aligned.m8n8.x4.b16 {%a0, %a1, %a2, %a3}, [{ADDR}];\n\tldmatrix.sync.aligned.m8n8.x2.b16 {%b0, %b1}, [%rd3];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n\tret;\n}";
+    for (op, addr) in [
+        ("bar.red.popc.u32 %r0, 0, %p;\n\tcvt.u64.u32 %rd0, %r0;", "%rd0"),
+        ("barrier.cta.red.popc.u32 %r0, 0, %p;\n\tcvt.u64.u32 %rd0, %r0;", "%rd0"),
+        ("mbarrier.arrive.shared::cta.b64 %rd0, [mbar];", "%rd0"),
+    ] {
+        let ptx = base.replace("{WRITE}", op).replace("{ADDR}", addr);
+        let lowered = lower(&ptx);
+        assert!(count(&lowered, "ld.shared.v4.u32 ") > 0);
+        assert_eq!(
+            count(&lowered, ", 15;"),
+            1,
+            "{op} writes {addr} and must invalidate prior alignment:\n{lowered}"
+        );
+    }
+}
+
+#[test]
+fn bfi_takes_position_and_length_modulo_256() {
+    // pos=256 (mod 256 == 0) overwrites the low 4 bits with unaligned `%r1`; must NOT be proved aligned.
+    let unaligned_pos_mod256 = "{\n\t.reg .b32 %r<6>, %a<4>, %b<2>, %d<4>;\n\t.reg .b64 %rd<2>;\n\t.shared .align 16 .b8 smem[4096], smem_b[1024];\n\tmov.u32 %r0, smem;\n\tmov.u64 %rd1, smem_b;\n\tbfi.b32 %r2, %r1, %r0, 256, 4;\n\tcvt.u64.u32 %rd0, %r2;\n\tldmatrix.sync.aligned.m8n8.x4.b16 {%a0, %a1, %a2, %a3}, [%rd0];\n\tldmatrix.sync.aligned.m8n8.x2.b16 {%b0, %b1}, [%rd1];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n\tret;\n}";
+    assert_eq!(
+        count(&lower(unaligned_pos_mod256), ", 15;"),
+        1,
+        "bfi with pos=256 (0 mod 256) must take bits 0..3 from unaligned source"
+    );
+
+    // len=256 (mod 256 == 0) inserts zero bits, keeping `%r1` (unaligned) rather than `smem`.
+    let unaligned_len_mod256 = "{\n\t.reg .b32 %r<6>, %a<4>, %b<2>, %d<4>;\n\t.reg .b64 %rd<2>;\n\t.shared .align 16 .b8 smem[4096], smem_b[1024];\n\tmov.u32 %r0, smem;\n\tmov.u64 %rd1, smem_b;\n\tbfi.b32 %r2, %r0, %r1, 0, 256;\n\tcvt.u64.u32 %rd0, %r2;\n\tldmatrix.sync.aligned.m8n8.x4.b16 {%a0, %a1, %a2, %a3}, [%rd0];\n\tldmatrix.sync.aligned.m8n8.x2.b16 {%b0, %b1}, [%rd1];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n\tret;\n}";
+    assert_eq!(
+        count(&lower(unaligned_len_mod256), ", 15;"),
+        1,
+        "bfi with len=256 (0 mod 256) inserts nothing and must preserve unaligned base"
+    );
+
+    // Positive controls modulo 256: len=256 preserves aligned `%r0`; pos=256, len=4 inserts `smem`'s low 4 zero bits.
+    let aligned_len_mod256 = "{\n\t.reg .b32 %r<6>, %a<4>, %b<2>, %d<4>;\n\t.reg .b64 %rd<2>;\n\t.shared .align 16 .b8 smem[4096], smem_b[1024];\n\tmov.u32 %r0, smem;\n\tmov.u64 %rd1, smem_b;\n\tbfi.b32 %r2, %r1, %r0, 0, 256;\n\tcvt.u64.u32 %rd0, %r2;\n\tldmatrix.sync.aligned.m8n8.x4.b16 {%a0, %a1, %a2, %a3}, [%rd0];\n\tldmatrix.sync.aligned.m8n8.x2.b16 {%b0, %b1}, [%rd1];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n\tret;\n}";
+    let out_len = lower(aligned_len_mod256);
+    assert!(count(&out_len, "ld.shared.v4.u32 ") > 0);
+    assert_eq!(count(&out_len, ", 15;"), 0);
+
+    let aligned_pos_mod256 = "{\n\t.reg .b32 %r<6>, %a<4>, %b<2>, %d<4>;\n\t.reg .b64 %rd<2>;\n\t.shared .align 16 .b8 smem[4096], smem_b[1024];\n\tmov.u32 %r0, smem;\n\tmov.u64 %rd1, smem_b;\n\tbfi.b32 %r2, %r0, %r1, 256, 4;\n\tcvt.u64.u32 %rd0, %r2;\n\tldmatrix.sync.aligned.m8n8.x4.b16 {%a0, %a1, %a2, %a3}, [%rd0];\n\tldmatrix.sync.aligned.m8n8.x2.b16 {%b0, %b1}, [%rd1];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n\tret;\n}";
+    let out_pos = lower(aligned_pos_mod256);
+    assert!(count(&out_pos, "ld.shared.v4.u32 ") > 0);
+    assert_eq!(count(&out_pos, ", 15;"), 0);
+}
+
+#[test]
+fn shared_symbols_are_scoped_and_malformed_directive_does_not_panic() {
+    // 1. Module `.shared .align 16` shadowed inside kernel by `.shared .align 4` / unaligned `.shared`.
+    for kernel_decl in ["\t.shared .align 4 .b8 buf[64];", "\t.shared .b8 buf[64];"] {
+        let module = format!(
+            ".version 8.0\n.target sm_80\n.address_size 64\n.extern .shared .align 16 .b8 buf[];\n.shared .align 16 .b8 smem_b[1024];\n.visible .entry k()\n{{\n\t.reg .b32 %r<4>, %a<4>, %b<2>, %d<4>;\n\t.reg .b64 %rd<2>;\n{kernel_decl}\n\tmov.u64 %rd0, buf;\n\tmov.u64 %rd1, smem_b;\n\tldmatrix.sync.aligned.m8n8.x4.b16 {{%a0, %a1, %a2, %a3}}, [%rd0];\n\tldmatrix.sync.aligned.m8n8.x2.b16 {{%b0, %b1}}, [%rd1];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{%d0, %d1, %d2, %d3}}, {{%a0, %a1, %a2, %a3}}, {{%b0, %b1}}, {{%d0, %d1, %d2, %d3}};\n\tret;\n}}\n"
+        );
+        let (out, _) = crate::lower_to_volta_with(
+            module.as_bytes(),
+            Options {
+                aligned_rows: false,
+                ..Options::default()
+            },
+        );
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(count(s, "ld.shared.v4.u32 ") > 0);
+        assert_eq!(
+            count(s, ", 15;"),
+            1,
+            "shadowing declaration {kernel_decl:?} must cancel module .align 16:\n{s}"
+        );
+    }
+
+    // 2. Inner `{ .shared .align 16 buf; }` must not leak out to outer `.shared .align 4 buf;`.
+    let inner_leak = "{\n\t.reg .b32 %r<4>, %a<4>, %b<2>, %e<2>, %d<4>, %c<4>;\n\t.reg .b64 %rd<4>;\n\t.shared .align 4 .b8 buf[64];\n\t.shared .align 16 .b8 smem_b[1024];\n\tmov.u64 %rd2, smem_b;\n\t{\n\t\t.shared .align 16 .b8 buf[64];\n\t\tmov.u64 %rd0, buf;\n\t\tldmatrix.sync.aligned.m8n8.x4.b16 {%a0, %a1, %a2, %a3}, [%rd0];\n\t\tldmatrix.sync.aligned.m8n8.x2.b16 {%b0, %b1}, [%rd2];\n\t\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n\t}\n\tmov.u64 %rd1, buf;\n\tldmatrix.sync.aligned.m8n8.x4.b16 {%c0, %c1, %c2, %c3}, [%rd1];\n\tldmatrix.sync.aligned.m8n8.x2.b16 {%e0, %e1}, [%rd2];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%c0, %c1, %c2, %c3}, {%e0, %e1}, {%d0, %d1, %d2, %d3};\n\tret;\n}";
+    let lowered_leak = lower(inner_leak);
+    assert!(count(&lowered_leak, "ld.shared.v4.u32 ") > 0);
+    assert_eq!(
+        count(&lowered_leak, ", 15;"),
+        1,
+        "only inner ldmatrix is aligned 16, outer must keep runtime check:\n{lowered_leak}"
+    );
+
+    // 3. Outer `.shared .align 16 buf` shadowed inside `{ .shared .align 4 buf; }`.
+    let outer_shadow = "{\n\t.reg .b32 %r<4>, %a<4>, %b<2>, %e<2>, %d<4>, %c<4>;\n\t.reg .b64 %rd<4>;\n\t.shared .align 16 .b8 buf[64], smem_b[1024];\n\tmov.u64 %rd2, smem_b;\n\t{\n\t\t.shared .align 4 .b8 buf[64];\n\t\tmov.u64 %rd0, buf;\n\t\tldmatrix.sync.aligned.m8n8.x4.b16 {%a0, %a1, %a2, %a3}, [%rd0];\n\t\tldmatrix.sync.aligned.m8n8.x2.b16 {%b0, %b1}, [%rd2];\n\t\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1, %a2, %a3}, {%b0, %b1}, {%d0, %d1, %d2, %d3};\n\t}\n\tmov.u64 %rd1, buf;\n\tldmatrix.sync.aligned.m8n8.x4.b16 {%c0, %c1, %c2, %c3}, [%rd1];\n\tldmatrix.sync.aligned.m8n8.x2.b16 {%e0, %e1}, [%rd2];\n\tmma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%c0, %c1, %c2, %c3}, {%e0, %e1}, {%d0, %d1, %d2, %d3};\n\tret;\n}";
+    let lowered_shadow = lower(outer_shadow);
+    assert!(count(&lowered_shadow, "ld.shared.v4.u32 ") > 0);
+    assert_eq!(
+        count(&lowered_shadow, ", 15;"),
+        1,
+        "inner shadowed ldmatrix must keep runtime check, outer skips it:\n{lowered_shadow}"
+    );
+}
+
+#[test]
+fn malformed_shared_directive_does_not_panic() {
+    let malformed = ".version 8.0\n.target sm_80\n.address_size 64\n.shared .align 16 .align;\n.visible .entry k()\n{\n\t.shared .align 16 .align ;\n\t.reg .b32 %r<4>, %a<4>, %b<2>, %d<4>;\n\t.reg .b64 %rd0;\n\tldmatrix.sync.aligned.m8n8.x4.b16 {%a0, %a1, %a2, %a3}, [%rd0];\n\tmma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%d0, %d1, %d2, %d3}, {%a0, %a1}, {%b0}, {%d0, %d1, %d2, %d3};\n\tret;\n}\n";
+    let (out, _) = crate::lower_to_volta_with(
+        malformed.as_bytes(),
+        Options {
+            aligned_rows: false,
+            ..Options::default()
+        },
+    );
+    assert!(!out.is_empty());
+}
