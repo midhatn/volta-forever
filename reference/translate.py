@@ -156,6 +156,26 @@ def graph_register_budget(registers, info):
     return block_registers(threads)
 
 
+def occupancy_warps(registers, info):
+    """Effective resident warps per GV100 subpartition for `registers`, rounding down to whole
+    CTAs when `info` fixes a CTA size (`EIATTR_REQNTID`)."""
+    regs_per_warp = ((32 * max(registers, 1) + 255) // 256) * 256
+    per_sub = min(16, 16384 // regs_per_warp)
+    req = required_threads(info)
+    if req is not None:
+        groups = max(1, (req + 127) // 128)
+        return (per_sub // groups) * groups
+    return per_sub
+
+
+def occupancy_target(registers, info):
+    """Largest register count per thread (<= 255) preserving at least `occupancy_warps(registers, info)` on GV100."""
+    w = occupancy_warps(registers, info)
+    if w == 0:
+        return 255
+    return min(255, ((16384 // w) // 256) * 8)
+
+
 def block_registers(threads):
     """The most registers a thread may have for a block of `threads` threads to be launched on a
     GV100 (the admission check counts warps by fours: each 128 threads take the same)."""
@@ -234,6 +254,7 @@ def stack_top(d):
 
 
 class Borrowed:
+    _exact_callee_caller_live = True
     """Registers of the program that hold nothing where the translation needs registers: a home
     for each uniform register through its whole life, and an even register and the next at an
     instruction whose sequence computes into two (the pool). docs/translator.md, "Registers".
@@ -269,10 +290,70 @@ class Borrowed:
                     out |= 1 << (256 + x)
             return out
         reads, writes = [bits(d.reads) for d in src], [bits(d.writes) for d in src]
+        raw_reads_u = [r >> 256 for r in reads]
+        raw_writes_u = [w >> 256 for w in writes]
         every = 0
         for i in range(n):
             every |= reads[i] | writes[i]
+        every_u = every >> 256
+        insn_pairs = []
+        for d in src:
+            uses = f.mc._uses[(75, d.c.name)]
+            ps = []
+            for operands in (uses.reads, uses.writes):
+                for letter, operand, span in operands:
+                    if letter == 'U' and operand in d.ops and d.ops[operand] != 63:
+                        first, count = d.ops[operand], MC.registers(span, d.ops)
+                        if count == 2 and first < 62:
+                            ps.append(first)
+            insn_pairs.append(sorted(set(ps)))
         kills, leaves = list(writes), [0] * n
+
+        # Identify exact internal CALL.REL/RET.REL subroutines (all calls exact, unreachable
+        # directly from entry 0, returning only via unguarded ret__REL).
+        main_reachable = [False] * n
+        if n > 0:
+            work = [0]
+            main_reachable[0] = True
+            while work:
+                k = work.pop()
+                for t in flow.succ[k]:
+                    if not main_reachable[t]:
+                        main_reachable[t] = True
+                        work.append(t)
+        target_callers = collections.defaultdict(list)
+        for i in range(n):
+            if flow.kind[i] == 'call' and flow.named[i] is not None:
+                target_callers[flow.named[i]].append(i)
+        callee_bodies = {}
+        exact_rets = [False] * n
+        exact_targets = set()
+        for target, callers in sorted(target_callers.items()):
+            body, work = set(), [target]
+            while work:
+                k = work.pop()
+                if k in body:
+                    continue
+                body.add(k)
+                if src[k].mnemonic == 'RET':
+                    continue
+                work.extend(flow.succ[k])
+            all_calls_exact = all(
+                src[c].c.name.startswith('call_rel') and flow.called.get(c) is not None
+                for c in callers
+            )
+            isolated = not any(main_reachable[k] for k in body)
+            clean_rets = all(
+                src[k].mnemonic != 'RET' or (src[k].c.name == 'ret__REL' and pairing.unguarded(src[k]))
+                for k in body
+            )
+            if all_calls_exact and isolated and clean_rets:
+                exact_targets.add(target)
+                for k in body:
+                    if src[k].mnemonic == 'RET':
+                        exact_rets[k] = True
+            callee_bodies[target] = sorted(body)
+
         for i in range(n):
             if flow.kind[i] == 'call':
                 called = flow.called.get(i)
@@ -281,22 +362,31 @@ class Borrowed:
                 else:
                     reads[i] |= sum(1 << x for x in called[0])
                     writes[i] |= sum(1 << x for x in called[1])
-                    # (And the uniform registers that the code it calls reads or writes:
-                    # `flow.called` has the registers only. A uniform register set before the
-                    # call and read by that code was taken for dead at the call until 2026-11-19.)
-                    body, work = set(), [flow.named[i]]
-                    while work:
-                        k = work.pop()
-                        if k not in body:
-                            body.add(k)
-                            work += flow.succ[k]
-                    for k in body:
-                        reads[i] |= bits(src[k].reads) >> 256 << 256
-                        writes[i] |= bits(src[k].writes) >> 256 << 256
+                    entry = flow.named[i]
+                    if entry is not None:
+                        body = callee_bodies[entry]
+                        exit_u = 0 if entry in exact_targets else every_u
+                        cal_live = {k: 0 for k in body}
+                        changed_u = True
+                        while changed_u:
+                            changed_u = False
+                            for k in reversed(body):
+                                after = exit_u if src[k].mnemonic == 'RET' else 0
+                                for t in flow.succ[k]:
+                                    if t in cal_live:
+                                        after |= cal_live[t]
+                                ck = raw_writes_u[k] if pairing.unguarded(src[k]) else 0
+                                now = raw_reads_u[k] | (after & ~ck)
+                                if now != cal_live[k]:
+                                    cal_live[k] = now
+                                    changed_u = True
+                        reads[i] |= cal_live.get(entry, 0) << 256
+                        for k in body:
+                            writes[i] |= raw_writes_u[k] << 256
                 kills[i] = 0
             elif not pairing.unguarded(src[i]):
                 kills[i] = 0
-            if src[i].mnemonic == 'RET':
+            if src[i].mnemonic == 'RET' and not exact_rets[i]:
                 leaves[i] = every
         live_in, changed = [0] * n, True
         while changed:
@@ -308,12 +398,49 @@ class Borrowed:
                 new = reads[i] | (out & ~kills[i])
                 if new != live_in[i]:
                     live_in[i], changed = new, True
-        busy = []
+        live_out, busy = [], []
         for i in range(n):
             out = leaves[i]
             for t in flow.succ[i]:
                 out |= live_in[t]
+            live_out.append(out)
             busy.append(live_in[i] | out | reads[i] | writes[i])
+        if self._exact_callee_caller_live and exact_targets:
+            exact_body_nodes = set()
+            exact_ret_leaves = {}
+            for target in exact_targets:
+                exit_mask = 0
+                for c in target_callers[target]:
+                    exit_mask |= live_out[c]
+                for k in callee_bodies[target]:
+                    exact_body_nodes.add(k)
+                    if src[k].mnemonic == 'RET':
+                        exact_ret_leaves[k] = exact_ret_leaves.get(k, 0) | exit_mask
+            for k, mask in exact_ret_leaves.items():
+                leaves[k] |= mask
+            exact_vec = sorted(exact_body_nodes)
+            changed_c = True
+            while changed_c:
+                changed_c = False
+                for k in reversed(exact_vec):
+                    out = leaves[k]
+                    for t in flow.succ[k]:
+                        out |= live_in[t]
+                    new = reads[k] | (out & ~kills[k])
+                    if new != live_in[k]:
+                        live_in[k], changed_c = new, True
+            for k in exact_vec:
+                out = leaves[k]
+                for t in flow.succ[k]:
+                    out |= live_in[t]
+                live_out[k] = out
+                busy[k] = live_in[k] | out | reads[k] | writes[k]
+        live_in_u = [v >> 256 for v in live_in]
+        live_out_u = [v >> 256 for v in live_out]
+        writes_u = [w >> 256 for w in writes]
+        busy_u = [b >> 256 for b in busy]
+        self._live_in_u = live_in_u
+        self._raw_reads_u = raw_reads_u
         never = 0
         for d in src:
             if unannounced(d):
@@ -327,11 +454,7 @@ class Borrowed:
         self.touch = [(reads[i] | writes[i]) & ((1 << 255) - 1) for i in range(n)]
         self.never, self.highest = never & ((1 << 255) - 1), f.highest
         # And where the stack pointer is, for a frame addressed from it: `depth[i]`, how far R1
-        # is, before instruction i, under where the first instruction puts it. The program
-        # moves it by constants only (PyTorch: 730 functions of 23,693 move it at all, every
-        # one by `IADD3 R1, R1, imm`): known at an instruction when every way to it agrees;
-        # code that is called has the depth of its calls. `r1_fixed`: known wherever the first
-        # instruction leads; otherwise the frame is addressed from a register (`frame_top`).
+        # is, before instruction i, under where the first instruction puts it.
         self.depth, self.r1_fixed = [None] * n, n > 1
         work = [(t, 0) for t in flow.succ[0]] if n > 1 else []
         while work and self.r1_fixed:
@@ -353,31 +476,143 @@ class Borrowed:
             if flow.kind[i] == 'call' and flow.called.get(i) is not None:
                 work.append((flow.named[i], at))
         self.room, self.from_r1, self.spill = False, False, 0
-        # The uniform registers, those of the longest lives first: each in the lowest register
-        # that is free wherever it is alive, read or written, and that no other one has there.
-        self.taken, self.homes, self.used = [0] * n, {}, set()
-        self.spans = {}                              # {homed uniform register: the instructions of its life}
-        units = []
+
+        def uf_find(parent, x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def uf_union(parent, a, b):
+            ra, rb = uf_find(parent, a), uf_find(parent, b)
+            if ra != rb:
+                parent[rb] = ra
+
+        return_sites = [j + 1 for j in range(n) if src[j].c.name.startswith('call_rel') and j + 1 < n]
+
+        # Decompose each uniform register's active instructions (`busy_u`) into disjoint SSA
+        # value-flow webs, then couple webs linked by 64-bit pair operands.
+        webs = []  # [(u, span)]
+        web_of_insn_u = {}
         for u in f.uniform:
-            if u - 1 in f.pairs:
+            if u >= 63:
                 continue
-            width = 2 if u in f.pairs else 1
-            mask = (1 << width) - 1
-            units.append((u, width, [i for i in range(n) if busy[i] >> (256 + u) & mask]))
-        if not all_in_memory:
-            for u, width, span in sorted(units, key=lambda unit: (-len(unit[2]), unit[0])):
-                union, mask = 0, (1 << width) - 1
+            if not any(busy_u[i] >> u & 1 for i in range(n)):
+                continue
+            parent = list(range(n))
+            for i in range(n):
+                for t in flow.succ[i]:
+                    if live_in_u[t] >> u & 1:
+                        uf_union(parent, i, t)
+                if src[i].c.name == 'ret__REL' and not exact_rets[i]:
+                    for t in return_sites:
+                        if live_in_u[t] >> u & 1:
+                            uf_union(parent, i, t)
+                if flow.kind[i] == 'call' and flow.called.get(i) is not None:
+                    entry = flow.named[i]
+                    if entry is not None:
+                        if (busy_u[i] >> u & 1) and (live_in_u[entry] >> u & 1):
+                            uf_union(parent, i, entry)
+                        if (writes_u[i] & live_out_u[i]) >> u & 1:
+                            for k in callee_bodies[entry]:
+                                if raw_writes_u[k] >> u & 1:
+                                    uf_union(parent, i, k)
+            by_root = collections.defaultdict(list)
+            for i in range(n):
+                if busy_u[i] >> u & 1:
+                    by_root[uf_find(parent, i)].append(i)
+            for root in sorted(by_root):
+                wid = len(webs)
+                span = by_root[root]
                 for i in span:
-                    union |= self.busy[i] | self.taken[i]
-                for r in range(2, self.top + 2 - width, width):
-                    if not union >> r & mask:
-                        for k in range(width):
-                            self.homes[u + k] = r + k
-                            self.used.add(r + k)
-                            self.spans[u + k] = span
-                        for i in span:
-                            self.taken[i] |= mask << r
+                    web_of_insn_u[(i, u)] = wid
+                webs.append((u, span))
+
+        nw = len(webs)
+        unit_parent = list(range(nw))
+        for i, pairs_here in enumerate(insn_pairs):
+            for first in pairs_here:
+                w0 = web_of_insn_u.get((i, first))
+                w1 = web_of_insn_u.get((i, first + 1))
+                if w0 is not None and w1 is not None:
+                    uf_union(unit_parent, w0, w1)
+
+        unit_members = collections.defaultdict(list)
+        for wid in range(nw):
+            unit_members[uf_find(unit_parent, wid)].append(wid)
+        unit_pair_firsts = collections.defaultdict(list)
+        for i, pairs_here in enumerate(insn_pairs):
+            for first in pairs_here:
+                w0 = web_of_insn_u.get((i, first))
+                if w0 is not None:
+                    unit_pair_firsts[uf_find(unit_parent, w0)].append(first)
+        units = []
+        for root in sorted(unit_members):
+            members = unit_members[root]
+            min_u = min(webs[w][0] for w in members)
+            max_u = max(webs[w][0] for w in members)
+            width = max_u - min_u + 1
+            span_set = set()
+            for w in members:
+                span_set.update(webs[w][1])
+            first_insn = min(span_set) if span_set else 0
+            pfirsts = sorted(set(unit_pair_firsts.get(root, ())))
+            valid = width == 1 or all((pf - min_u) % 2 == 0 for pf in pfirsts)
+            units.append((min_u, width, len(span_set), first_insn, members, pfirsts, valid))
+        units.sort(key=lambda unit: (-unit[2], -unit[1], unit[0], unit[3]))
+
+        self.taken = [0] * n
+        self._home_at = [{} for _ in range(n)]
+        self.web_homes = []
+        self.unhomed_u = set()
+        self.unhomed_pairs = set()
+        self.used = set()
+
+        def mark_unhomed(unit):
+            _, _, _, _, members, pfirsts, _ = unit
+            for wid in members:
+                self.unhomed_u.add(webs[wid][0])
+            for pf in pfirsts:
+                self.unhomed_pairs.add(pf)
+                self.unhomed_u.add(pf)
+                self.unhomed_u.add(pf + 1)
+
+        if all_in_memory:
+            for unit in units:
+                mark_unhomed(unit)
+        else:
+            for unit in units:
+                min_u, width, _, _, members, _, valid = unit
+                if not valid or width > self.top:
+                    mark_unhomed(unit)
+                    continue
+                union_by_off = [0] * width
+                for wid in members:
+                    wu, wspan = webs[wid]
+                    off = wu - min_u
+                    u_acc = 0
+                    for i in wspan:
+                        u_acc |= self.busy[i] | self.taken[i]
+                    union_by_off[off] |= u_acc
+                step = 1 if width == 1 else 2
+                found = None
+                for r in range(2, self.top + 2 - width, step):
+                    if all(not (union_by_off[off] >> (r + off) & 1) for off in range(width)):
+                        found = r
                         break
+                if found is not None:
+                    for wid in members:
+                        wu, wspan = webs[wid]
+                        reg = found + (wu - min_u)
+                        self.web_homes.append((wu, reg, list(wspan)))
+                        for i in wspan:
+                            self._home_at[i][wu] = reg
+                            self.taken[i] |= 1 << reg
+                        self.used.add(reg)
+                else:
+                    mark_unhomed(unit)
+        self.web_homes.sort(key=lambda h: (h[0], h[1], h[2]))
+
         # Level 3 (`everything`): the uniform registers that found no home live in the thread's
         # local memory, in a frame the translation adds, and whatever else the translation of an
         # instruction needs is taken at that instruction (`Function.take`).
@@ -385,6 +620,9 @@ class Borrowed:
         self.slots = {}           # {uniform register: its word in the frame}
         self.predicate_slots = {} # {held uniform predicate: its word in the frame}
         self.frame_bytes = 0      # the frame: 4 bytes a register, a multiple of 16
+
+    def home_at(self, i, u):
+        return self._home_at[i].get(u) if 0 <= i < len(self._home_at) else None
 
     def free_at(self, i, width=1, given=0):
         """The lowest register that holds nothing at instruction `i`, or the lowest run of `width`
@@ -425,13 +663,13 @@ class Borrowed:
         return None
 
     def assign_slots(self, uniform, pairs):
-        """A word of the frame for each uniform register that has no home (the two of a pair
+        """A word of the frame for each uniform register that has unhomed webs (the two of a pair
         side by side, the lower one first). Returns the size of the frame in bytes."""
         slot = 0
-        for u in sorted(uniform):
-            if u in self.homes or u - 1 in pairs:
+        for u in sorted(self.unhomed_u):
+            if u - 1 in self.unhomed_pairs:
                 continue
-            if u in pairs:
+            if u in self.unhomed_pairs:
                 # Pair: 8 bytes (low word first)
                 self.slots[u] = slot
                 self.slots[u + 1] = slot + 1
@@ -815,6 +1053,10 @@ class Function:
                 return 255
             if u in self._mem_regs:
                 return self._mem_regs[u]
+            if self.borrow is not None:
+                r = self.borrow.home_at(self.at, u)
+                if r is not None:
+                    return r
             if u not in place:
                 raise Refused('uniform register UR%d is used in a way that was not foreseen' % u)
             return place[u]
@@ -992,13 +1234,20 @@ class Function:
             at_instr = {r for r in range(2, 255) if self.given >> r & 1}
             if self.borrow is not None:
                 at_instr.update(self.hold_at[q] for q, p, reads, writes in self.held.get(i, ()) if writes and self.hold_at.get(q, 255) <= self.borrow.top)
-            if self.borrow is not None and (i in self.pool_taken or at_instr or any(l == 'U' and u in self.borrow.homes for l, u in d.writes)):
+            written_homes = set()
+            if self.borrow is not None:
+                for l, u in d.writes:
+                    if l == 'U':
+                        r = self.borrow.home_at(i, u)
+                        if r is not None:
+                            written_homes.add(r)
+            if self.borrow is not None and (i in self.pool_taken or at_instr or written_homes):
                 # It writes into a register of the program that holds nothing: what the program
                 # wrote there last may still be on its way (the words of a load that nothing
                 # reads), and would be written over what is put there now. Every
                 # scoreboard is waited for first. (Two cycles after whatever names one: `schedule`.)
                 new[0].word |= 63 << WAIT
-                mine = {self.borrow.homes[u] for l, u in d.writes if l == 'U' and u in self.borrow.homes}
+                mine = set(written_homes)
                 if i in self.pool_taken:
                     mine.update((self.pool_taken[i], self.pool_taken[i] + 1))
                 mine.update(at_instr)
@@ -1068,6 +1317,25 @@ class Function:
             item.d = mc.decode(70, item.word)
             if item.d is None:
                 raise Refused('the translation of the instruction at 0x%x (%s) is not an sm_70 instruction: %032x' % (16 * item.origin, self.src[item.origin].c.name, item.word))
+        if self.borrow is not None and self.borrow.used:
+            used_regs = self.borrow.used
+            for k, item in enumerate(items):
+                if item.says and not item.late:
+                    rb = (item.word >> READ_BARRIER) & 7
+                    wb = (item.word >> WRITE_BARRIER) & 7
+                    if rb != 7:
+                        reads_borrowed = {r for l, r, _ in item.d.reads if l == 'R' and r in used_regs}
+                        if reads_borrowed:
+                            boards = (rb, wb) if wb != 7 else (rb,)
+                            for item_j in items[k + 1:]:
+                                wait_mask = (item_j.word >> WAIT) & 63
+                                if any(wait_mask >> sb & 1 for sb in boards):
+                                    break
+                                if item_j.d.kind == 'BRU':
+                                    break
+                                if any(l == 'R' and r in reads_borrowed for l, r in item_j.d.writes):
+                                    item_j.word |= 1 << (WAIT + rb)
+                                    break
         self.return_addresses()
         self.schedule()
         return self.finish()
@@ -1324,14 +1592,17 @@ class Function:
     def in_frame(self, d):
         """The uniform registers of the frame that instruction `d` reads, those it writes, and
         the lower one of each two that it takes as one operand of 64 bits."""
-        slots, uses = self.borrow.slots, self.mc._uses[(75, d.c.name)]
+        b = self.borrow
+        slots, uses = b.slots, self.mc._uses[(75, d.c.name)]
+        def is_slot_here(x):
+            return x in slots and b.home_at(self.at, x) is None
         read, written, together = set(), set(), set()
         for operands, found in ((uses.reads, read), (uses.writes, written)):
             for letter, operand, span in operands:
                 if letter == 'U' and operand in d.ops and d.ops[operand] != 63:
                     u, count = d.ops[operand], MC.registers(span, d.ops)
-                    found.update(u + k for k in range(count) if u + k in slots)
-                    if count == 2 and u in slots:
+                    found.update(u + k for k in range(count) if is_slot_here(u + k))
+                    if count == 2 and is_slot_here(u):
                         together.add(u)
         return read, written, together
 
@@ -2902,10 +3173,11 @@ def translate(data, mc=None, listing=None, lives=None):
                             raise Refused('no register holds nothing through the lives of uniform predicate UP%d' % q)
                     # Above the registers that may be taken: those the predicates are saved in, only.
                     where = placement(b.top + 1, [], set(), False, f.save_slots, False, 0, False, {}, [], {}, [])
-                    out = {indices[0]: f.translate(dict(b.homes), None, where[2], None, None, None, None, where[7], {}, {}, {}, held_at)}
+                    l3_free = max(where[7], max(b.used) + 1 if b.used else 0)
+                    out = {indices[0]: f.translate({}, None, where[2], None, None, None, None, l3_free, {}, {}, {}, held_at)}
                     if os.environ.get('VF_BORROW_SAY'):
                         print('  registers\t%s\t%d\t%d\tlevel 3\tuniform %d\thomed %d\tin memory %d\tframe %d\tsaves %d\theld %d\tproducts %d\tgave up: %s'
-                              % (f.name, f.registers, max(r[2] for r in out.values()), len(f.uniform), len(b.homes),
+                              % (f.name, f.registers, max(r[2] for r in out.values()), len(f.uniform), len(b.web_homes),
                                  len(b.slots), b.frame_bytes, f.save_slots, len(held_at), f.product_count, '; '.join(gave_up) or '-'), file=sys.stderr)
                     return out
                 # The registers of the rows: one set for each destination of whole-row loads, or
@@ -2922,20 +3194,26 @@ def translate(data, mc=None, listing=None, lives=None):
                 for f in fs:
                     for root, count in (f.q.companion_registers() if f.q else {}).items():
                         beside[root] = max(beside.get(root, 0), count)
-                homes = fs[0].borrow.homes if borrow else {}
-                where = placement(max(f.highest for f in fs) + 1, sorted({u for f in fs for u in f.uniform} - set(homes)),
-                                  {u for f in fs for u in f.pairs} - set(homes), any(f.needs_pool for f in fs) and borrow != 2,
+                max_borrowed = max(fs[0].borrow.used, default=0) if borrow else 0
+                base = max(max(f.highest for f in fs), max_borrowed) + 1
+                all_u = sorted({u for f in fs for u in f.uniform})
+                all_p = {u for f in fs for u in f.pairs}
+                if borrow:
+                    all_u = [u for u in all_u if u in fs[0].borrow.unhomed_u]
+                    all_p = {u for u in all_p if u in fs[0].borrow.unhomed_pairs}
+                where = placement(base, all_u, all_p, any(f.needs_pool for f in fs) and borrow != 2,
                                   max(f.save_slots for f in fs),
                                   any(f.needs_lane for f in fs), max(f.scratch_need for f in fs), any(f.has_product for f in fs),
                                   rows, row_kept, beside, sorted({q for f in fs for q in f.held_predicates}))
-                where = ({**where[0], **homes},) + where[1:8] + ({rd: where[8][to] for rd, to in shares.items()},) + where[9:]
+                where = (where[0],) + where[1:8] + ({rd: where[8][to] for rd, to in shares.items()},) + where[9:]
                 out = {i: f.translate(*where) for i, f in zip(indices, fs)}
                 if os.environ.get('VF_BORROW_SAY') and len(fs) == 1:
                     # (One line a function, for counts: what it had, what it has, and where the
                     # difference went.)
                     f = fs[0]
+                    n_homes = len(fs[0].borrow.web_homes) if borrow else 0
                     print('  registers\t%s\t%d\t%d\tlevel %d\tuniform %d\thomed %d\tpool %d\tsaves %d\theld %d\tproducts %d\tgave up: %s'
-                          % (f.name, f.registers, max(r[2] for r in out.values()), borrow, len(f.uniform), len(homes), 2 * bool(f.needs_pool and borrow != 2),
+                          % (f.name, f.registers, max(r[2] for r in out.values()), borrow, len(f.uniform), n_homes, 2 * bool(f.needs_pool and borrow != 2),
                              f.save_slots, len(f.held_predicates), f.product_count, '; '.join(gave_up) or '-'), file=sys.stderr)
                 return out
             gave_up = []
@@ -3019,11 +3297,84 @@ def translate(data, mc=None, listing=None, lives=None):
                         if os.environ.get('VF_BORROW_SAY'):
                             print('  refused\t%s\t%s\tand with borrowed registers: %s' % (fs[0].name, why, '; '.join(gave_up[1:])), file=sys.stderr)
                         raise why
+                f = fs[0]
+                def snap_state(fn):
+                    return (
+                        fn.borrow,
+                        dict(getattr(fn, 'hold_at', {})),
+                        dict(getattr(fn, 'given_at', {})),
+                        dict(getattr(fn, 'spilled', {})),
+                        list(getattr(fn, 'lives', [])),
+                        list(getattr(fn, 'held_lives', [])),
+                        list(getattr(fn, 'items', [])),
+                        list(getattr(fn, 'moved', [])),
+                        list(getattr(fn, 'relocate', [])),
+                    )
+                def restore_state(fn, st):
+                    (fn.borrow, fn.hold_at, fn.given_at, fn.spilled,
+                     fn.lives, fn.held_lives, fn.items, fn.moved, fn.relocate) = st
+                best_f_state = snap_state(f)
+                info = e.section('.nv.info.' + f.name)
+                info_data = info.data if info is not None else b''
+                occ_limit = occupancy_target(f.registers, info_data)
+                normal_count = done[indices[0]][2]
+                best_warps = occupancy_warps(normal_count, info_data)
+                saves = f.save_slots
+                min_possible = f.highest + 3 + saves
+                if normal_count > occ_limit and occupancy_warps(min_possible, info_data) > best_warps and not relocations.get(indices[0]) and not f.tables:
+                    old_keys = set(done[indices[0]][1].keys())
+                    min_tier = occupancy_target(min_possible, info_data)
+                    tier = max(occ_limit, min_tier)
+                    tried_eff = set()
+                    while True:
+                        pool_extra = 2 if f.needs_pool else 0
+                        top_l2 = max(0, tier - 3 - saves)
+                        top_l1 = max(0, top_l2 - pool_extra)
+                        hit_occ_limit = False
+                        for level, bound in ((1, top_l1), (2, top_l2)):
+                            try_bounds = [bound]
+                            idx = 0
+                            while idx < len(try_bounds):
+                                bnd = try_bounds[idx]
+                                idx += 1
+                                eff_key = (level, max(bnd, f.highest))
+                                if eff_key in tried_eff:
+                                    continue
+                                tried_eff.add(eff_key)
+                                try:
+                                    candidate = attempt(True, True, level, bnd)
+                                except Refused:
+                                    continue
+                                c_count = candidate[indices[0]][2]
+                                c_warps = occupancy_warps(c_count, info_data)
+                                if c_warps > best_warps and set(candidate[indices[0]][1].keys()) == old_keys:
+                                    done = candidate
+                                    best_warps = c_warps
+                                    best_f_state = snap_state(f)
+                                    if c_count <= occ_limit:
+                                        hit_occ_limit = True
+                                        break
+                                if c_count > tier and idx == 1 and c_count - tier <= bnd:
+                                    tighter = bnd - (c_count - tier)
+                                    if tighter not in try_bounds:
+                                        try_bounds.append(tighter)
+                            if hit_occ_limit:
+                                break
+                        if hit_occ_limit:
+                            break
+                        next_tier = None
+                        for probe in range(tier + 1, normal_count):
+                            if occupancy_warps(probe, info_data) > best_warps:
+                                next_tier = occupancy_target(probe, info_data)
+                                break
+                        if next_tier is not None and next_tier > tier and next_tier < normal_count:
+                            tier = next_tier
+                        else:
+                            break
                 if BORROW == 9:
-                    f = fs[0]
-                    info = e.section('.nv.info.' + f.name)
-                    limit = graph_register_budget(f.registers, info.data if info is not None else b'')
+                    limit = graph_register_budget(f.registers, info_data)
                     if done[indices[0]][2] > limit and not relocations.get(indices[0]) and not f.tables:
+                        pre_b9 = done
                         top = max(0, limit - 3 - f.save_slots)
                         for bounded in (lambda: attempt(True, True, 1), lambda: attempt(True, True, 2),
                                         lambda: attempt(False, False, 3, top)):
@@ -3033,11 +3384,16 @@ def translate(data, mc=None, listing=None, lives=None):
                                 continue
                             if candidate[indices[0]][2] <= limit:
                                 # Preserve all instruction boundaries used by attributes and symbols.
-                                done = candidate if candidate[indices[0]][1].keys() == done[indices[0]][1].keys() else way()
+                                if candidate[indices[0]][1].keys() == done[indices[0]][1].keys():
+                                    done = candidate
+                                    best_f_state = snap_state(f)
+                                else:
+                                    done = pre_b9
                                 break
                         else:
                             # Restore the instruction map, frame and relocations of the normal translation.
-                            done = way()
+                            done = pre_b9
+                restore_state(f, best_f_state)
             elif BORROW == 6 and alone:
                 # What the layer does by itself. Wherever the translation of the switch off
                 # exists it is the one taken, byte for byte: nothing that runs today changes,
@@ -3207,7 +3563,7 @@ def translate(data, mc=None, listing=None, lives=None):
                     # memory (second), and `frame`, the bytes added there (first number). (A
                     # `held` line whose register is one of the program's is borrowed too.)
                     b = functions[i].borrow
-                    lives += [(name, u, r, 'home', [16 * at for at in b.spans[u]]) for u, r in sorted(b.homes.items())]
+                    lives += [(name, u, r, 'home', [16 * at for at in span]) for u, r, span in b.web_homes]
                     lives += [(name, width, first, 'pool', [16 * at]) for at, runs in sorted(functions[i].given_at.items()) for first, width in runs]
                     # (`room`: a register of the program (second number) put in the frame for
                     # the time of one instruction's sequence, and brought back.)

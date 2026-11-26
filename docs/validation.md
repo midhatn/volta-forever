@@ -147,15 +147,18 @@ home is declared has its register in the whole function, and shares it with noth
 Registers are borrowed in kernels only: a function that others call may be entered with its
 caller's values in registers that it never names.
 
-**The life of a home.** A register is the home of a uniform register for a life that the
-translator declares, and serves other purposes outside it; this holds for a register of the
-program and for one left under the kernel's own count alike. The validator works out the lives
-of the uniform registers itself, with those of the program's registers: the declared life must
-be the whole life (every instruction before or after which the uniform register holds something
-that may still be read, and every instruction that reads or writes it), and the homes of one
-uniform register are one register. And whatever is declared, nothing that the translation adds
-writes a home at an instruction of its declared life, but what the instruction that writes
-that uniform register became.
+**The life of a home.** A register is the home of a uniform register for a web (a connected
+SSA value-flow life that the translator declares), and serves other purposes outside it —
+including holding another register or another web's home elsewhere; this holds for a register
+of the program and for one left under the kernel's own count alike. The validator works out the
+lives of the uniform registers itself, with those of the program's registers: the declared web
+cover must cover the whole life (`HL`: every instruction before or after which the uniform
+register holds something that may still be read, and every instruction that reads or writes it),
+the home must stay constant along every control-flow and exact-call edge where the uniform
+register is live (`HC`), and at most one home may be declared per instruction for a given
+uniform register. And whatever is declared, nothing that the translation adds writes a home at
+an instruction of its declared life, but what the instruction that writes that uniform register
+became.
 
 **A predicate held in a register.** The register that holds a uniform predicate between the
 instructions that name it may be one of the program's: it then holds nothing of the program at
@@ -408,7 +411,7 @@ control was written for: a fault often breaks more than one rule.)
 | `unconverted` | The conversions of the first place that has some are left out: every sequence is as the design has it, and the plan is wrong (the checker of plans, qcheck.py, must object: nothing else looks at the states of the accumulators) | default: 5 of 5 |
 | `notalso` | A load whose result in Turing's layout something else reads does not give it (the same: only the checker of plans knows who reads what) | default: 5 of 5 |
 
-**Borrowed registers (9)**
+**Borrowed registers (11)**
 
 | Control | What is made wrong | Objected to (cubins objected to, of those it changes) |
 |---|---|---|
@@ -421,6 +424,8 @@ control was written for: a fault often breaks more than one rule.)
 | `overlap_pool` | The same for the pairs only | default: 1 of 1; `VF_BORROW=1`: 5 of 5 |
 | `short_home` | The declarations say less than the life of a uniform register in its home: an instruction of the life that neither reads nor writes it is left out (the translation is as it was: what the validator is told is wrong) | default: 1 of 2; `VF_BORROW=1`: 19 of 20 |
 | `pool_in_home_unsaid` | As overlap_pool, and no line of the declarations says that the pair is taken where it is the home of a uniform register that is alive | default: 1 of 1; `VF_BORROW=1`: 5 of 5 |
+| `split_home` | A uniform register's home changes mid-web across a control-flow edge where it is live (`HC`) | `VF_BORROW=1`: 8 of 8 (16 test cubins) |
+| `caller_live_in_callee` | An ordinary register kept live by a caller across an exact `CALL.REL`/`RET.REL` call is taken as free inside the callee | default: 1 of 1; `VF_BORROW=1`: 1 of 1 (16 test cubins) |
 
 **The frame (31)**
 

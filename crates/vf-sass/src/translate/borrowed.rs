@@ -1,24 +1,24 @@
 //! Borrowed registers: registers of the program that hold nothing where the translation
-//! needs them. Liveness analysis of registers, homes for uniform registers, the pool at
-//! each instruction, and victims for room-making at level 3.
+//! needs them. Liveness analysis of registers, homes for uniform register value-flow webs,
+//! the pool at each instruction, and victims for room-making at level 3.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::decode::{LETTER_R, LETTER_U};
+use crate::decode::{LETTER_R, LETTER_U, uniform_operands};
 
 use super::context::entries;
 use super::parse::FuncData;
 use super::{Refused, RegSet, regset_andnot, regset_empty, regset_or, regset_set, regset_test, unannounced};
 
-/// Registers of the program that hold nothing where the translation needs registers: a home
-/// for each uniform register through its whole life, and an even register and the next at an
-/// instruction whose sequence computes into two (the pool). `docs/translator.md`, "Registers".
+/// Registers of the program that hold nothing where the translation needs registers: homes
+/// for each uniform register value-flow web through its life, and an even register and the next
+/// at an instruction whose sequence computes into two (the pool). `docs/translator.md`, "Registers".
 ///
 /// A register is free at an instruction when it is dead before it, dead after it, and neither
 /// read nor written by it (an instruction may write a register that nothing reads).
 /// The lives follow the ways of `pairing::Flow`; a write
-/// under a predicate ends no life; a call within the section reads and writes what the code
-/// it calls does; a call elsewhere reads every register the function names; at a return every
+/// under a predicate ends no life; an exact `CALL.REL`/`RET.REL` subroutine uses caller liveness;
+/// an inexact call reads every register the function names; at any other return every
 /// one of them is alive. R0 and R1 are never taken (R1 is the stack).
 pub(super) struct Borrowed {
     /// The highest register the program uses.
@@ -35,10 +35,14 @@ pub(super) struct Borrowed {
     /// A bit set of registers that some instruction writes late without saying when
     /// (never borrowed as victims either).
     pub(super) never: RegSet,
-    /// {uniform register: ordinary register it lives in through its whole life}.
-    pub(super) homes: HashMap<u32, u32>,
-    /// {uniform register with a home: the instructions of its life}.
-    pub(super) spans: HashMap<u32, Vec<usize>>,
+    /// Per-instruction home assignments: `(u, r)` sorted by `u` at each instruction `i`.
+    pub(super) home_at_insn: Vec<Vec<(u32, u32)>>,
+    /// Homed value-flow webs: `(uniform_reg, ordinary_reg, sorted_insn_indices)` for `MAP.lives`.
+    pub(super) web_homes: Vec<(u32, u32, Vec<usize>)>,
+    /// Uniform registers that have at least one unhomed web (need `placement` or frame `slots`).
+    pub(super) unhomed_u: HashSet<u32>,
+    /// Uniform 64-bit pair heads (`first` of `first:first+1`) with an unhomed pair web.
+    pub(super) unhomed_pairs: HashSet<u32>,
     /// The ordinary registers taken for homes or for the pool.
     pub(super) used: HashSet<u32>,
     /// Level 3: everything at the instruction.
@@ -65,6 +69,22 @@ pub(super) struct Borrowed {
     pub(super) spill: u32,
 }
 
+fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+    let ra = uf_find(parent, a);
+    let rb = uf_find(parent, b);
+    if ra != rb {
+        parent[rb] = ra;
+    }
+}
+
 impl Borrowed {
     pub(super) fn new(fd: &FuncData, all_in_memory: bool, top_override: Option<u32>) -> Result<Self, Refused> {
         let ent = entries(fd);
@@ -81,6 +101,7 @@ impl Borrowed {
         let mut writes_u: Vec<u64> = vec![0u64; n];
         let mut every_r: RegSet = regset_empty();
         let mut every_u: u64 = 0;
+        let mut insn_pairs: Vec<Vec<u32>> = Vec::with_capacity(n);
         for (i, d) in fd.src.iter().enumerate() {
             for &(letter, x, _) in &d.reads {
                 if letter == LETTER_R && x != 255 {
@@ -96,19 +117,83 @@ impl Borrowed {
                     writes_u[i] |= 1u64 << x;
                 }
             }
+            let mut pairs_here = Vec::new();
+            for (first, count) in uniform_operands(d) {
+                if count == 2 && first < 62 {
+                    pairs_here.push(first);
+                }
+            }
+            pairs_here.sort_unstable();
+            pairs_here.dedup();
+            insn_pairs.push(pairs_here);
             every_r = regset_or(&every_r, &regset_or(&reads_r[i], &writes_r[i]));
             every_u |= reads_u[i] | writes_u[i];
         }
+        let raw_reads_u = reads_u.clone();
+        let raw_writes_u = writes_u.clone();
         let mut kills_r = writes_r.clone();
         let mut kills_u = writes_u.clone();
         let mut leaves_r: Vec<RegSet> = vec![regset_empty(); n];
         let mut leaves_u: Vec<u64> = vec![0u64; n];
+
+        // Identify exact internal CALL.REL/RET.REL subroutines (all calls exact, unreachable
+        // directly from entry 0, returning only via unguarded ret__REL).
+        let mut main_reachable = vec![false; n];
+        if n > 0 {
+            let mut work = vec![0usize];
+            main_reachable[0] = true;
+            while let Some(k) = work.pop() {
+                for &t in &flow.succ[k] {
+                    if !main_reachable[t] {
+                        main_reachable[t] = true;
+                        work.push(t);
+                    }
+                }
+            }
+        }
+        let mut target_callers: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for i in 0..n {
+            if flow.kind[i] == "call"
+                && let Some(target) = flow.named[i]
+            {
+                target_callers.entry(target).or_default().push(i);
+            }
+        }
+        let mut callee_bodies: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+        let mut exact_rets = vec![false; n];
+        let mut exact_targets: HashSet<usize> = HashSet::new();
+        for (target, callers) in &target_callers {
+            let mut body = BTreeSet::new();
+            let mut work = vec![*target];
+            while let Some(k) = work.pop() {
+                if !body.insert(k) || fd.src[k].mnemonic == "RET" {
+                    continue;
+                }
+                work.extend(flow.succ[k].iter().copied());
+            }
+            let all_calls_exact = callers
+                .iter()
+                .all(|&c| fd.src[c].name.starts_with("call_rel") && flow.called.get(&c).is_some_and(Option::is_some));
+            let isolated = !body.iter().any(|&k| main_reachable[k]);
+            let clean_rets = body.iter().all(|&k| {
+                fd.src[k].mnemonic != "RET" || (fd.src[k].name == "ret__REL" && crate::pairing::unguarded(&fd.src[k]))
+            });
+            if all_calls_exact && isolated && clean_rets {
+                exact_targets.insert(*target);
+                for &k in &body {
+                    if fd.src[k].mnemonic == "RET" {
+                        exact_rets[k] = true;
+                    }
+                }
+            }
+            callee_bodies.insert(*target, body);
+        }
+
         for i in 0..n {
             if flow.kind[i] == "call" {
                 let called = flow.called.get(&i);
                 match called {
                     Some(None) => {
-                        // A function not known here: reads everything.
                         reads_r[i] = regset_or(&reads_r[i], &every_r);
                         reads_u[i] |= every_u;
                     }
@@ -123,34 +208,39 @@ impl Borrowed {
                                 regset_set(&mut writes_r[i], x);
                             }
                         }
-                        // And the uniform registers that the code it calls reads or writes:
-                        // `flow.called` has the registers only. A uniform register set before
-                        // the call and read by that code was taken for dead at the call
-                        // until 2026-11-19.
                         if let Some(entry) = flow.named[i] {
-                            let mut body = std::collections::BTreeSet::new();
-                            let mut work = vec![entry];
-                            while let Some(k) = work.pop() {
-                                if body.insert(k) {
-                                    work.extend(flow.succ[k].iter().copied());
+                            let body = &callee_bodies[&entry];
+                            let exit_u = if exact_targets.contains(&entry) { 0u64 } else { every_u };
+                            let mut cal_live: BTreeMap<usize, u64> = body.iter().map(|&k| (k, 0)).collect();
+                            let mut changed_u = true;
+                            while changed_u {
+                                changed_u = false;
+                                for &k in body.iter().rev() {
+                                    let mut after = if fd.src[k].mnemonic == "RET" { exit_u } else { 0u64 };
+                                    for &t in &flow.succ[k] {
+                                        if let Some(&v) = cal_live.get(&t) {
+                                            after |= v;
+                                        }
+                                    }
+                                    let ck = if crate::pairing::unguarded(&fd.src[k]) {
+                                        raw_writes_u[k]
+                                    } else {
+                                        0
+                                    };
+                                    let now = raw_reads_u[k] | (after & !ck);
+                                    if now != cal_live[&k] {
+                                        cal_live.insert(k, now);
+                                        changed_u = true;
+                                    }
                                 }
                             }
-                            for &k in &body {
-                                for &(letter, x, _) in &fd.src[k].reads {
-                                    if letter == LETTER_U && x != 63 {
-                                        reads_u[i] |= 1u64 << x;
-                                    }
-                                }
-                                for &(letter, x) in &fd.src[k].writes {
-                                    if letter == LETTER_U && x != 63 {
-                                        writes_u[i] |= 1u64 << x;
-                                    }
-                                }
+                            reads_u[i] |= cal_live.get(&entry).copied().unwrap_or(0);
+                            for &k in body {
+                                writes_u[i] |= raw_writes_u[k];
                             }
                         }
                     }
                     None => {
-                        // Not in called map means it's not a recognized call pattern.
                         reads_r[i] = regset_or(&reads_r[i], &every_r);
                         reads_u[i] |= every_u;
                     }
@@ -161,7 +251,7 @@ impl Borrowed {
                 kills_r[i] = regset_empty();
                 kills_u[i] = 0;
             }
-            if fd.src[i].mnemonic == "RET" {
+            if fd.src[i].mnemonic == "RET" && !exact_rets[i] {
                 leaves_r[i] = every_r;
                 leaves_u[i] = every_u;
             }
@@ -189,8 +279,7 @@ impl Borrowed {
                 }
             }
         }
-        // busy[i] = live_in[i] | live_out[i] | reads[i] | writes[i], register portion only.
-        // busy_u[i] = same for uniform registers (for computing spans).
+        let mut live_out_u: Vec<u64> = Vec::with_capacity(n);
         let mut busy: Vec<RegSet> = Vec::with_capacity(n);
         let mut busy_u: Vec<u64> = Vec::with_capacity(n);
         for i in 0..n {
@@ -200,11 +289,79 @@ impl Borrowed {
                 out_r = regset_or(&out_r, &live_in_r[t]);
                 out_u |= live_in_u[t];
             }
+            live_out_u.push(out_u);
             busy.push(regset_or(
                 &regset_or(&live_in_r[i], &out_r),
                 &regset_or(&reads_r[i], &writes_r[i]),
             ));
             busy_u.push(live_in_u[i] | out_u | reads_u[i] | writes_u[i]);
+        }
+
+        // Registers and uniform registers preserved by callers across exact CALL.REL sites stay
+        // live inside the callee's body while it executes (without feeding back into caller `reads`).
+        if !exact_targets.is_empty() {
+            let mut exact_body_nodes: BTreeSet<usize> = BTreeSet::new();
+            let mut exact_ret_leaves_r: HashMap<usize, RegSet> = HashMap::new();
+            let mut exact_ret_leaves_u: HashMap<usize, u64> = HashMap::new();
+            for &target in &exact_targets {
+                let mut exit_r = regset_empty();
+                let mut exit_u = 0u64;
+                for &c in &target_callers[&target] {
+                    let mut c_out_r = leaves_r[c];
+                    let mut c_out_u = leaves_u[c];
+                    for &t in &flow.succ[c] {
+                        c_out_r = regset_or(&c_out_r, &live_in_r[t]);
+                        c_out_u |= live_in_u[t];
+                    }
+                    exit_r = regset_or(&exit_r, &c_out_r);
+                    exit_u |= c_out_u;
+                }
+                for &k in &callee_bodies[&target] {
+                    exact_body_nodes.insert(k);
+                    if fd.src[k].mnemonic == "RET" {
+                        let er = exact_ret_leaves_r.entry(k).or_insert_with(regset_empty);
+                        *er = regset_or(er, &exit_r);
+                        *exact_ret_leaves_u.entry(k).or_insert(0) |= exit_u;
+                    }
+                }
+            }
+            for (&k, &er) in &exact_ret_leaves_r {
+                leaves_r[k] = regset_or(&leaves_r[k], &er);
+            }
+            for (&k, &eu) in &exact_ret_leaves_u {
+                leaves_u[k] |= eu;
+            }
+            let exact_vec: Vec<usize> = exact_body_nodes.into_iter().collect();
+            let mut changed_c = true;
+            while changed_c {
+                changed_c = false;
+                for &k in exact_vec.iter().rev() {
+                    let mut out_r = leaves_r[k];
+                    let mut out_u = leaves_u[k];
+                    for &t in &flow.succ[k] {
+                        out_r = regset_or(&out_r, &live_in_r[t]);
+                        out_u |= live_in_u[t];
+                    }
+                    let new_r = regset_or(&reads_r[k], &regset_andnot(&out_r, &kills_r[k]));
+                    let new_u = reads_u[k] | (out_u & !kills_u[k]);
+                    if new_r != live_in_r[k] || new_u != live_in_u[k] {
+                        live_in_r[k] = new_r;
+                        live_in_u[k] = new_u;
+                        changed_c = true;
+                    }
+                }
+            }
+            for &k in &exact_vec {
+                let mut out_r = leaves_r[k];
+                let mut out_u = leaves_u[k];
+                for &t in &flow.succ[k] {
+                    out_r = regset_or(&out_r, &live_in_r[t]);
+                    out_u |= live_in_u[t];
+                }
+                live_out_u[k] = out_u;
+                busy[k] = regset_or(&regset_or(&live_in_r[k], &out_r), &regset_or(&reads_r[k], &writes_r[k]));
+                busy_u[k] = live_in_u[k] | out_u | reads_u[k] | writes_u[k];
+            }
         }
 
         // Registers that some instruction writes late without saying when are never borrowed:
@@ -231,10 +388,7 @@ impl Borrowed {
             Some(t) => t.max(fd.highest),
             None => fd.highest,
         };
-        // Where the stack pointer is at each instruction: `depth[i]` is how far R1 is, before
-        // instruction i, under where the first instruction puts it. The program moves it by
-        // constants only (IADD3 R1, R1, imm); known at an instruction when every way to it
-        // agrees; code that is called has the depth of its calls.
+        // Where the stack pointer is at each instruction.
         let mut depth: Vec<Option<i32>> = vec![None; n];
         let mut r1_fixed = n > 1;
         if n > 1 {
@@ -251,13 +405,11 @@ impl Borrowed {
                 }
                 depth[i] = Some(at);
                 let mut after = at;
-                // Check if instruction i writes R1.
                 if writes_r[i]
                     .iter()
                     .enumerate()
                     .any(|(wi, &w)| if wi == 0 { w & 2 != 0 } else { false })
                 {
-                    // Does it write R1 by IADD3 R1, R1, imm (unguarded, Rc=255, no negate)?
                     let d = &fd.src[i];
                     if d.name == "iadd3_imm__RsIR_RIR"
                         && d.op_or(crate::generated::fields::OP_RD, 255) == 1
@@ -277,74 +429,218 @@ impl Borrowed {
                 for &t in &flow.succ[i] {
                     work.push((t, after));
                 }
-                // Code that is called has the depth of its calls: of the calls whose function
-                // is known whole (`called`), as in the prototype. A function that calls another
-                // is not entered, and a uniform register in memory there is refused (`slot`).
                 if flow.kind[i] == "call"
-                    && flow.called.get(&i).is_some_and(|effect| effect.is_some())
+                    && flow.called.get(&i).is_some_and(Option::is_some)
                     && let Some(Some(entry)) = flow.named.get(i).copied()
                 {
                     work.push((entry, at));
                 }
             }
         }
-        // The uniform registers, those of the longest lives first: each in the lowest register
-        // that is free wherever it is alive, read or written, and that no other one has there.
-        let mut taken: Vec<RegSet> = vec![regset_empty(); n];
-        let mut homes: HashMap<u32, u32> = HashMap::new();
-        let mut spans: HashMap<u32, Vec<usize>> = HashMap::new();
-        let mut used: HashSet<u32> = HashSet::new();
 
-        // Build the list of uniform register units with their spans.
-        let pairs_set: HashSet<u32> = fd.pairs.iter().copied().collect();
-        let mut units: Vec<(u32, u32, Vec<usize>)> = Vec::new(); // (u, width, span)
-        for &u in &fd.uniform {
-            if u > 0 && pairs_set.contains(&(u - 1)) {
-                continue; // upper half of a pair
-            }
-            let width: u32 = if pairs_set.contains(&u) { 2 } else { 1 };
-            let mask = (1u64 << width) - 1;
-            let span: Vec<usize> = (0..n).filter(|&i| (busy_u[i] >> u) & mask != 0).collect();
-            units.push((u, width, span));
+        // Decompose each uniform register's active instructions (`busy_u[i]`) into disjoint
+        // SSA value-flow webs, then couple webs linked by 64-bit pair operands (`uniform_operands`
+        // with count == 2) into allocation units.
+        let return_sites: Vec<usize> = (0..n)
+            .filter(|&j| fd.src[j].name.starts_with("call_rel") && j + 1 < n)
+            .map(|j| j + 1)
+            .collect();
+
+        struct Web {
+            u: u32,
+            span: Vec<usize>,
         }
-        // Sort: longest lives first, ties by number.
-        units.sort_by(|a, b| b.2.len().cmp(&a.2.len()).then(a.0.cmp(&b.0)));
-
-        if !all_in_memory {
-            for (u, width, span) in &units {
-                let width = *width;
-                // Union of busy | taken over the span.
-                let mut union = regset_empty();
-                for &i in span {
-                    union = regset_or(&union, &regset_or(&busy[i], &taken[i]));
+        let mut webs: Vec<Web> = Vec::new();
+        let mut web_of_insn_u: HashMap<(usize, u32), usize> = HashMap::new();
+        let mut parent: Vec<usize> = vec![0; n];
+        for &u in &fd.uniform {
+            if u >= 63 {
+                continue;
+            }
+            let bit = 1u64 << u;
+            if (0..n).all(|i| (busy_u[i] & bit) == 0) {
+                continue;
+            }
+            for (idx, slot) in parent.iter_mut().enumerate() {
+                *slot = idx;
+            }
+            for i in 0..n {
+                for &t in &flow.succ[i] {
+                    if (live_in_u[t] & bit) != 0 {
+                        uf_union(&mut parent, i, t);
+                    }
                 }
-                // Find the lowest free register (starting from 2, stepping by width).
-                // Python: range(2, top + 2 - width, width).
-                let mut r = 2u32;
-                let upper = top + 2 - width;
-                let found = loop {
-                    if r >= upper {
-                        break None;
+                if fd.src[i].name == "ret__REL" && !exact_rets[i] {
+                    for &t in &return_sites {
+                        if (live_in_u[t] & bit) != 0 {
+                            uf_union(&mut parent, i, t);
+                        }
                     }
-                    let all_clear = (0..width).all(|k| !regset_test(&union, r + k));
-                    if all_clear {
-                        break Some(r);
+                }
+                if flow.kind[i] == "call"
+                    && flow.called.get(&i).is_some_and(Option::is_some)
+                    && let Some(entry) = flow.named[i]
+                {
+                    if (busy_u[i] & bit) != 0 && (live_in_u[entry] & bit) != 0 {
+                        uf_union(&mut parent, i, entry);
                     }
-                    r += width;
-                };
-                if let Some(r) = found {
-                    for k in 0..width {
-                        homes.insert(*u + k, r + k);
-                        spans.insert(*u + k, span.clone());
-                        used.insert(r + k);
-                    }
-                    for &i in span {
-                        for k in 0..width {
-                            regset_set(&mut taken[i], r + k);
+                    if ((writes_u[i] & live_out_u[i]) & bit) != 0 {
+                        for &k in &callee_bodies[&entry] {
+                            if (raw_writes_u[k] & bit) != 0 {
+                                uf_union(&mut parent, i, k);
+                            }
                         }
                     }
                 }
             }
+            let mut by_root: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            for (i, &bu) in busy_u.iter().enumerate() {
+                if (bu & bit) != 0 {
+                    let r = uf_find(&mut parent, i);
+                    by_root.entry(r).or_default().push(i);
+                }
+            }
+            for span in by_root.into_values() {
+                let wid = webs.len();
+                for &i in &span {
+                    web_of_insn_u.insert((i, u), wid);
+                }
+                webs.push(Web { u, span });
+            }
+        }
+
+        let nw = webs.len();
+        let mut unit_parent: Vec<usize> = (0..nw).collect();
+        for (i, pairs_here) in insn_pairs.iter().enumerate() {
+            for &first in pairs_here {
+                if let (Some(&w0), Some(&w1)) = (web_of_insn_u.get(&(i, first)), web_of_insn_u.get(&(i, first + 1))) {
+                    uf_union(&mut unit_parent, w0, w1);
+                }
+            }
+        }
+
+        struct Unit {
+            min_u: u32,
+            width: u32,
+            total_span_len: usize,
+            first_insn: usize,
+            members: Vec<usize>,
+            pair_firsts: Vec<u32>,
+            valid: bool,
+        }
+        let mut unit_members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for wid in 0..nw {
+            let root = uf_find(&mut unit_parent, wid);
+            unit_members.entry(root).or_default().push(wid);
+        }
+        let mut unit_pair_firsts: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+        for (i, pairs_here) in insn_pairs.iter().enumerate() {
+            for &first in pairs_here {
+                if let Some(&w0) = web_of_insn_u.get(&(i, first)) {
+                    let root = uf_find(&mut unit_parent, w0);
+                    unit_pair_firsts.entry(root).or_default().push(first);
+                }
+            }
+        }
+        let mut units: Vec<Unit> = Vec::with_capacity(unit_members.len());
+        for (root, members) in unit_members {
+            let min_u = members.iter().map(|&w| webs[w].u).min().unwrap();
+            let max_u = members.iter().map(|&w| webs[w].u).max().unwrap();
+            let width = max_u - min_u + 1;
+            let mut span_set: BTreeSet<usize> = BTreeSet::new();
+            for &w in &members {
+                span_set.extend(webs[w].span.iter().copied());
+            }
+            let first_insn = *span_set.iter().next().unwrap_or(&0);
+            let mut pfirsts = unit_pair_firsts.remove(&root).unwrap_or_default();
+            pfirsts.sort_unstable();
+            pfirsts.dedup();
+            let valid = width == 1 || pfirsts.iter().all(|&f| (f - min_u).is_multiple_of(2));
+            units.push(Unit {
+                min_u,
+                width,
+                total_span_len: span_set.len(),
+                first_insn,
+                members,
+                pair_firsts: pfirsts,
+                valid,
+            });
+        }
+        units.sort_by(|a, b| {
+            b.total_span_len
+                .cmp(&a.total_span_len)
+                .then(b.width.cmp(&a.width))
+                .then(a.min_u.cmp(&b.min_u))
+                .then(a.first_insn.cmp(&b.first_insn))
+        });
+
+        let mut taken: Vec<RegSet> = vec![regset_empty(); n];
+        let mut home_at_insn: Vec<Vec<(u32, u32)>> = vec![Vec::new(); n];
+        let mut web_homes: Vec<(u32, u32, Vec<usize>)> = Vec::new();
+        let mut unhomed_u: HashSet<u32> = HashSet::new();
+        let mut unhomed_pairs: HashSet<u32> = HashSet::new();
+        let mut used: HashSet<u32> = HashSet::new();
+
+        let mark_unhomed = |unit: &Unit, unhomed_u: &mut HashSet<u32>, unhomed_pairs: &mut HashSet<u32>| {
+            for &wid in &unit.members {
+                unhomed_u.insert(webs[wid].u);
+            }
+            for &f in &unit.pair_firsts {
+                unhomed_pairs.insert(f);
+                unhomed_u.insert(f);
+                unhomed_u.insert(f + 1);
+            }
+        };
+
+        if all_in_memory {
+            for unit in &units {
+                mark_unhomed(unit, &mut unhomed_u, &mut unhomed_pairs);
+            }
+        } else {
+            for unit in &units {
+                if !unit.valid || unit.width > top {
+                    mark_unhomed(unit, &mut unhomed_u, &mut unhomed_pairs);
+                    continue;
+                }
+                let mut union_by_off = vec![regset_empty(); unit.width as usize];
+                for &wid in &unit.members {
+                    let off = (webs[wid].u - unit.min_u) as usize;
+                    for &i in &webs[wid].span {
+                        union_by_off[off] = regset_or(&union_by_off[off], &regset_or(&busy[i], &taken[i]));
+                    }
+                }
+                let step = if unit.width == 1 { 1u32 } else { 2 };
+                let upper = top + 2 - unit.width;
+                let mut r = 2u32;
+                let found = loop {
+                    if r >= upper {
+                        break None;
+                    }
+                    let all_clear = (0..unit.width).all(|off| !regset_test(&union_by_off[off as usize], r + off));
+                    if all_clear {
+                        break Some(r);
+                    }
+                    r += step;
+                };
+                if let Some(r) = found {
+                    for &wid in &unit.members {
+                        let w = &webs[wid];
+                        let reg = r + (w.u - unit.min_u);
+                        web_homes.push((w.u, reg, w.span.clone()));
+                        for &i in &w.span {
+                            home_at_insn[i].push((w.u, reg));
+                            regset_set(&mut taken[i], reg);
+                        }
+                        used.insert(reg);
+                    }
+                } else {
+                    mark_unhomed(unit, &mut unhomed_u, &mut unhomed_pairs);
+                }
+            }
+        }
+        web_homes.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        for entry in &mut home_at_insn {
+            entry.sort_unstable_by_key(|&(u, _)| u);
         }
 
         Ok(Borrowed {
@@ -354,8 +650,10 @@ impl Borrowed {
             taken,
             touch,
             never,
-            homes,
-            spans,
+            home_at_insn,
+            web_homes,
+            unhomed_u,
+            unhomed_pairs,
             used,
             everything: false,
             slots: HashMap::new(),
@@ -369,12 +667,19 @@ impl Borrowed {
         })
     }
 
+    pub(super) fn home_at(&self, i: usize, u: u32) -> Option<u32> {
+        self.home_at_insn
+            .get(i)?
+            .binary_search_by_key(&u, |&(reg_u, _)| reg_u)
+            .ok()
+            .map(|pos| self.home_at_insn[i][pos].1)
+    }
+
     /// The lowest register that holds nothing at instruction `i`, or the lowest run of `width`
     /// registers from an even one: no home of a uniform register alive there, and not among
     /// `given` (a bit set: what the same instruction was given already). None when there is none.
     pub(super) fn free_at(&self, i: usize, width: u32, given: &RegSet) -> Option<u32> {
         let held = regset_or(&regset_or(&self.busy[i], &self.taken[i]), given);
-        // Python: range(2, top + 2 - width, 1 if width == 1 else 2).
         let upper = self.top + 2 - width;
         let step = if width == 1 { 1u32 } else { 2 };
         let mut r = 2u32;
@@ -396,14 +701,10 @@ impl Borrowed {
     /// something for the program, to be put in the frame for the time of the sequence and
     /// brought back after it (`Ctx::make_room`). None when there is none.
     pub(super) fn victims_at(&self, i: usize, width: u32, given: &RegSet) -> Option<u32> {
-        // Python: held = touch[i] | taken[i] | given | never | 3
         let mut held = regset_or(&regset_or(&self.touch[i], &self.taken[i]), given);
         held = regset_or(&held, &self.never);
-        // R0 and R1 never.
         regset_set(&mut held, 0);
         regset_set(&mut held, 1);
-        let _mask = (1u128 << width) - 1;
-        // Python: range(2, highest + 2 - width, 1 if width == 1 else 2)
         let upper = self.highest + 2 - width;
         let step = if width == 1 { 1u32 } else { 2 };
         let mut r = 2u32;
@@ -427,7 +728,6 @@ impl Borrowed {
         for &i in span {
             union = regset_or(&union, &regset_or(&self.busy[i], &self.taken[i]));
         }
-        // Python: range(2, top + 1).
         for r in 2..=self.top {
             if !regset_test(&union, r) {
                 for &i in span {
@@ -440,15 +740,18 @@ impl Borrowed {
         None
     }
 
-    /// A word of the frame for each uniform register that has no home (the two of a pair
+    /// A word of the frame for each uniform register that has unhomed webs (the two of a pair
     /// side by side, the lower one first). Returns the size of the frame in bytes.
     pub(super) fn assign_slots(&mut self, uniform: &[u32], pairs: &HashSet<u32>) -> u32 {
+        let _ = (uniform, pairs);
+        let mut list: Vec<u32> = self.unhomed_u.iter().copied().collect();
+        list.sort_unstable();
         let mut slot = 0u32;
-        for &u in uniform {
-            if self.homes.contains_key(&u) || (u > 0 && pairs.contains(&(u - 1))) {
+        for &u in &list {
+            if u > 0 && self.unhomed_pairs.contains(&(u - 1)) {
                 continue;
             }
-            if pairs.contains(&u) {
+            if self.unhomed_pairs.contains(&u) {
                 self.slots.insert(u, slot);
                 self.slots.insert(u + 1, slot + 1);
                 slot += 2;

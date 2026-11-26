@@ -433,7 +433,8 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             &[],
                         )?;
                         let si = indices[0];
-                        let place_map: HashMap<u32, u32> = b.homes.clone();
+                        let place_map: HashMap<u32, u32> = HashMap::new();
+                        let l3_count_next = placed.7.max(b.used.iter().copied().max().map_or(0, |m| m + 1));
                         match translate_function(
                             &mut dec70,
                             &functions[&si],
@@ -445,7 +446,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             None,     // no kept
                             None,     // no gathered
                             None,     // no scratch (taken at instruction)
-                            placed.7, // free
+                            l3_count_next,
                             None,     // no pairs plan
                             HashMap::new(),
                             HashMap::new(),
@@ -462,7 +463,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                                     eprintln!(
                                         "  registers\t{}\t{}\t{}\tlevel 3\tuniform {}\thomed {}\tin memory {}\tframe {}\tsaves {}\theld {}\tproducts {}\tgave up: {}",
                                         f.name, f.registers, tr.count,
-                                        f.uniform.len(), b.homes.len(),
+                                        f.uniform.len(), b.web_homes.len(),
                                         b.slots.len(), b.frame_bytes,
                                         predicates[0].save_slots, held_at.len(),
                                         f.product_count, gu
@@ -473,23 +474,32 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                             Err(refused) => return Err(refused),
                         }
                     }
-                    let homes: HashMap<u32, u32> = borrowed.as_ref().map_or_else(HashMap::new, |b| b.homes.clone());
-                    let homed_set: HashSet<u32> = homes.keys().copied().collect();
-                    // Uniform registers not homed: those that still need placement above.
+                    let max_borrowed = borrowed
+                        .as_ref()
+                        .and_then(|b| b.used.iter().copied().max())
+                        .unwrap_or(0);
+                    let base = fs.iter().map(|f| f.highest).max().unwrap().max(max_borrowed) + 1;
+                    // Uniform registers with unhomed webs still need placement above.
                     let uniform_for_placement: Vec<u32> = {
                         let mut all: Vec<u32> = fs.iter().flat_map(|f| f.uniform.iter().copied()).collect();
                         all.sort_unstable();
                         all.dedup();
-                        all.into_iter().filter(|u| !homed_set.contains(u)).collect()
+                        match borrowed.as_ref() {
+                            Some(b) => all.into_iter().filter(|u| b.unhomed_u.contains(u)).collect(),
+                            None => all,
+                        }
                     };
                     let pairs_for_placement: Vec<u32> = {
                         let mut all: Vec<u32> = fs.iter().flat_map(|f| f.pairs.iter().copied()).collect();
                         all.sort_unstable();
                         all.dedup();
-                        all.into_iter().filter(|u| !homed_set.contains(u)).collect()
+                        match borrowed.as_ref() {
+                            Some(b) => all.into_iter().filter(|u| b.unhomed_pairs.contains(u)).collect(),
+                            None => all,
+                        }
                     };
                     let placed = placement(
-                        fs.iter().map(|f| f.highest).max().unwrap() + 1,
+                        base,
                         &uniform_for_placement,
                         &pairs_for_placement,
                         fs.iter().any(|f| f.needs_pool) && borrow_level != 2,
@@ -502,7 +512,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         &held_preds,
                     )?;
                     let (
-                        mut place,
+                        place,
                         pool,
                         save,
                         lane,
@@ -514,10 +524,6 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         kept_rows_base,
                         hold_at,
                     ) = placed;
-                    // Merge the borrowed homes into the placement map.
-                    for (&u, &r) in &homes {
-                        place.insert(u, r);
-                    }
                     // Apply sharing: each destination gets the rows_at of the destination it shares with.
                     let mut result = Vec::new();
                     for (k, (&si, predicates)) in indices.iter().zip(&predicates).enumerate() {
@@ -558,7 +564,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     if std::env::var("VF_BORROW_SAY").is_ok() && fs.len() == 1 {
                         let f = &fs[0];
                         let count = result.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
-                        let n_homes = borrowed.as_ref().map_or(0, |b| b.homes.len());
+                        let n_homes = borrowed.as_ref().map_or(0, |b| b.web_homes.len());
                         let pool_count = if f.needs_pool && borrow_level != 2 { 2 } else { 0 };
                         let gu = if gave_up.is_empty() { "-".to_string() } else { gave_up.join("; ") };
                         eprintln!(
@@ -624,7 +630,7 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     // The chain: plain; levels 1, 2; level 3 with room and with products.
                     let mut gave_up: Vec<String> = Vec::new();
                     let plain_result = plain(&mut attempt, &gave_up);
-                    let normal = match plain_result {
+                    let mut normal = match plain_result {
                         Ok(d) => Ok(d),
                         Err(original_why) if original_why.0 == "more registers than there are" => {
                             gave_up.push(original_why.0.clone());
@@ -653,6 +659,80 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                         }
                         Err(e) => Err(e),
                     }?;
+                    // When level 0 crosses a GV100 warp occupancy cliff vs the source declaration,
+                    // recover occupancy via zero-spill level 1 / level 2 (without local-memory spills).
+                    {
+                        let f = fs[0];
+                        let info = e.section(&format!(".nv.info.{}", f.name))
+                            .map_or(&[][..], |i| e.sections[i].data.as_slice());
+                        let occ_limit = super::block_registers::occupancy_target(f.registers, info);
+                        let normal_count = normal[0].1.count;
+                        let mut best_warps = super::block_registers::occupancy_warps(normal_count, info);
+                        let min_possible = f.highest + 3 + saves;
+                        if normal_count > occ_limit
+                            && super::block_registers::occupancy_warps(min_possible, info) > best_warps
+                            && !relocations.contains_key(&indices[0])
+                            && f.tables.is_empty()
+                        {
+                            let old_keys: std::collections::BTreeSet<u64> =
+                                normal[0].1.new_of.keys().copied().collect();
+                            let min_tier = super::block_registers::occupancy_target(min_possible, info);
+                            let mut tier = occ_limit.max(min_tier);
+                            let mut tried_eff = std::collections::HashSet::new();
+                            'tiers: loop {
+                                let pool_extra = if f.needs_pool { 2 } else { 0 };
+                                let top_l2 = tier.saturating_sub(3).saturating_sub(saves);
+                                let top_l1 = top_l2.saturating_sub(pool_extra);
+                                for (level, bound) in [(1u32, top_l1), (2u32, top_l2)] {
+                                    let mut try_bounds = vec![bound];
+                                    let mut idx = 0;
+                                    while idx < try_bounds.len() {
+                                        let bnd = try_bounds[idx];
+                                        idx += 1;
+                                        if !tried_eff.insert((level, bnd.max(f.highest))) {
+                                            continue;
+                                        }
+                                        if let Ok(candidate) = attempt(true, level, Some(bnd), &gave_up) {
+                                            let c_count = candidate[0].1.count;
+                                            let c_warps = super::block_registers::occupancy_warps(c_count, info);
+                                            if c_warps > best_warps
+                                                && candidate[0].1.new_of.len() == old_keys.len()
+                                                && old_keys.iter().all(|k| candidate[0].1.new_of.contains_key(k))
+                                            {
+                                                normal = candidate;
+                                                best_warps = c_warps;
+                                                if c_count <= occ_limit {
+                                                    break 'tiers;
+                                                }
+                                            }
+                                            if c_count > tier
+                                                && idx == 1
+                                                && c_count - tier <= bnd
+                                            {
+                                                let tighter = bnd - (c_count - tier);
+                                                if !try_bounds.contains(&tighter) {
+                                                    try_bounds.push(tighter);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut next_tier = None;
+                                let mut probe = tier + 1;
+                                while probe < normal_count {
+                                    if super::block_registers::occupancy_warps(probe, info) > best_warps {
+                                        next_tier = Some(super::block_registers::occupancy_target(probe, info));
+                                        break;
+                                    }
+                                    probe += 1;
+                                }
+                                match next_tier {
+                                    Some(nt) if nt > tier && nt < normal_count => tier = nt,
+                                    _ => break 'tiers,
+                                }
+                            }
+                        }
+                    }
                     if opts.borrow == 9 {
                         let f = fs[0];
                         let info = e.section(&format!(".nv.info.{}", f.name))

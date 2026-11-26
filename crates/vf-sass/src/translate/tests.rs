@@ -345,7 +345,7 @@ fn borrowed_home_only_in_free_register() {
     let b = Borrowed::new(&fd, false, None).unwrap();
     // U4 should NOT get a home because R2..R7 are all busy in the span.
     assert!(
-        b.homes.is_empty(),
+        b.web_homes.is_empty(),
         "no home should be found when all registers are busy"
     );
 }
@@ -374,7 +374,7 @@ fn borrowed_never_takes_r0_r1() {
         false,
     );
     let b = Borrowed::new(&fd, false, None).unwrap();
-    for (&_u, &r) in &b.homes {
+    for &(_, r, _) in &b.web_homes {
         assert!(r >= 2, "R0 and R1 must never be taken as homes");
     }
     for &r in &b.used {
@@ -405,8 +405,8 @@ fn borrowed_no_shared_home_for_overlapping_lives() {
         false,
     );
     let b = Borrowed::new(&fd, false, None).unwrap();
-    if b.homes.contains_key(&4) && b.homes.contains_key(&5) {
-        assert_ne!(b.homes[&4], b.homes[&5], "overlapping lives must not share a home");
+    if let (Some(r4), Some(r5)) = (b.home_at(0, 4), b.home_at(0, 5)) {
+        assert_ne!(r4, r5, "overlapping lives must not share a home");
     }
 }
 
@@ -639,8 +639,10 @@ fn free_at_skips_given() {
         taken: vec![regset_empty()],
         touch: vec![regset_empty()],
         never: regset_empty(),
-        homes: HashMap::new(),
-        spans: HashMap::new(),
+        home_at_insn: vec![Vec::new()],
+        web_homes: Vec::new(),
+        unhomed_u: HashSet::new(),
+        unhomed_pairs: HashSet::new(),
         used: HashSet::new(),
         everything: false,
         slots: HashMap::new(),
@@ -683,8 +685,10 @@ fn free_at_returns_none_when_full() {
         taken: vec![regset_empty()],
         touch: vec![regset_empty()],
         never: regset_empty(),
-        homes: HashMap::new(),
-        spans: HashMap::new(),
+        home_at_insn: vec![Vec::new()],
+        web_homes: Vec::new(),
+        unhomed_u: HashSet::new(),
+        unhomed_pairs: HashSet::new(),
         used: HashSet::new(),
         everything: false,
         slots: HashMap::new(),
@@ -1431,4 +1435,344 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
     // A writer earlier in the code that goes on to that place.
     let through = ends(&[with_stall(board(DSETP, 0), 2, false), nop, nop], &[32], true);
     assert_eq!(through[0] + through[1], 15, "{through:?}");
+}
+
+/// A kernel whose translated register count crosses a GV100 warp occupancy cliff recovers a
+/// full warp tier via zero-spill level-2 borrowing without allocating a local frame.
+#[test]
+fn occupancy_cliff_recovers_full_warp_tier_without_spills() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let result = translate_with_options(original, true, &Options::default()).unwrap();
+    let report = result.report.iter().find(|r| r.name == "p_callee").unwrap();
+    assert_eq!(report.refused, None);
+    let out = crate::elf::Elf::parse(&result.bytes).unwrap();
+    let text = &out.sections[out.section(".text.p_callee").unwrap()];
+    let count = text.info >> 24;
+    assert!(
+        count <= 64,
+        "expected p_callee to recover <= 64 registers (8 warps/subpartition), got {count}"
+    );
+    let map = result.map.unwrap();
+    assert!(
+        !map.iter()
+            .any(|(f, _, _, what)| f == "p_callee" && what.starts_with("mem:")),
+        "occupancy recovery must stay zero-spill without local-memory frame ops"
+    );
+}
+
+/// Disjoint SSA value-flow webs of the same uniform register may occupy different ordinary
+/// registers when no single register is free across both webs.
+#[test]
+fn borrowed_splits_disjoint_uniform_webs_to_break_cliff() {
+    // Web 1 at [0, 1]: R2 is free, R3..R4 are busy.
+    // Gap at [2]: UR4 is dead, R2 is written and kept live across [3, 4] while R3 becomes free.
+    // Web 2 at [3, 4]: R3 is free, R2 and R4 are busy.
+    let fd = make_borrow_func(
+        &[
+            (&[(LETTER_R, 3, 0), (LETTER_R, 4, 0)], &[(LETTER_U, 4)]),
+            (&[(LETTER_U, 4, 0), (LETTER_R, 3, 0), (LETTER_R, 4, 0)], &[]),
+            (&[(LETTER_R, 4, 0)], &[(LETTER_R, 2)]),
+            (&[(LETTER_R, 2, 0), (LETTER_R, 4, 0)], &[(LETTER_U, 4)]),
+            (&[(LETTER_U, 4, 0), (LETTER_R, 2, 0), (LETTER_R, 4, 0)], &[]),
+            (&[(LETTER_R, 4, 0)], &[]),
+        ],
+        4,
+        &[4],
+        &[],
+        false,
+    );
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    assert!(b.unhomed_u.is_empty(), "split webs should all find homes");
+    assert_eq!(b.web_homes.len(), 2);
+    assert_eq!(b.home_at(0, 4), Some(2));
+    assert_eq!(b.home_at(1, 4), Some(2));
+    assert_eq!(b.home_at(2, 4), None);
+    assert_eq!(b.home_at(3, 4), Some(3));
+    assert_eq!(b.home_at(4, 4), Some(3));
+}
+
+/// Exact internal CALL.REL/RET.REL subroutines follow caller liveness instead of treating every
+/// register of the function as live at the return.
+#[test]
+fn borrowed_exact_call_rel_liveness_avoids_spurious_busy() {
+    let mut dec75 = Decoder::new(75);
+    let nop_word: u128 = 0x000fc00000000000_0000000000007918;
+    // CALL.REL target = 16*0 + 16 + 0x20 = 0x30 (insn 3).
+    let call_rel_word: u128 = 0x000fea0003c00000_0000002000007944;
+    let exit_word: u128 = 0x000fea0003800000_000000000000794d;
+    let ret_rel_word: u128 = 0x000fee0003c3ffff_ffffe6a004007950;
+    let mut src = Vec::new();
+    // 0: call_rel -> insn 3
+    let mut d0 = dec75.decode(call_rel_word).unwrap();
+    d0.reads = vec![];
+    d0.writes = vec![];
+    src.push(d0);
+    // 1: R10 written and immediately overwritten/dead after call (dead across call!)
+    let mut d1 = dec75.decode(nop_word).unwrap();
+    d1.reads = vec![];
+    d1.writes = vec![(LETTER_R, 10)];
+    src.push(d1);
+    // 2: EXIT
+    let mut d2 = dec75.decode(exit_word).unwrap();
+    d2.reads = vec![];
+    d2.writes = vec![];
+    src.push(d2);
+    // 3: callee writes UR4, reads R2
+    let mut d3 = dec75.decode(nop_word).unwrap();
+    d3.reads = vec![(LETTER_R, 2, 0)];
+    d3.writes = vec![(LETTER_U, 4)];
+    src.push(d3);
+    // 4: callee reads UR4, R2..R9 busy
+    let mut d4 = dec75.decode(nop_word).unwrap();
+    d4.reads = vec![
+        (LETTER_U, 4, 0),
+        (LETTER_R, 2, 0),
+        (LETTER_R, 3, 0),
+        (LETTER_R, 4, 0),
+        (LETTER_R, 5, 0),
+        (LETTER_R, 6, 0),
+        (LETTER_R, 7, 0),
+        (LETTER_R, 8, 0),
+        (LETTER_R, 9, 0),
+    ];
+    d4.writes = vec![];
+    src.push(d4);
+    // 5: ret__REL
+    let mut d5 = dec75.decode(ret_rel_word).unwrap();
+    d5.reads = vec![];
+    d5.writes = vec![];
+    src.push(d5);
+
+    let fd = FuncData {
+        name: "call_rel_liveness_test".into(),
+        registers: 11,
+        tables: vec![],
+        src,
+        uniform: vec![4],
+        pairs: vec![],
+        needs_pool: false,
+        uniform_predicates: vec![],
+        highest: 10,
+        scratch_need: 0,
+        needs_lane: false,
+        product_count: 0,
+        entered_inside: false,
+        ampere: false,
+        ampere_ops: HashMap::new(),
+    };
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    assert!(
+        !regset_test(&b.busy[3], 10) && !regset_test(&b.busy[4], 10) && !regset_test(&b.busy[5], 10),
+        "R10 is dead across the exact CALL.REL and must not be marked busy inside the callee"
+    );
+    assert_eq!(b.home_at(3, 4), Some(10));
+    assert_eq!(b.home_at(4, 4), Some(10));
+}
+
+/// When an instruction reads a borrowed home late and a following program instruction writes that
+/// same register before a branch, the translator emits a wait on the read scoreboard.
+#[test]
+fn late_read_of_borrowed_home_waits_before_program_write() {
+    let original = include_bytes!("../../../../tests/kernels/translate/k_convert.sm75.cubin");
+    let opts = Options {
+        borrow: 1,
+        ..Options::default()
+    };
+    let result = translate_with_options(original, false, &opts).unwrap();
+    let out = crate::elf::Elf::parse(&result.bytes).unwrap();
+    let text = &out.sections[out.section(".text.k_uniform_double").unwrap()];
+    let mut dec70 = Decoder::new(70);
+    let words: Vec<u128> = text
+        .data
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|c| u128::from_le_bytes(*c))
+        .collect();
+    let mut verified_war = false;
+    for k in 0..words.len() - 1 {
+        let d = dec70.decode(words[k]).unwrap();
+        if d.name == "i2f_Rd64__Rb_16b" && d.reads.iter().any(|&(l, r, _)| l == LETTER_R && r == 2) {
+            let rb = ((words[k] >> 113) & 7) as u32;
+            let d_next = dec70.decode(words[k + 1]).unwrap();
+            if d_next.writes.iter().any(|&(l, r)| l == LETTER_R && r == 2) {
+                assert_ne!(rb, 7, "late reader of borrowed R2 must set a read scoreboard");
+                let wait_mask = ((words[k + 1] >> 116) & 63) as u32;
+                assert_ne!(
+                    (wait_mask >> rb) & 1,
+                    0,
+                    "following write to R2 must wait on read scoreboard {rb}"
+                );
+                verified_war = true;
+            }
+        }
+    }
+    assert!(
+        verified_war,
+        "expected i2f_Rd64__Rb_16b -> R2 writer pair in k_uniform_double"
+    );
+}
+
+/// An inexact `RET.REL` flows back to every `CALL.REL` continuation in the function; any uniform
+/// register live across that continuation must keep the same home at the return and continuation.
+#[test]
+fn borrowed_inexact_ret_rel_unions_with_call_rel_continuation() {
+    let mut dec75 = Decoder::new(75);
+    let nop_word: u128 = 0x000fc00000000000_0000000000007918;
+    // CALL.REL target = 16*0 + 16 + 0x20 = 0x30 (insn 3).
+    let call_rel_to3: u128 = 0x000fea0003c00000_0000002000007944;
+    // CALL.REL target = 16*4 + 16 - 16 = 0x40 (insn 4, self-calling -> inexact).
+    let call_rel_to4: u128 = 0x000fea0003c00000_fffffff000007944;
+    let exit_word: u128 = 0x000fea0003800000_000000000000794d;
+    let ret_rel_word: u128 = 0x000fee0003c3ffff_ffffe6a004007950;
+    let mut src = Vec::new();
+    // 0: exact call_rel -> insn 3 (only R3 read inside insn 3, leaving R2 free at insn 1)
+    let mut d0 = dec75.decode(call_rel_to3).unwrap();
+    d0.reads = vec![];
+    d0.writes = vec![];
+    src.push(d0);
+    // 1: continuation after call 0 reads UR4 while R3 is busy (R2 free)
+    let mut d1 = dec75.decode(nop_word).unwrap();
+    d1.reads = vec![(LETTER_U, 4, 0), (LETTER_R, 3, 0)];
+    d1.writes = vec![];
+    src.push(d1);
+    // 2: EXIT
+    let mut d2 = dec75.decode(exit_word).unwrap();
+    d2.reads = vec![];
+    d2.writes = vec![];
+    src.push(d2);
+    // 3: exact ret__REL for insn 0 reading R3
+    let mut d3 = dec75.decode(ret_rel_word).unwrap();
+    d3.reads = vec![(LETTER_R, 3, 0)];
+    d3.writes = vec![];
+    src.push(d3);
+    // 4: inexact self-call_rel -> insn 4, falling through to insn 5
+    let mut d4 = dec75.decode(call_rel_to4).unwrap();
+    d4.reads = vec![];
+    d4.writes = vec![];
+    src.push(d4);
+    // 5: inexact ret__REL reading R2; every_r={R2, R3} blocks all homes in R2..=R3 here
+    let mut d5 = dec75.decode(ret_rel_word).unwrap();
+    d5.reads = vec![(LETTER_R, 2, 0)];
+    d5.writes = vec![];
+    src.push(d5);
+
+    let fd = FuncData {
+        name: "inexact_ret_rel_hc_test".into(),
+        registers: 4,
+        tables: vec![],
+        src,
+        uniform: vec![4],
+        pairs: vec![],
+        needs_pool: false,
+        uniform_predicates: vec![],
+        highest: 3,
+        scratch_need: 0,
+        needs_lane: false,
+        product_count: 0,
+        entered_inside: false,
+        ampere: false,
+        ampere_ops: HashMap::new(),
+    };
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    assert_eq!(
+        b.home_at(5, 4),
+        b.home_at(1, 4),
+        "UR4 home must remain identical across inexact ret__REL -> call_rel+1 edge"
+    );
+    assert!(b.unhomed_u.contains(&4));
+}
+
+/// Registers kept live in the caller across an exact `CALL.REL`/`RET.REL` remain busy inside the
+/// subroutine so borrowed pools or homes inside the callee cannot overwrite caller-live values.
+#[test]
+fn borrowed_exact_call_rel_preserves_caller_live_out_registers() {
+    let mut dec75 = Decoder::new(75);
+    let nop_word: u128 = 0x000fc00000000000_0000000000007918;
+    // CALL.REL at insn 1: target = 16*1 + 16 + 0x20 = 0x40 (insn 4).
+    let call_rel_to4: u128 = 0x000fea0003c00000_0000002000007944;
+    let exit_word: u128 = 0x000fea0003800000_000000000000794d;
+    let ret_rel_word: u128 = 0x000fee0003c3ffff_ffffe6a004007950;
+    let mut src = Vec::new();
+    // 0: caller defines R2
+    let mut d0 = dec75.decode(nop_word).unwrap();
+    d0.reads = vec![];
+    d0.writes = vec![(LETTER_R, 2)];
+    src.push(d0);
+    // 1: exact call_rel -> insn 4 while R2 is live-out across the call
+    let mut d1 = dec75.decode(call_rel_to4).unwrap();
+    d1.reads = vec![];
+    d1.writes = vec![];
+    src.push(d1);
+    // 2: caller reads R2 after returning from insn 4
+    let mut d2 = dec75.decode(nop_word).unwrap();
+    d2.reads = vec![(LETTER_R, 2, 0)];
+    d2.writes = vec![];
+    src.push(d2);
+    // 3: EXIT
+    let mut d3 = dec75.decode(exit_word).unwrap();
+    d3.reads = vec![];
+    d3.writes = vec![];
+    src.push(d3);
+    // 4: callee writes UR4 and keeps R3..R9 busy (R2 and R10 untouched inside callee)
+    let mut d4 = dec75.decode(nop_word).unwrap();
+    d4.reads = vec![
+        (LETTER_R, 3, 0),
+        (LETTER_R, 4, 0),
+        (LETTER_R, 5, 0),
+        (LETTER_R, 6, 0),
+        (LETTER_R, 7, 0),
+        (LETTER_R, 8, 0),
+        (LETTER_R, 9, 0),
+    ];
+    d4.writes = vec![(LETTER_U, 4)];
+    src.push(d4);
+    // 5: callee reads UR4 and R3..R9
+    let mut d5 = dec75.decode(nop_word).unwrap();
+    d5.reads = vec![
+        (LETTER_U, 4, 0),
+        (LETTER_R, 3, 0),
+        (LETTER_R, 4, 0),
+        (LETTER_R, 5, 0),
+        (LETTER_R, 6, 0),
+        (LETTER_R, 7, 0),
+        (LETTER_R, 8, 0),
+        (LETTER_R, 9, 0),
+    ];
+    d5.writes = vec![];
+    src.push(d5);
+    // 6: ret__REL
+    let mut d6 = dec75.decode(ret_rel_word).unwrap();
+    d6.reads = vec![];
+    d6.writes = vec![];
+    src.push(d6);
+
+    let fd = FuncData {
+        name: "call_rel_caller_live_out_test".into(),
+        registers: 11,
+        tables: vec![],
+        src,
+        uniform: vec![4],
+        pairs: vec![],
+        needs_pool: false,
+        uniform_predicates: vec![],
+        highest: 10,
+        scratch_need: 0,
+        needs_lane: false,
+        product_count: 0,
+        entered_inside: false,
+        ampere: false,
+        ampere_ops: HashMap::new(),
+    };
+    let b = Borrowed::new(&fd, false, None).unwrap();
+    assert!(
+        regset_test(&b.busy[4], 2) && regset_test(&b.busy[5], 2) && regset_test(&b.busy[6], 2),
+        "R2 live across CALL.REL must remain busy inside exact callee"
+    );
+    assert!(
+        !regset_test(&b.busy[4], 10),
+        "dead R10 should stay free inside exact callee"
+    );
+    assert_eq!(b.home_at(4, 4), Some(10));
+    assert_eq!(b.home_at(5, 4), Some(10));
 }

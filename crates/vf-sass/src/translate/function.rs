@@ -378,7 +378,7 @@ pub(super) fn translate_function(
             let mut mine: HashSet<u32> = HashSet::new();
             for &(l, u) in &d.writes {
                 if l == LETTER_U
-                    && let Some(&r) = borrow.homes.get(&u)
+                    && let Some(r) = borrow.home_at(i, u)
                 {
                     mine.insert(r);
                 }
@@ -530,6 +530,47 @@ pub(super) fn translate_function(
         });
     }
 
+    if let Some(b) = ctx.borrow.as_ref()
+        && !b.used.is_empty()
+    {
+        for k in 0..items.len() {
+            if items[k].says && !items[k].late {
+                let rb = ((items[k].word >> READ_BARRIER) & 7) as u32;
+                let wb = ((items[k].word >> WRITE_BARRIER) & 7) as u32;
+                if rb != 7 {
+                    let reads_borrowed: Vec<u32> = items[k]
+                        .d
+                        .as_ref()
+                        .unwrap()
+                        .reads
+                        .iter()
+                        .filter_map(|&(l, r, _)| (l == LETTER_R && b.used.contains(&r)).then_some(r))
+                        .collect();
+                    if !reads_borrowed.is_empty() {
+                        for item_j in &mut items[k + 1..] {
+                            let wait_mask = (item_j.word >> WAIT) & 63;
+                            if ((wait_mask >> rb) & 1 != 0) || (wb != 7 && ((wait_mask >> wb) & 1 != 0)) {
+                                break;
+                            }
+                            let d_next = item_j.d.as_ref().unwrap();
+                            if d_next.kind == crate::decode::Kind::BRU {
+                                break;
+                            }
+                            if d_next
+                                .writes
+                                .iter()
+                                .any(|&(l, r)| l == LETTER_R && reads_borrowed.contains(&r))
+                            {
+                                item_j.word |= 1u128 << (WAIT + rb);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let relocate = return_addresses(&mut items, &targets, fd)?;
     schedule(&mut items, &targets)?;
     let (code, new_of, count) = finish(&mut items, &fd.src, ctx.next_register, ctx.dec70)?;
@@ -580,11 +621,8 @@ fn lives(
         }
     }
     if let Some(b) = borrow {
-        let mut homes: Vec<(u32, u32)> = b.homes.iter().map(|(&u, &r)| (u, r)).collect();
-        homes.sort_unstable();
-        for (u, r) in homes {
-            let span = b.spans.get(&u).map_or_else(Vec::new, |span| offsets(span));
-            lives.push((i64::from(u), i64::from(r), "home", span));
+        for (u, r, span) in &b.web_homes {
+            lives.push((i64::from(*u), i64::from(*r), "home", offsets(span)));
         }
         let mut given: Vec<_> = given_at.iter().collect();
         given.sort_unstable();
