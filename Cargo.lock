@@ -88,6 +88,7 @@ name = "vf-proxy"
 version = "0.1.6"
 dependencies = [
  "libc",
+ "lz4_flex",
  "twox-hash",
  "vf-adapt",
  "vf-fatbin",

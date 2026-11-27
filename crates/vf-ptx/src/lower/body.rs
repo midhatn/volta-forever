@@ -157,7 +157,7 @@ impl<'a> Body<'a> {
     /// Load the 16 bytes at each address into four registers: with one instruction each if every
     /// address is a multiple of 16 (see the module documentation), word by word otherwise. The test
     /// needs an instruction after it (`followed`), for its last label to stand on.
-    pub(super) fn wide_loads(&mut self, loads: &[(String, Vec<String>)], followed: bool) {
+    pub(super) fn wide_loads(&mut self, loads: &[(String, Vec<String>)], followed: bool, static_aligned: bool) {
         let words = |body: &mut Self| {
             for (address, registers) in loads {
                 emit!(body, "ld.shared.u32 {}, [{address}];", registers[0]);
@@ -174,7 +174,7 @@ impl<'a> Body<'a> {
         let Some((first, rest)) = loads.split_first() else {
             return;
         };
-        if self.options.aligned_rows {
+        if self.options.aligned_rows || static_aligned {
             return wide(self);
         }
         if !followed {
