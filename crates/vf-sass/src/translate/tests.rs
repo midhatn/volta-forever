@@ -1830,3 +1830,48 @@ fn every_section_of_attributes_says_what_a_function_calls() {
         Some("a function it calls, or that calls it, is refused")
     );
 }
+
+/// An unmodified compiler-emitted Triton `sm_75` matmul cubin (`tl.dot` 64x32x16 fp16->fp32,
+/// compiled with `TRITON_DISABLE_LINE_INFO=1`) reaches the level-3 fast path with no uniform
+/// registers in memory and no room made at `VF_BORROW=3`. Before the `empty_lane` fix, every
+/// `S2R SR_LANEID` before its matrix sequences was dropped (`0` of `4` `"lane"` entries).
+#[test]
+fn unmodified_triton_dot_reads_lane_at_level_3() {
+    let original = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/triton_dot.sm_75.cubin"
+    ));
+    let opts = Options {
+        borrow: 3,
+        ..Options::default()
+    };
+    let result = translate_with_options(original, true, &opts).unwrap();
+    let report = result.report.iter().find(|f| f.name == "k_dot").unwrap();
+    assert_eq!(report.refused, None);
+    let map = result.map.unwrap();
+    let mut lane_pcs = std::collections::HashSet::new();
+    let mut group_pcs = std::collections::HashSet::new();
+    for (fn_name, _dst, src, role) in &map {
+        if fn_name != "k_dot" {
+            continue;
+        }
+        if role == "lane" {
+            lane_pcs.insert(*src);
+        } else if role == "group" {
+            group_pcs.insert(*src);
+        }
+    }
+    assert_eq!(
+        lane_pcs.len(),
+        4,
+        "expected 4 per-instruction S2R SR_LANEID reads at VF_BORROW=3, got {}",
+        lane_pcs.len()
+    );
+    assert!(!group_pcs.is_empty());
+    for pc in group_pcs {
+        assert!(
+            lane_pcs.contains(&pc),
+            "nothing reads the lane for matrix instruction at 0x{pc:x}"
+        );
+    }
+}
