@@ -4045,12 +4045,7 @@ def main():
                             if not ok:
                                 break
                             r_hi = 'R%d' % (rn + 1)
-                            if un + 1 in mem_standins:
-                                ok = ok and mem_standins[un + 1] == r_hi and (rn + 1 > highest or rn + 1 >= 2)
-                            elif un + 1 in frame_slots:
-                                ok = ok and (rn + 1 > highest or rn + 1 >= 2)
-                            else:
-                                ok = ok and place.setdefault('UR%d' % (un + 1), r_hi) == r_hi and (rn + 1 > highest or rn + 1 >= 2)
+                            ok = ok and stands_ur('UR%d' % (un + 1), r_hi, old) and (rn + 1 > highest or rn + 1 >= 2)
                             if ok and rn + 1 <= highest and rn + 1 >= 2:
                                 borrowed_regs.add(rn + 1)
                 # Everything but the registers: the same once the uniform mnemonic and names are made ordinary.
