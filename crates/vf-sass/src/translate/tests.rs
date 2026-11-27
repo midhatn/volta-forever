@@ -1908,3 +1908,52 @@ fn call_rel_colliding_data_constant_kernel_translates_and_keeps_data_mov() {
         assert_eq!(d_data_mov.op_or_name("Sb", 0), 0x120);
     }
 }
+
+/// A guarded `@P0 RET.REL` in a callee must not stop the callee CFG walk: the fall-through path
+/// still runs when `!P0`, so a return through a copied register on fall-through succeeds while a
+/// data read or conflicting `RET.REL` register on fall-through refuses.
+#[test]
+fn call_rel_guarded_ret_follows_fallthrough_path() {
+    // 1. Valid: guarded `@P0 RET.REL R8` falls through to `MOV R2, R8; RET.REL R2`.
+    let mut ok_fallthrough = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x20)], None, "same", None),
+        make_call_rel_item(1, "call_rel__RIR", &[], Some(0x30), "same", None),
+        make_call_rel_item(2, "exit_", &[], None, "same", None),
+        make_call_rel_item(3, "ret__REL", &[("Pg", 0), ("Ra", 8)], Some(0), "same", None),
+        make_call_rel_item(4, "mov__RRR_RR", &[("Rd", 2), ("Rb", 8)], None, "same", None),
+        make_call_rel_item(5, "ret__REL", &[("Ra", 2)], Some(0), "same", None),
+    ];
+    let fd_ok = empty_func_data(ok_fallthrough.len());
+    assert!(super::return_addr::return_addresses(&mut ok_fallthrough, &[0x30], &fd_ok).is_ok());
+    assert_eq!(ok_fallthrough[0].fix, Some(0x20));
+
+    // 2. Refused: guarded `@P0 RET.REL R8` falls through to a data read of R8 before `RET.REL R8`.
+    let mut data_read_fallthrough = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x20)], None, "same", None),
+        make_call_rel_item(1, "call_rel__RIR", &[], Some(0x30), "same", None),
+        make_call_rel_item(2, "exit_", &[], None, "same", None),
+        make_call_rel_item(3, "ret__REL", &[("Pg", 0), ("Ra", 8)], Some(0), "same", None),
+        make_call_rel_item(
+            4,
+            "iadd3_noimm__RRR_RRR",
+            &[("Rd", 0), ("Ra", 8), ("Rb", 2), ("Rc", 255)],
+            None,
+            "same",
+            None,
+        ),
+        make_call_rel_item(5, "ret__REL", &[("Ra", 8)], Some(0), "same", None),
+    ];
+    let fd_read = empty_func_data(data_read_fallthrough.len());
+    assert!(super::return_addr::return_addresses(&mut data_read_fallthrough, &[0x30], &fd_read).is_err());
+
+    // 3. Refused: guarded `@P0 RET.REL R8` falls through to `RET.REL R9` (different input register).
+    let mut conflict_fallthrough = vec![
+        make_call_rel_item(0, "mov__RuIR_RI", &[("Rd", 8), ("Sb", 0x20)], None, "same", None),
+        make_call_rel_item(1, "call_rel__RIR", &[], Some(0x30), "same", None),
+        make_call_rel_item(2, "exit_", &[], None, "same", None),
+        make_call_rel_item(3, "ret__REL", &[("Pg", 0), ("Ra", 8)], Some(0), "same", None),
+        make_call_rel_item(4, "ret__REL", &[("Ra", 9)], Some(0), "same", None),
+    ];
+    let fd_conflict = empty_func_data(conflict_fallthrough.len());
+    assert!(super::return_addr::return_addresses(&mut conflict_fallthrough, &[0x30], &fd_conflict).is_err());
+}
