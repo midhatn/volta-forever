@@ -1693,12 +1693,15 @@ def run(mc, control, path, out_dir, untouched, validated=True):
         def ignore_taken_pair(self, i, width=1, given=0):
             if width != 2:
                 return orig_pair_ov(self, i, width, given)
-            # Ignore `taken` so the pool may overlap an alive home.
-            held = self.busy[i] | given
-            for r in range(2, self.top + 2 - width, 2):
-                if not held >> r & ((1 << width) - 1):
-                    return r
-            return None
+            # Ignore `taken` so the pool may overlap an alive home, and choose otherwise as the
+            # translator does (its cap, and its preference for registers no late reader or
+            # scoreboard holds): where nothing is taken the control changes nothing.
+            saved = self.taken[i]
+            self.taken[i] = 0
+            try:
+                return orig_pair_ov(self, i, width, given)
+            finally:
+                self.taken[i] = saved
         Borrowed.free_at = ignore_taken_pair
     elif control == 'written_pair':
         borrow_saved['free_at'] = Borrowed.free_at
