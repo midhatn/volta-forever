@@ -1,4 +1,5 @@
 //! Bit facts for straight-line operations that construct packed floating-point operands.
+pub(in crate::lower) mod align;
 mod literals;
 pub(super) mod nibbles;
 use std::collections::HashMap;

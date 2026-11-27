@@ -63,7 +63,14 @@ registers and predicates by itself.
 instruction now is.
 
 **Ordinary registers.** The instruction reads as the original with each uniform register replaced
-by an ordinary one, always the same one, and the mnemonic without its U.
+by an ordinary one, always the same one, and the mnemonic without its U. An operand of two uniform
+registers (as the destination and the addend of `UIMAD.WIDE` and `UIMAD.WIDE.X`) is printed as its
+first register only: the ordinary register that stands for that one is even, and the uniform
+register above it has the ordinary register above that one wherever it is named alone (since
+2026-11-26, pull request #15). The translators place a pair so (`docs/translator.md`, "Placing
+uniform registers and predicates"): this rule of the validator is what checks it. The control
+`unpaired` gives the upper half another register, and `misruled` alters by one the immediate of an
+instruction made so (section 3).
 
 **Sequences.** What stands for an instruction that has no such twin (the upper half of a
 product, a minimum or maximum, a stride, a constant at a uniform index) must be the instructions
@@ -308,7 +315,7 @@ with the next instruction waiting, and the distances between the steps and after
 ## 3. Controls
 
 A check that never objects proves nothing. `reference/controls.py` makes the reference translator
-wrong on purpose, one way at a time, and counts what the validator finds in the result: 113
+wrong on purpose, one way at a time, and counts what the validator finds in the result: 117
 controls, each described at the head of that file. A control that changes translations and meets
 no objection anywhere is a hole in the validator, or a control that tests nothing.
 
@@ -329,6 +336,16 @@ the controls need), 2026-11-23:
 - the translation as it is: 0 problems in the 39 cubins, at each of the five settings.
 
 Eighty minutes with 24 processes.
+
+Two of the four controls written since are in section 8 (`doublesoon`, `doubleacross`). The two
+others came on 2026-11-26 with the rule on pairs of uniform registers (section 2, "Ordinary
+registers"; pull request #15): `unpaired` gives the upper half of a 64-bit uniform operand
+another register than the one above its lower half's, and `misruled` alters by one the immediate
+of the first instruction of a function that a rule translates to ordinary registers. At the
+default, one process a cubin, on 49 cubins (35 of the held-out corpus and of the 39 above, on
+which `unpaired` stopped until it took the arguments of the translator by their names, and 14
+others), `unpaired` changed the translation of 46 and was objected to in each, `misruled` changed
+45 and was objected to in each.
 
 A control may change a translation that stays right, and is then rightly not objected to there:
 `alive_home` moves every home to the next register, which may be free too; `short_home` leaves
@@ -728,9 +745,10 @@ layer, and each kernel must give what the sm_70 build gives on the same inputs. 
 is compared with itself first: a kernel whose result depends on the order of its threads would
 fail there, and would prove nothing.
 
-Eleven source files, 60 kernels: all the same as their native builds. They cover uniform
+Twelve source files, 62 kernels: all the same as their native builds. They cover uniform
 registers and predicates, calls, loops, minima and maxima, jump tables, memory instructions,
-conversions and instructions on uniform registers under a guard, one kind of rewriting each.
+conversions, instructions on uniform registers under a guard, and `UIMAD` with an immediate and
+`UIMAD.WIDE` (`k_uimad.cu`, since pull request #15), one kind of rewriting each.
 
 Two of the files run a second time from a cubin changed by hand into something that compilers
 do not write, or write rarely, and that a translation must still get right:

@@ -606,7 +606,7 @@ fn by_kernel(text: &[u8], changed: &[Changed], lowering: &mut Lowering) {
 
 /// The names beginning with `%` that the module has outside the bodies of its functions,
 /// comments and strings apart.
-fn outside_names(text: &[u8], functions: &[Function]) -> Vec<String> {
+fn outside_chunks(text: &[u8], functions: &[Function]) -> Vec<u8> {
     let mut between = Vec::new();
     let mut at = 0;
     for function in functions {
@@ -615,10 +615,23 @@ fn outside_names(text: &[u8], functions: &[Function]) -> Vec<String> {
         at = function.body.end;
     }
     between.extend(scan::without_comments(&text[at..]));
+    between
+}
+
+fn outside_names(text: &[u8], functions: &[Function]) -> Vec<String> {
+    let between = outside_chunks(text, functions);
     if !between.contains(&b'%') {
         return Vec::new();
     }
     lower::outside_names(&String::from_utf8_lossy(&between))
+}
+
+fn outside_shared_aligned(text: &[u8], functions: &[Function]) -> std::collections::HashMap<String, u64> {
+    let between = outside_chunks(text, functions);
+    if !between.windows(7).any(|w| w == b".shared") {
+        return std::collections::HashMap::new();
+    }
+    lower::aligned_shared_symbols(&String::from_utf8_lossy(&between))
 }
 
 /// Make a module that uses Turing-only instructions compilable for Volta.
@@ -651,13 +664,14 @@ struct LoweredTarget {
 fn lower_single_target(
     target: &LowerTarget<'_>,
     outside: &[String],
+    shared_aligned: &std::collections::HashMap<String, u64>,
     address_bits: u32,
     options: lower::Options,
 ) -> LoweredTarget {
     let lowered = if target.cluster.is_empty() {
         std::str::from_utf8(target.body)
             .map_err(|_| lower::Unsupported("not text".to_string()))
-            .and_then(|body| lower::body_reporting(body, outside, address_bits, options))
+            .and_then(|body| lower::body_reporting_shared(body, outside, shared_aligned, address_bits, options))
     } else {
         Err(lower::Unsupported(
             "the kernel asks for a cluster of blocks, which this GPU does not have".to_string(),
@@ -796,6 +810,11 @@ fn lower_to_volta_inner(text: &[u8], options: lower::Options, max_threads: Optio
     } else {
         Vec::new()
     };
+    let shared_aligned = if need_outside && !options.aligned_rows {
+        outside_shared_aligned(text, &functions)
+    } else {
+        std::collections::HashMap::new()
+    };
     let address_bits = address_bits(text);
     let threads = if targets.len() >= 2 && active_bytes >= PARALLEL_LOWER_MIN_BYTES {
         max_threads
@@ -806,7 +825,7 @@ fn lower_to_volta_inner(text: &[u8], options: lower::Options, max_threads: Optio
         1
     };
     let results = parallel::par_map(&targets, threads, &|target| {
-        lower_single_target(target, &outside, address_bits, options)
+        lower_single_target(target, &outside, &shared_aligned, address_bits, options)
     });
 
     let mut out = Vec::with_capacity(text.len() + text.len() / 2);

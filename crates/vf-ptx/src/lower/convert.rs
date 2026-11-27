@@ -187,7 +187,9 @@ impl<'a> Body<'a> {
     pub(super) fn fp8_pair(&mut self, kind: Fp8, pair: &str) -> String {
         if kind == Fp8::E5m2 {
             // The byte is the upper byte of the half it equals: byte 0 goes to byte 1 and byte 1
-            // to byte 3, with zeros below them.
+            // to byte 3, with zeros below them. One permutation of bytes (`PRMT`; three shifts
+            // and an `or` until 2026-11-18: the same halves for all 65,536 pairs of bytes on a
+            // V100).
             let halves = self.fresh();
             emit!(self, "prmt.b32 {halves}, {pair}, 0, 0x1404;");
             return halves;
@@ -201,21 +203,32 @@ impl<'a> Body<'a> {
     /// into packed `f16x2` halves, multiplied by 256 when `scale_256` is true.
     fn fp8_e4m3_bytes(&mut self, bytes: &str, scale_256: bool) -> String {
         let [sh7, sh8, placed, smask, nan, nmask, scale, halves]: [String; 8] = self.fresh_n();
+        // As the bits of a half, the sign in bit 15 and the seven other bits in bits 13..7 are the
+        // value divided by 256, subnormal or not (the exponents of the formats differ by 8).
         emit!(self, "shl.b32 {sh7}, {bytes}, 7;");
         emit!(self, "shl.b32 {sh8}, {bytes}, 8;");
         emit!(self, "and.b32 {placed}, {sh7}, 0x3f803f80;");
         emit!(self, "mov.b32 {smask}, 0x80008000;");
         emit!(self, "lop3.b32 {placed}, {placed}, {sh8}, {smask}, 0xF8;");
-        // Adding 1 ULP at bit 7 sets bit 14 iff all 7 magnitude bits are 1 (0x7f / 0xff NaN);
-        // bit 14 is 0 in `placed` so carry never reaches sign bit 15.
+        // A byte whose seven magnitude bits are all ones (0x7f / 0xff) is NaN, not 480: adding
+        // 0x0080 sets bit 14 iff bits 13..7 are all 1 (bit 14 is 0 in `placed`, so carry never
+        // reaches sign bit 15).
         emit!(self, "add.u32 {nan}, {placed}, 0x00800080;");
         if scale_256 {
+            // Multiplying `placed` by 256 (`0x5c005c00`) recovers the exact half in one `HMUL2` on
+            // a V100 (which takes subnormal halves as they are; each half went through f32 and back
+            // until 2026-11-18: the same halves for all 65,536 pairs of bytes on a V100, and this
+            // `prmt`/`lop3` form matches all 65,536 pairs bit-for-bit, NaN payloads included:
+            // `0x5f80 | 0x2000 = 0x7f80`, `0xdf80 | 0x2000 = 0xff80`).
             emit!(self, "shr.u32 {nan}, {nan}, 1;");
             emit!(self, "mov.b32 {scale}, 0x5c005c00;");
             emit!(self, "mul.rn.f16x2 {halves}, {placed}, {scale};");
             emit!(self, "mov.b32 {nmask}, 0x20002000;");
             emit!(self, "lop3.b32 {halves}, {halves}, {nan}, {nmask}, 0xF8;");
         } else {
+            // Defer the 2^8 factor to a power-of-two scale (UE8M0 in `kind::mxf8f6f4`); exact
+            // because Volta's `HMMA` takes f16 subnormal inputs without flushing (`fp8-bits` pins
+            // all 14 E4M3 subnormal bytes on a V100). NaN: `0x3f80 | 0x4000 = 0x7f80`.
             emit!(self, "mov.b32 {nmask}, 0x40004000;");
             emit!(self, "lop3.b32 {halves}, {placed}, {nan}, {nmask}, 0xF8;");
         }
@@ -225,7 +238,7 @@ impl<'a> Body<'a> {
     /// The FP8 byte nearest to the f32 `value`, ties to the even byte, in a fresh register: the
     /// largest finite one for what is beyond it (`.satfinite`), the NaN of the format for a NaN.
     ///
-    /// The value (divided by 256 for `e4m3`: see `fp8_pair`) is first cut to a half towards zero,
+    /// The value (divided by 256 for `e4m3`: see `fp8_e4m3_bytes`) is first cut to a half towards zero,
     /// with a bit that says whether something was cut off. The byte is that half without its low
     /// bits, rounded on them and on that bit: one rounding, of the value itself. (Rounding to a half
     /// first and then to the byte would round twice.)

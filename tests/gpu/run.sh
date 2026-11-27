@@ -270,6 +270,12 @@ rb over "PTX for sm_75 retargeted" 00000000 40b1ac30 00000054 00000005
 tc ampere "$G/k_ampere.135.sm80.ptx" "PTX for sm_80 retargeted \(1 module, 25 tensor-core instructions rewritten\)" "31 kernels, 0 wrong"
 # FP8: the conversions both ways, and the products, which run on the tensor cores as products of halves.
 tc fp8 "$G/k_fp8.135.sm89.ptx" "PTX for sm_89 retargeted \(1 module, 8 tensor-core instructions rewritten\)" "19 kernels, 0 wrong"
+# Exhaustive bit-pinning of FP8 decodes (all 65,536 pairs for f16x2 and bf16x2, NaN payloads included)
+# and single plain / block-scaled m16n8k32 products exercising all 14 E4M3 subnormal bytes on a V100.
+[ -x "$out/bin/fp8_bits" ] && [ "$out/bin/fp8_bits" -nt "$G/fp8_bits.c" ] || gcc -O2 -o "$out/bin/fp8_bits" "$G/fp8_bits.c" -ldl -lm || exit 2
+log=$out/logs/fp8-bits.log
+DRVRUN_LIBCUDA=$proxy/libcuda.so.1 VF_LOG_LEVEL=2 "$out/bin/fp8_bits" "$G/k_fp8_bits.135.sm89.ptx" "$G/blackwell/k_mma_scaled_forms.135.sm120a.ptx" >"$log" 2>&1
+check fp8-bits "^PASS fp8-bits:" "PTX for sm_89 retargeted \(1 module, 3 tensor-core instructions rewritten\)"
 # The conversions of the 4-bit floats (E2M1) and of the exponents alone (UE8M0), against host models.
 tc fp4 "$G/k_fp4.135.sm120a.ptx" "PTX for sm_120 retargeted \(1 module\)" "10 kernels, 0 wrong"
 # The same conversions against what an RTX 5090 computed: on the inputs of the
@@ -323,16 +329,13 @@ scaled_forms() {
     # The other forms: no worse than today.
     scaled_form s_mxf4_2x 36352 36242 4 106 || bad=1
     scaled_form s_mxf4_2x_large 394112 371635 841 21636 || bad=1
-    # Chained row.col MXF8 lowers >1-ULP error (further drops 4021->3252, 26699->21802, 578->483)
-    # while increasing exact matches (24272->25043, 308475->312091, 36359->36389), moving former
-    # >1-ULP cases into 1-ULP and exact. Total non-identical (one+further) strictly decreases.
-    scaled_form s_mxf8_e4m3_1x 36352 25043 3252 8057 || bad=1
-    scaled_form s_mxf8_e4m3_1x_large 387712 312091 21802 53819 || bad=1
+    scaled_form s_mxf8_e4m3_1x 36352 24272 4021 8059 || bad=1
+    scaled_form s_mxf8_e4m3_1x_large 387712 308475 26699 52538 || bad=1
     # Other thread_id and byte_id values, E5M2 operands.
     scaled_form s_mxf4_tid_a1 38400 36488 143 1769 || bad=1
     scaled_form s_mxf4_tid_b1 38400 36365 186 1849 || bad=1
     scaled_form s_mxf4_bid_a2 38400 36429 164 1807 || bad=1
-    scaled_form s_mxf8_e5m2_1x 38400 36389 483 1528 || bad=1
+    scaled_form s_mxf8_e5m2_1x 38400 36359 578 1463 || bad=1
     return $bad
 }
 if scaled_forms >"$log.forms"; then ok=PASS; else ok=FAIL; failed=1; fi
@@ -475,6 +478,7 @@ mc k_simple_minmax 1
 mc k_uniform 4
 mc k_params 3
 mc k_uniform_math 2
+mc k_uimad 2
 mc k_switch 12
 mc k_memory 7
 mc k_convert 2

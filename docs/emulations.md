@@ -236,9 +236,13 @@ A 16-byte load from shared memory faults on a V100 when its address is not a mul
 to its access size. By default (`VF_ALIGNED_ROWS` on, `Options::aligned_rows`) the layer
 takes the manual at its word and loads 16 bytes. A program whose rows are elsewhere stops
 with a misaligned-address fault (error 716), and `VF_ALIGNED_ROWS=0` makes the layer
-test the addresses at runtime: if a row is not at a multiple of 16 the same bytes are
-loaded word by word. The test costs 17 % to a factor of two on a program's emulated
-tensor-core kernels; every program tested keeps its rows aligned.
+test addresses at runtime when static alignment cannot be proved: if a row is not at a
+multiple of 16, the same bytes are loaded word by word. Under `VF_ALIGNED_ROWS=0`, a
+forward low-zero-bits dataflow pass tracks `.shared .align N` symbols (with `N` a multiple
+of 16), literals, `mov`/`cvt`/`cvta.shared`/`cvta.to.shared`, shifts, bitwise masks,
+`add`/`sub`/`mul.lo`/`mul.wide`/`mad.lo`/`mad.wide`, `selp`, and `bfi` across the
+control-flow graph; every `ldmatrix` whose base and literal offset are proven 16-byte
+aligned on all paths emits direct 16-byte loads with zero runtime test overhead.
 
 **Instruction counts.** Plain `ldmatrix` of 4 matrices: 14 instructions (2 for the
 address, one more when it has an offset, and 3 per matrix), besides the lane values of the
@@ -496,15 +500,15 @@ with `0x80008000`) place the sign at bit 15 and magnitude at bits 13..7 (leaving
 giving the value divided by 256. Adding `0x00800080` sets bit 14 iff all 7 magnitude bits are 1
 (`0x7f`/`0xff` NaN, without overflowing into sign bit 15); multiplying by 256 (`0x5c005c00`)
 via `mul.rn.f16x2` recovers all finite values and subnormals while `lop3.b32` merges the bit-13
-NaN flag (`0x4000 -> 0x2000`, `0x5f00 | 0x2000 = 0x7f00`) instead of multi-shift subtraction.
-When feeding UE8M0 block-scaled products (`kind::mxf8f6f4`), the `2^8` factor per `e4m3`
-operand is folded directly into UE8M0's exponent bias (`896 + 8` or `896 + 16`), omitting
-`mul.rn.f16x2` and setting bit 14 (`0x4000 -> 0x7f80`) for NaN.
+NaN flag (`0x4000 -> 0x2000`, `0x5f80 | 0x2000 = 0x7f80`, or `0xdf80 | 0x2000 = 0xff80`)
+instead of multi-shift subtraction. When feeding UE8M0 block-scaled products (`kind::mxf8f6f4`),
+the `2^8` factor per `e4m3` operand is folded directly into UE8M0's exponent bias (`896 + 8` or
+`896 + 16`), omitting `mul.rn.f16x2` and setting bit 14 (`0x3f80 | 0x4000 = 0x7f80`) for NaN.
 
 | Form | Instructions | Exact |
 |---|---|---|
-| `cvt.rn.f16x2.e4m3x2` | 30 (in the test kernel) | yes |
-| `cvt.rn.f16x2.e5m2x2` | 14 | yes |
+| `cvt.rn.f16x2.e4m3x2` | 14 (12 in `fp8_pair`; 31 PTX / 21 SASS in the test kernel) | yes |
+| `cvt.rn.f16x2.e5m2x2` | 3 (1 `prmt.b32`; 20 PTX / 13 SASS in the test kernel) | yes |
 
 **Encode (f32 to FP8).** The value (divided by 256 for `e4m3`) is cut to a half towards
 zero (`cvt.rz.f16.f32`), a bit records whether the cut dropped anything, and the byte is
@@ -533,9 +537,9 @@ becomes a pair of halves (exact, as above), and the product is four FP16 `m16n8k
 row (eight of Volta's `mma.m8n8k4`). No lane is asked for anything to decode, and the
 halves of an operand used by several products are made once.
 
-**Instruction count.** 225 to 353 instructions per product (the range is across the three
-type combinations of the test kernels: e4m3xe4m3, e4m3xe5m2, e5m2xe4m3). An e5m2 operand
-costs less to decode: e5m2xe5m2 takes 64 instructions fewer than e5m2xe4m3.
+**Instruction count.** 130 to 218 PTX instructions per product (164 to 228 non-NOP SASS
+instructions in the test kernels across e5m2xe4m3, e4m3xe5m2, e4m3xe4m3). An e5m2 operand
+costs less to decode: e5m2xe5m2 takes 44 PTX instructions fewer than e5m2xe4m3.
 
 **Exactness.** The conversion to halves is exact, and the products are FP16 products on
 Volta's tensor cores, with what section 2 says of them: on the inputs of the test suite,
@@ -543,9 +547,12 @@ where the sums are exact, no difference from the host model nor from an RTX 5090
 2026-11-17); on arbitrary values, last bits that depend on how the sums are made (the
 MXF8F6F4 row of section 8 shows how much on E4M3 operands).
 
-**Test cases.** `tests/gpu/run.sh`: `fp8` (19 kernels, 0 wrong). Tests cover every byte
-pair decoded, conversions at and around every value and halfway point of both formats,
-products of the three type combinations, and operands from `ldmatrix`.
+**Test cases.** `tests/gpu/run.sh`: `fp8` (19 kernels, 0 wrong) and `fp8-bits` (all 65,536
+operand pairs for `cvt.rn.{f16x2,bf16x2}.{e4m3x2,e5m2x2}` pinned bit-for-bit including NaN
+payloads, plus single plain `m16n8k32` and `kind::mxf8f6f4` products exercising all 14 E4M3
+subnormal bytes). Tests cover every byte pair decoded, conversions at and around every value
+and halfway point of both formats, products of the three type combinations, and operands
+from `ldmatrix`.
 
 ## 7. FP4 and exponent-only formats
 
@@ -629,8 +636,8 @@ For each block:
 2. Each block is computed on Volta's `mma.m8n8k4` (section 2) into a zero-initialized f32
    accumulator. Both FP4 forms use the single-instruction `mma.m8n8k4.row.col` split-octet
    layout (8 Volta `mma.m8n8k4` instructions = 32 HMMA steps total for K=64, reducing across
-   octets with four `bfly 8` exchanges per block), and `kind::mxf8f6f4` uses `mma_f32_chain`
-   (`m8n8k4.row.col`, 16 HMMA steps instead of 32). The f32 block sum is exact for E2M1
+   octets with four `bfly 8` exchanges per block). `kind::mxf8f6f4` keeps the 8-step
+   `mma.m8n8k4` chain (section 2), preserving bit-identical block sums. The f32 block sum is exact for E2M1
    (every term is a quarter, and sums reach at most 576 for NVFP4 or 1,152 for MXFP4).
 3. Each block sum is multiplied by `scale_A * scale_B` and added to the `f64` accumulator
    (kept in split-octet layout across blocks for FP4). For NVFP4, UE4M3 scales are decoded
@@ -682,8 +689,8 @@ Measured 2026-11-18 on an RTX 5090 and a V100. The counts are what `tests/gpu/ru
 | **NVFP4** (`kind::mxf4nvf4`, 4X) large | 3,179 | 406,912 | **405,861 (99.74%)** | 1,051 (0.26%) | 0 | 0 |
 | **MXFP4** (`kind::mxf4`, 2X) small | 284 | 36,352 | 36,242 (99.70%) | 106 | 4 | 0 |
 | **MXFP4** (`kind::mxf4`, 2X) large | 3,079 | 394,112 | 371,635 (94.30%) | 21,636 (5.49%) | 841 | 0 |
-| **MXF8F6F4** (`kind::mxf8f6f4`, 1X) small | 284 | 36,352 | 25,043 (68.9%) | 8,057 (22.2%) | 3,252 | 0 |
-| **MXF8F6F4** (`kind::mxf8f6f4`, 1X) large | 3,029 | 387,712 | 312,091 (80.5%) | 53,819 (13.9%) | 21,802 | 0 |
+| **MXF8F6F4** (`kind::mxf8f6f4`, 1X) small | 284 | 36,352 | 24,272 (66.8%) | 8,059 (22.2%) | 4,021 | 0 |
+| **MXF8F6F4** (`kind::mxf8f6f4`, 1X) large | 3,029 | 387,712 | 308,475 (79.6%) | 52,538 (13.6%) | 26,699 | 0 |
 
 The "small" sets are the original 284-case reference vectors; the "large" sets add
 rounding discriminators, random accumulators and one-block tests.
@@ -705,12 +712,9 @@ rounding discriminators, random accumulators and one-block tests.
   block-scaled form gives identical results to the plain FP8 product (measured on the
   RTX 5090, 12,800 results).
 
-Using `mma_f32_chain` (`m8n8k4.row.col`, 16 HMMA steps vs 32) on `kind::mxf8f6f4` and
-folding `e4m3`'s `2^8` scale per operand into UE8M0 lowers both instruction count and `>1-ULP`
-differences (`36,389 / 38,400` identical, `1,528` 1-ULP, `483` beyond on `E5M2`; `0` NaN
-mismatches). Extra forms tested against the RTX 5090 (300 cases each): `thread_id_a = 1`,
-`thread_id_b = 1`, `byte_id = 2` with two scales, and E5M2 operands. All consistent, no NaN
-mismatches.
+Extra forms tested against the RTX 5090 (300 cases each): `thread_id_a = 1`,
+`thread_id_b = 1`, `byte_id = 2` with two scales, and E5M2 operands (the `kind::mxf8f6f4`
+form). All consistent with the main forms, no NaN mismatches.
 
 **Test cases.** `tests/gpu/run.sh`: `block-scaled` (10 forms checked, counts as above).
 The reference vectors are in `tests/kernels/blackwell/ref_scaled/`.

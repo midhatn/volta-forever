@@ -255,9 +255,9 @@ impl<'a> Body<'a> {
             emit!(self, "cvt.f64.f32 {sum}, {};", c[i]);
         }
 
-        let block_sums: [String; 4] = self.fresh_n();
+        let block_sums: Vec<String> = (0..4).map(|_| self.fresh()).collect();
         for sum in &block_sums {
-            self.zeros.insert(sum.clone());
+            emit!(self, "mov.b32 {sum}, 0f00000000;");
         }
         let block_sum_names: Vec<&str> = block_sums.iter().map(String::as_str).collect();
         let mut of_a = Vec::new();
@@ -272,11 +272,11 @@ impl<'a> Body<'a> {
             .iter()
             .flat_map(|b_reg| self.fp8_halves_scaled(b_type, b_reg, false))
             .collect();
-        for (a_pair, b_reg) in of_a.chunks(2).zip(&of_b) {
-            let a_refs: Vec<&str> = a_pair.iter().map(String::as_str).collect();
-            self.mma_f32_chain(&block_sum_names, &a_refs, b_reg, &block_sum_names);
-        }
-        self.chain_end_one(block_sums.clone());
+        let (of_a_refs, of_b_refs): (Vec<&str>, Vec<&str>) = (
+            of_a.iter().map(String::as_str).collect(),
+            of_b.iter().map(String::as_str).collect(),
+        );
+        self.mma_f32(&block_sum_names, &of_a_refs, &of_b_refs, &block_sum_names);
         for i in 0..4 {
             let f64_sum = self.fresh_wide();
             emit!(self, "cvt.f64.f32 {f64_sum}, {};", block_sums[i]);

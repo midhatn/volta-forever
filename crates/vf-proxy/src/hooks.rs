@@ -38,10 +38,12 @@ const INPUT_CUBIN: c_int = 0;
 const INPUT_PTX: c_int = 1;
 const INPUT_FATBINARY: c_int = 2;
 
-/// NVIDIA's implementation of a function, as a pointer of the given type; the call is counted.
+/// NVIDIA's implementation of a function, as a pointer of the given type; the call is counted when statistics are asked for.
 macro_rules! real {
     ($name:ident: $ty:ty) => {{
-        COUNTS[idx::$name].fetch_add(1, Relaxed);
+        if crate::config().stats {
+            COUNTS[idx::$name].fetch_add(1, Relaxed);
+        }
         // SAFETY: REALS holds the address of NVIDIA's function of that name, whose C prototype is
         // `$ty`, or of a stub that ignores its arguments and returns an error code.
         unsafe { std::mem::transmute::<usize, $ty>(REALS[idx::$name].load(Relaxed)) }
@@ -1413,7 +1415,9 @@ pub unsafe extern "C" fn cuLibraryGetKernel(
     library: *mut c_void,
     name: *const c_char,
 ) -> CUresult {
-    COUNTS[idx::cuLibraryGetKernel].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuLibraryGetKernel].fetch_add(1, Relaxed);
+    }
     let handle = library as usize;
     let find = || {
         if lazy::is_lazy(handle) {
@@ -1601,7 +1605,9 @@ impl Enumeration {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuLibraryGetKernelCount(count: *mut c_uint, library: *mut c_void) -> CUresult {
-    COUNTS[idx::cuLibraryGetKernelCount].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuLibraryGetKernelCount].fetch_add(1, Relaxed);
+    }
     match unsafe { Enumeration::library(library) } {
         Ok(list) => unsafe { list.write_count(count) },
         Err(rc) => rc,
@@ -1614,7 +1620,9 @@ pub unsafe extern "C" fn cuLibraryEnumerateKernels(
     count: c_uint,
     library: *mut c_void,
 ) -> CUresult {
-    COUNTS[idx::cuLibraryEnumerateKernels].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuLibraryEnumerateKernels].fetch_add(1, Relaxed);
+    }
     match unsafe { Enumeration::library(library) } {
         Ok(list) => unsafe { list.write_entries(kernels, count) },
         Err(rc) => rc,
@@ -1623,7 +1631,9 @@ pub unsafe extern "C" fn cuLibraryEnumerateKernels(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuModuleGetFunctionCount(count: *mut c_uint, module: *mut c_void) -> CUresult {
-    COUNTS[idx::cuModuleGetFunctionCount].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuModuleGetFunctionCount].fetch_add(1, Relaxed);
+    }
     unsafe { Enumeration::module(module).write_count(count) }
 }
 
@@ -1633,7 +1643,9 @@ pub unsafe extern "C" fn cuModuleEnumerateFunctions(
     count: c_uint,
     module: *mut c_void,
 ) -> CUresult {
-    COUNTS[idx::cuModuleEnumerateFunctions].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuModuleEnumerateFunctions].fetch_add(1, Relaxed);
+    }
     unsafe { Enumeration::module(module).write_entries(functions, count) }
 }
 
@@ -1713,7 +1725,9 @@ pub unsafe extern "C" fn cuLibraryGetModule(module: *mut *mut c_void, library: *
 }
 
 unsafe extern "C" fn library_get_module(module: *mut *mut c_void, library: *mut c_void, caller: usize) -> CUresult {
-    COUNTS[idx::cuLibraryGetModule].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuLibraryGetModule].fetch_add(1, Relaxed);
+    }
     let handle = library as usize;
     if unsafe { no_whole_module(module, handle, caller) } {
         return CUDA_ERROR_NO_BINARY_FOR_GPU;
@@ -1780,7 +1794,9 @@ pub unsafe extern "C" fn cuLibraryGetGlobal(
     library: *mut c_void,
     name: *const c_char,
 ) -> CUresult {
-    COUNTS[idx::cuLibraryGetGlobal].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuLibraryGetGlobal].fetch_add(1, Relaxed);
+    }
     let handle = library as usize;
     if lazy::is_lazy(handle) {
         if !unsafe { may_name_global(handle, name) } {
@@ -1816,7 +1832,9 @@ pub unsafe extern "C" fn cuLibraryGetManaged(
     library: *mut c_void,
     name: *const c_char,
 ) -> CUresult {
-    COUNTS[idx::cuLibraryGetManaged].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuLibraryGetManaged].fetch_add(1, Relaxed);
+    }
     let handle = library as usize;
     if lazy::is_lazy(handle) {
         // Managed variables live in the full module; materialize it.
@@ -1848,7 +1866,9 @@ pub unsafe extern "C" fn cuLibraryGetUnifiedFunction(
     library: *mut c_void,
     name: *const c_char,
 ) -> CUresult {
-    COUNTS[idx::cuLibraryGetUnifiedFunction].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuLibraryGetUnifiedFunction].fetch_add(1, Relaxed);
+    }
     let handle = library as usize;
     if lazy::is_lazy(handle) {
         // Unified functions live in the full module; materialize it.
@@ -1917,7 +1937,9 @@ pub unsafe extern "C" fn cuKernelGetFunction(function: *mut *mut c_void, kernel:
 /// `cuKernelGetLibrary`: for a kernel from a lazy library, return the lazy library handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn cuKernelGetLibrary(library: *mut *mut c_void, kernel: *mut c_void) -> CUresult {
-    COUNTS[idx::cuKernelGetLibrary].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuKernelGetLibrary].fetch_add(1, Relaxed);
+    }
     // (A kernel given from the image's code for the capability told: the library that was asked.)
     if let Some(lib_handle) = told::library_of(kernel as usize).or_else(|| lazy::kernel_library(kernel as usize)) {
         if !library.is_null() {
