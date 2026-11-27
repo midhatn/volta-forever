@@ -3085,6 +3085,17 @@ def translate(data, mc=None, listing=None, lives=None):
             x = group[x]
         return x
     by_symbol = {i: sym[3] for i, sym in enumerate(symbols) if sym[3] in group}
+    framed_sections = set()
+    root_info = e.section('.nv.info')
+    if root_info is not None:
+        d, pos = root_info.data, 0
+        while pos + 4 <= len(d):
+            fmt, attr, val = d[pos], d[pos + 1], struct.unpack_from('<H', d, pos + 2)[0]
+            if fmt == 4 and attr in (0x11, 0x12) and val >= 8 and pos + 4 + val <= len(d):
+                symbol, size = struct.unpack_from('<II', d, pos + 4)
+                if size > 0 and symbol in by_symbol:
+                    framed_sections.add(by_symbol[symbol])
+            pos += 4 + val if fmt == 4 else 4
     # The sections that are kernels: a function symbol with the mark of an entry point.
     entries = {sym[3] for sym in symbols if sym[1] & 15 == 2 and sym[2] & 0x10}
     relocations, holders, named = relocations_of(e, symbols, group)
@@ -3353,7 +3364,8 @@ def translate(data, mc=None, listing=None, lives=None):
                 target_warps = occupancy_warps(occ_limit, info_data)
                 done = None
                 best_f_state = None
-                if not relocations.get(indices[0]) and not f.tables:
+                has_local_frame = indices[0] in framed_sections or any(d.mnemonic in ('LDL', 'STL') for d in f.src)
+                if not has_local_frame and not relocations.get(indices[0]) and not f.tables:
                     f.plan_pairs(True, True)
                     rows = {}
                     for rd, count in (f.q.rows() if f.q else {}).items():

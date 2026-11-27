@@ -61,6 +61,26 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
         .filter(|(_, sym)| group.contains_key(&(sym.shndx as usize)))
         .map(|(i, sym)| (i, sym.shndx as usize))
         .collect();
+    let mut framed_sections: HashSet<usize> = HashSet::new();
+    if let Some(ii) = e.section(".nv.info") {
+        let d = &e.sections[ii].data;
+        let mut pos = 0;
+        while pos + 4 <= d.len() {
+            let fmt = d[pos];
+            let attr = d[pos + 1];
+            let val = u16::from_le_bytes(d[pos + 2..pos + 4].try_into().unwrap()) as usize;
+            if fmt == 4 && matches!(attr, 0x11 | 0x12) && val >= 8 && pos + 4 + val <= d.len() {
+                let symbol = u32::from_le_bytes(d[pos + 4..pos + 8].try_into().unwrap()) as usize;
+                let size = u32::from_le_bytes(d[pos + 8..pos + 12].try_into().unwrap());
+                if size > 0
+                    && let Some(&si) = by_symbol.get(&symbol)
+                {
+                    framed_sections.insert(si);
+                }
+            }
+            pos += if fmt == 4 { 4 + val } else { 4 };
+        }
+    }
 
     // Relocations: the driver, or a linker, writes addresses into the instructions and the data
     // they name once it knows them. Those on code are kept by the function they are on (`follow`);
@@ -662,7 +682,9 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
                     let target_warps = super::block_registers::occupancy_warps(occ_limit, info);
                     let mut cliff_best: Option<Vec<(usize, TransResult)>> = None;
 
-                    if !relocations.contains_key(&indices[0]) && f.tables.is_empty() {
+                    let has_local_frame = framed_sections.contains(&indices[0])
+                        || f.src.iter().any(|d| matches!(d.mnemonic, "LDL" | "STL"));
+                    if !has_local_frame && !relocations.contains_key(&indices[0]) && f.tables.is_empty() {
                         let layout = compute_layout(&paired);
                         let rows_opt = if layout.rows.is_empty() { None } else { Some(&layout.rows) };
                         let l0_placed = placement(

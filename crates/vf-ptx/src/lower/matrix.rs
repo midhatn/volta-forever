@@ -448,7 +448,8 @@ impl<'a> Body<'a> {
                 }
             }
         }
-        self.wide_loads(&wide, followed);
+        let static_aligned = self.plan.aligned_16.contains(&self.current_index);
+        self.wide_loads(&wide, followed, static_aligned);
         for (upper, row, registers) in halves {
             let (not, h) = (if upper { "" } else { "!" }, self.lane(Lane::Has(16)));
             emit!(

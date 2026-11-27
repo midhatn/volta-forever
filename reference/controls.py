@@ -83,6 +83,13 @@ sm_75 cubins named with it, and counts what validate.py finds. A control that pa
                 from elsewhere, a call, another register of B gathered
     unkept      of what a function with a product keeps of the lane, the lane that holds what
                 a thread gathers for the columns 4 to 7 is 8 further and not 16
+    unpaired    the upper half of a 64-bit uniform operand of an instruction that goes to
+                ordinary registers (UIMAD.WIDE, UIMAD.WIDE.X) gets another register than the
+                lower half's + 1, even when the lower half is even: that of a single uniform
+                register, or else the first register that the translation leaves free (only
+                where the upper half is also named alone: elsewhere its register is named nowhere)
+    misruled    the immediate of the first instruction translated by a rule to ordinary registers
+                is altered by one
 
 With pairs of products on whole rows (the translation as it is has them, unless VF_PAIRS=0:
 these change nothing then):
@@ -335,7 +342,7 @@ careful than nvdisasm's (they are, across calls within a function) that predicat
 nothing after all. Such a 0 is worth a look, and is not a hole by itself: this program and
 tests/sass/controls.sh fail on each but those of RIGHT_THERE, each looked at.
 """
-import collections, os, re, struct, subprocess, sys, tempfile
+import collections, inspect, os, re, struct, subprocess, sys, tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import elf, machine, translate
 from machine import READ_BARRIER, WRITE_BARRIER, WAIT, stall_of, with_stall
@@ -771,6 +778,88 @@ def patched(control):
             item.what = {'to pairs': 'from pairs', 'from pairs': 'to pairs'}.get(item.what, item.what)
         return new
 
+    translate_orig = Function.translate
+    one_orig = Function.one
+
+    # (The arguments of `Function.translate` are read and given back by their names. Until
+    # 2026-11-26 the sixth after `place` was taken by its place for the register to look from
+    # where no single uniform register is there to exchange with: it is `scratch`, the first of
+    # the registers of matrix sequences, which `placement` gives as None to a function without
+    # them, as level 3 does (it takes them at each instruction). The control stopped there on
+    # such a function, and in a function with them gave the upper half that first scratch
+    # register.)
+    translate_parameters = inspect.signature(translate_orig)
+
+    def unpaired_translate(*args, **kwargs):
+        given = translate_parameters.bind(*args, **kwargs)
+        self, place, free = given.arguments['self'], dict(given.arguments['place']), given.arguments['free']
+        paired64 = {
+            d.ops[op]
+            for d in self.src
+            if d.c.name in self.mc.rule_of
+            for l, op, span in self.mc._uses[(75, d.c.name)].reads + self.mc._uses[(75, d.c.name)].writes
+            if l == 'U' and op in d.ops and d.ops[op] != 63 and machine.registers(span, d.ops) == 2
+        }
+        indiv = {
+            d.ops[op] + k
+            for d in self.src
+            for l, op, span in self.mc._uses[(75, d.c.name)].reads + self.mc._uses[(75, d.c.name)].writes
+            if l == 'U' and op in d.ops and d.ops[op] != 63
+            for k in ((0, 1) if d.c.name.startswith('uldc') and machine.registers(span, d.ops) == 2 else ((0,) if machine.registers(span, d.ops) == 1 else ()))
+        }
+        for u in sorted(paired64):
+            if u in place and u + 1 in place and u + 1 in indiv and place[u] % 2 == 0 and place[u + 1] == place[u] + 1:
+                singleton = next((v for v in sorted(place) if v != u and v != u + 1 and v not in self.pairs and (v - 1) not in self.pairs and place[v] != place[u] + 1), None)
+                if singleton is not None:
+                    place[u + 1], place[singleton] = place[singleton], place[u + 1]
+                    break
+                if free < 253:
+                    # None to exchange with: the first register that the translation leaves
+                    # free, which holds nothing else, and the function counts it.
+                    place[u + 1], free = free, free + 1
+                    break
+        given.arguments['place'], given.arguments['free'] = place, free
+        return translate_orig(*given.args, **given.kwargs)
+
+    def unpaired_from_memory(self, i, d):
+        items = from_memory(self, i, d)
+        if d.c.name in self.mc.rule_of and self.borrow and self.borrow.slots:
+            _, _, together = self.in_frame(d)
+            for u in sorted(together):
+                if u in self._mem_regs and u + 1 in self._mem_regs and self._mem_regs[u] % 2 == 0 and self._mem_regs[u + 1] == self._mem_regs[u] + 1:
+                    old_r1 = self._mem_regs[u + 1]
+                    try:
+                        alt = self.take(1)
+                    except translate.Refused:
+                        alt = None
+                    if alt is not None and alt != old_r1:
+                        self._mem_regs[u + 1] = alt
+                        for item in items:
+                            d70 = self.mc.decode(70, item.word)
+                            if d70 and d70.mnemonic == 'LDL' and d70.ops.get('Rd') == old_r1:
+                                item.word = self.mc.assemble('ldl__sImmOffset', Rd=alt, Ra=d70.ops['Ra'], Ra_offset=d70.ops.get('Ra_offset', 0), dst_wr_sb=d70.ops.get('dst_wr_sb', 7))
+                        break
+        return items
+
+    def misruled_one(self, i, d):
+        # (The instruction that was altered is kept, not that one was: the translator may
+        # translate a function again, after an attempt that it gives up, and the next attempt
+        # alters the same instruction. Until 2026-11-26 it altered none, and the function was
+        # translated as it is: one function of cuSOLVER's 0015, of 198 cubins looked at.)
+        items = one_orig(self, i, d)
+        if getattr(self, '_misruled_at', i) == i:
+            for item in items:
+                if item.what == 'ordinary registers':
+                    d70 = self.mc.decode(70, item.word)
+                    if d70 is not None:
+                        for kind, fields, data in self.mc.d70.plan(d70.c):
+                            if kind == 'operand' and data in ('Sc', 'Sb') and any('Imm' in f.name or 'imm' in f.name or d70.c.operands[data].type == 'SImm' for f in fields if data in d70.c.operands):
+                                val = fields[0].get(item.word)
+                                item.word = fields[0].put(item.word, val ^ 1)
+                                self._misruled_at = i
+                                return items
+        return items
+
     all_controls = {
         'as it is': {},
         'unsaved': {'stand_ins': unsaved},
@@ -834,6 +923,8 @@ def patched(control):
         'pool_in_home_unsaid': {},
         'split_home': {},
         'caller_live_in_callee': {},
+        'unpaired': {'translate': unpaired_translate, 'from_memory': unpaired_from_memory},
+        'misruled': {'one': misruled_one},
     }
     # ---- level 3 controls (the frame) ----
     from_memory, to_memory = Function.from_memory, Function.to_memory
@@ -1262,7 +1353,7 @@ def patched(control):
     return all_controls[control]
 
 
-CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
+CONTROLS = ['as it is', 'unsaved', 'blind', 'cut', 'masks', 'nowait', 'close', 'doublesoon', 'doubleacross', 'returns', 'waitless', 'unlisted', 'swapped', 'batched', 'unmoved', 'named', 'unguarded', 'lanes', 'unwaited', 'unordered', 'complement_rewritten', 'complement_same', 'soon', 'partial', 'boardless', 'unmasked', 'early', 'unheld', 'unwritten', 'stale', 'unkept', 'unpaired', 'misruled', 'slowno', 'slowshort', 'slownowait', 'slownever', 'slowfree', 'slowsaved', 'alive_scratch']
 # (Those of pairs of products on whole rows: only when the translator makes them, not with VF_PAIRS=0.)
 PAIR_CONTROLS = ['rowlane', 'otherrow', 'rowwait', 'rowread', 'halfswap', 'halfk', 'inplace', 'stepfast', 'unsettled', 'unsynced', 'unpermuted', 'unconverted', 'notalso']
 CONTROLS += PAIR_CONTROLS
@@ -1387,7 +1478,7 @@ def run(mc, control, path, out_dir, untouched, validated=True):
     """(problems validate.py finds, its first objection) for one cubin; (None, '') when the control
     changed nothing in its translation, which `untouched` holds by path. (`validated` false: the
     translation as it is is kept there and not validated.)"""
-    originals = {name: getattr(Function, name) for name in ('stand_ins', 'liveness', 'late', 'schedule', 'return_addresses', 'matrix_load', 'matrix_product', 'kept', 'kept_gathering', 'given_back', 'all_predicates', 'waits_for', 'masked',
+    originals = {name: getattr(Function, name) for name in ('stand_ins', 'liveness', 'late', 'schedule', 'return_addresses', 'matrix_load', 'matrix_product', 'kept', 'kept_gathering', 'given_back', 'all_predicates', 'waits_for', 'masked', 'translate', 'one',
                                                              'kept_for_rows', 'whole_rows', 'half_of_pair', 'converted',
                                                              'from_memory', 'to_memory', 'frame_top', 'load_word', 'store_word', 'read_back')}
     for name, replacement in patched(control).items():

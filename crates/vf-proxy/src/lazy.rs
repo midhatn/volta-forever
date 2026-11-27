@@ -758,30 +758,55 @@ fn build_standin_ptx(full_ptx: &[u8]) -> Vec<u8> {
 /// When a lazy library was set up from the proxy cache, adapt the original bytes, by the policy of
 /// its load, and analyse the result. Fills `lazy_lib.adapted_data` and `lazy_lib.info` so that
 /// materialization and sub-module extraction work. Must be called outside the lock.
-fn ensure_adapted(original: &[u8], policy: &vf_adapt::Policy) -> Option<(Vec<u8>, ModuleInfo)> {
-    // The original bytes are the fat binary or PTX the program gave. Adapt them exactly as
-    // `images::adapt` would.
-    let adapted = if original.len() >= 4 && u32::from_le_bytes(original[..4].try_into().ok()?) == fatbin::MAGIC {
-        let fat = fatbin::parse(original).ok()?;
-        policy.adapt_fatbin(&fat).ok()?.image?
+fn ensure_adapted(
+    original: &[u8],
+    policy: &vf_adapt::Policy,
+    cache_key: Option<crate::cache::CacheKey>,
+) -> Option<(Vec<u8>, ModuleInfo)> {
+    // The original bytes are the fat binary or PTX the program gave. Adapt them (or restore from
+    // the retargeted proxy cache) using the load's saved key/policy rather than the caller thread's.
+    let is_fatbin = original.len() >= 4 && u32::from_le_bytes(original[..4].try_into().ok()?) == fatbin::MAGIC;
+    let key_bytes = if is_fatbin {
+        original
     } else {
-        // PTX text: adapt, then append the null terminator the driver needs (the hooks path
-        // does this in `finish` via `terminate`; we must do it here too).
-        let text = if original.last() == Some(&0) {
-            &original[..original.len() - 1]
-        } else {
-            original
-        };
-        let mut image = policy.adapt_ptx(text).image?;
-        image.push(0);
-        image
+        original.strip_suffix(&[0]).unwrap_or(original)
     };
-    let ptx = extract_ptx_from_adapted(&adapted)?;
+    let ck =
+        crate::cache::enabled().then(|| cache_key.unwrap_or_else(|| crate::cache::key_for_policy(key_bytes, policy)));
+    let start = std::time::Instant::now();
+    let mut image = if let Some(kept) = ck.as_ref().and_then(crate::cache::load_retargeted) {
+        log::timing(format_args!(
+            "timing: lazy: retargeted from the cache {:.1} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        ));
+        kept.image?
+    } else {
+        let out = if is_fatbin {
+            let fat = fatbin::parse(original).ok()?;
+            policy.adapt_fatbin(&fat).ok()?
+        } else {
+            policy.adapt_ptx(key_bytes)
+        };
+        if matches!(out.outcome, vf_adapt::Outcome::Retargeted { .. }) {
+            log::timing(format_args!(
+                "timing: lazy: PTX retargeted in {:.1} ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            ));
+            if let Some(ref ck) = ck {
+                crate::cache::save_retargeted(ck, &out);
+            }
+        }
+        out.image?
+    };
+    if !is_fatbin {
+        image.push(0);
+    }
+    let ptx = extract_ptx_from_adapted(&image)?;
     let info = ModuleInfo::analyse(&ptx);
-    Some((adapted, info))
+    Some((image, info))
 }
 
-/// Get the real `cuLibraryLoadData` function pointer (counts the call).
+/// Get the real `cuLibraryLoadData` function pointer (counts the call when statistics are asked for).
 fn real_library_load() -> unsafe extern "C" fn(
     *mut *mut c_void,
     *const c_void,
@@ -792,7 +817,9 @@ fn real_library_load() -> unsafe extern "C" fn(
     *mut *mut c_void,
     c_uint,
 ) -> CUresult {
-    COUNTS[idx::cuLibraryLoadData].fetch_add(1, Relaxed);
+    if crate::config().stats {
+        COUNTS[idx::cuLibraryLoadData].fetch_add(1, Relaxed);
+    }
     // SAFETY: REALS holds the address of NVIDIA's cuLibraryLoadData, whose prototype matches.
     unsafe { std::mem::transmute(REALS[idx::cuLibraryLoadData].load(Relaxed)) }
 }
@@ -1088,10 +1115,11 @@ fn adapt_restored(mut libs: Libs, library: usize, id: u64, kernel: Option<&str>)
         }
         lazy_lib.adapting = true;
         let policy = lazy_lib.policy;
+        let cache_key = lazy_lib.cache_key;
         // Outside the lock, which is that of every lazy library: the adaptation and the analysis
         // of a whole module take from tens of milliseconds to seconds.
         drop(libs);
-        let adapted = ensure_adapted(&original, &policy);
+        let adapted = ensure_adapted(&original, &policy, cache_key);
         libs = mutex.lock().unwrap_or_else(|e| e.into_inner());
         let made = adapted.is_some();
         let there = match same(&mut libs, library, id) {
@@ -1790,4 +1818,22 @@ pub fn kernel_library(kernel: usize) -> Option<usize> {
         .unwrap_or_else(|e| e.into_inner())
         .get(&kernel)
         .copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_adapted_retargets_ptx_under_passed_policy() {
+        let ptx = b".version 8.8\n.target sm_75\n.address_size 64\n.visible .entry a() { ret; }\n\0";
+        let policy = vf_adapt::Policy {
+            told_sm: Some(75),
+            keep_sources: true,
+            ..vf_adapt::Policy::default()
+        };
+        let (image, info) = ensure_adapted(ptx, &policy, None).expect("adapted PTX");
+        assert!(image.ends_with(&[0]));
+        assert!(info.entries.iter().any(|e| e == "a"));
+    }
 }

@@ -420,9 +420,23 @@ pub fn body_in(
 
 /// `body_in`, with the forms of the instructions replaced by a reported trap
 /// (`Options::reported_traps`), in the order of the body: one for each, `Counts::reported` in all.
+pub(crate) fn aligned_shared_symbols(text: &str) -> HashMap<String, u64> {
+    known_bits::align::aligned_shared_symbols(text)
+}
+
 pub fn body_reporting(
     text: &str,
     outside: &[String],
+    address_bits: u32,
+    options: Options,
+) -> Result<(String, Counts, Vec<String>), Unsupported> {
+    body_reporting_shared(text, outside, &HashMap::new(), address_bits, options)
+}
+
+pub(crate) fn body_reporting_shared(
+    text: &str,
+    outside: &[String],
+    shared_aligned: &HashMap<String, u64>,
     address_bits: u32,
     options: Options,
 ) -> Result<(String, Counts, Vec<String>), Unsupported> {
@@ -498,7 +512,7 @@ pub fn body_reporting(
         wide_registers: 0,
         half_registers: 0,
         lane: Vec::new(),
-        plan: Plan::new(text, &items, options),
+        plan: Plan::new(text, &items, options, shared_aligned),
         loaded: HashMap::new(),
         filled: HashSet::new(),
         remembered: HashMap::new(),

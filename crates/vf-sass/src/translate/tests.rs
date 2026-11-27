@@ -1079,6 +1079,178 @@ fn a_uniform_sign_extension_becomes_sgxt() {
 }
 
 #[test]
+fn uimad_stride_and_wide_kernel_translates_and_preserves_pairs() {
+    let cubin = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/k_uimad.sm75.cubin"
+    ));
+    let mut decoder = Decoder::new(70);
+    for borrow in [Options::default().borrow, 1, 8] {
+        let options = Options {
+            borrow,
+            ..Options::default()
+        };
+        let result = translate_with_options(cubin, true, &options).unwrap();
+        assert!(
+            result.report.iter().all(|f| f.refused.is_none()),
+            "refused under borrow={borrow:?}: {:?}",
+            result.report
+        );
+        let out = crate::elf::Elf::parse(&result.bytes).unwrap();
+        let map = result.map.unwrap();
+        let mut decode_at = |func: &str, origin: u64| {
+            let code = &out.sections[out.section(&format!(".text.{func}")).unwrap()].data;
+            let (_, new, _, what) = map
+                .iter()
+                .find(|(f, _, old, w)| f == func && *old == origin && !w.starts_with("mem: "))
+                .unwrap_or_else(|| panic!("missing {func}+0x{origin:x} under {borrow:?}"));
+            let at = *new as usize;
+            let d = decoder
+                .decode(u128::from_le_bytes(code[at..at + 16].try_into().unwrap()))
+                .unwrap();
+            (what.clone(), d)
+        };
+        let (w_stride, d_stride) = decode_at("k_uimad_stride", 0xb0);
+        assert_eq!((w_stride.as_str(), d_stride.mnemonic), ("ordinary registers", "IMAD"));
+        assert_eq!(d_stride.op_or_name("Sc", 0), 0x240);
+
+        let (w_wide, d_wide) = decode_at("k_uimad_wide_hi", 0x60);
+        assert_eq!((w_wide.as_str(), d_wide.mnemonic), ("ordinary registers", "IMAD"));
+        assert_eq!(d_wide.name, "imad_wide__RRR_RRR");
+        let rd = d_wide.op_or_name("Rd", 255);
+        assert_eq!(rd % 2, 0);
+        assert_eq!(d_wide.op_or_name("Rc", 255), rd);
+        let (_, d_hi_read) = decode_at("k_uimad_wide_hi", 0x80);
+        if borrow == 8 {
+            // Level 3 holds uniform registers in local memory slots and reloads per instruction:
+            // 0x60 stores UR4:UR5 from rd:rd+1, and 0x80 loads UR5 into its per-instruction scratch.
+            let code = &out.sections[out.section(".text.k_uimad_wide_hi").unwrap()].data;
+            let st_hi = map
+                .iter()
+                .find(|(f, _, old, w)| f == "k_uimad_wide_hi" && *old == 0x60 && w == "mem: store UR5")
+                .unwrap();
+            let d_st_hi = decoder
+                .decode(u128::from_le_bytes(
+                    code[st_hi.1 as usize..st_hi.1 as usize + 16].try_into().unwrap(),
+                ))
+                .unwrap();
+            assert_eq!(d_st_hi.op_or_name("Rb", 255), rd + 1);
+            let ld_hi = map
+                .iter()
+                .find(|(f, _, old, w)| f == "k_uimad_wide_hi" && *old == 0x80 && w == "mem: load UR5")
+                .unwrap();
+            let d_ld_hi = decoder
+                .decode(u128::from_le_bytes(
+                    code[ld_hi.1 as usize..ld_hi.1 as usize + 16].try_into().unwrap(),
+                ))
+                .unwrap();
+            assert_eq!(d_hi_read.op_or_name("Rc", 255), d_ld_hi.op_or_name("Rd", 255));
+        } else {
+            assert_eq!(d_hi_read.op_or_name("Rc", 255), rd + 1);
+        }
+    }
+}
+
+#[test]
+fn uimad_x_and_uimad_wide_x_preserve_predicates_and_pairs() {
+    let mut decoder = Decoder::new(70);
+    // Patch k_guarded_state+0x1d0 with UIMAD.X UR5, UR4, UR6, 0x240, UP0 right after 0x1c0 writes UP0.
+    let guards_tmpl = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/k_guards.sm75.cubin"
+    ));
+    let mut g_in = crate::elf::Elf::parse(guards_tmpl).unwrap();
+    let g_sec = g_in.section(".text.k_guarded_state").unwrap();
+    assert_eq!(
+        &g_in.sections[g_sec].data[0x1d0..0x1e0],
+        &0x000fd2000fffe006_0000000104057890_u128.to_le_bytes()
+    );
+    g_in.sections[g_sec].data[0x1d0..0x1e0].copy_from_slice(&0x000fd200080e0606_00000240040574a4_u128.to_le_bytes());
+
+    // Patch k_uimad_wide_hi+0x60 with UIMAD.WIDE.X UR4, UR8, UR9, UR4, UPT.
+    let uimad_tmpl = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/kernels/translate/k_uimad.sm75.cubin"
+    ));
+    let mut u_in = crate::elf::Elf::parse(uimad_tmpl).unwrap();
+    let u_sec = u_in.section(".text.k_uimad_wide_hi").unwrap();
+    assert_eq!(
+        &u_in.sections[u_sec].data[0x60..0x70],
+        &0x000fcc000f8e0004_00000009080472a5_u128.to_le_bytes()
+    );
+    u_in.sections[u_sec].data[0x60..0x70].copy_from_slice(&0x000fcc000b8e0604_00000009080472a5_u128.to_le_bytes());
+
+    let g_bytes = g_in.write();
+    let u_bytes = u_in.write();
+    for borrow in [Options::default().borrow, 8] {
+        let options = Options {
+            borrow,
+            ..Options::default()
+        };
+        let gr = translate_with_options(&g_bytes, true, &options).unwrap();
+        assert!(gr.report.iter().all(|f| f.refused.is_none()));
+        let gout = crate::elf::Elf::parse(&gr.bytes).unwrap();
+        let gcode = &gout.sections[gout.section(".text.k_guarded_state").unwrap()].data;
+        let gmap = gr.map.unwrap();
+        let (_, cmp_off, _, _) = gmap
+            .iter()
+            .find(|(f, _, old, w)| {
+                f == "k_guarded_state"
+                    && *old == 0x1c0
+                    && !w.starts_with("mem: ")
+                    && *w != "held: back"
+                    && *w != "held: kept"
+            })
+            .unwrap();
+        let cmp = decoder
+            .decode(u128::from_le_bytes(
+                gcode[*cmp_off as usize..*cmp_off as usize + 16].try_into().unwrap(),
+            ))
+            .unwrap();
+        let (_, u_off, _, u_what) = gmap
+            .iter()
+            .find(|(f, _, old, w)| {
+                f == "k_guarded_state"
+                    && *old == 0x1d0
+                    && !w.starts_with("mem: ")
+                    && *w != "held: back"
+                    && *w != "held: kept"
+            })
+            .unwrap();
+        let uimad_x = decoder
+            .decode(u128::from_le_bytes(
+                gcode[*u_off as usize..*u_off as usize + 16].try_into().unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(u_what, "ordinary registers");
+        assert_eq!(uimad_x.name, "imad_x__RRsI_RRI");
+        assert_eq!(uimad_x.op_or_name("Sc", 0), 0x240);
+        assert_eq!(uimad_x.op_or_name("Pp", 7), cmp.op_or_name("Pu", 6));
+
+        let ur = translate_with_options(&u_bytes, true, &options).unwrap();
+        assert!(ur.report.iter().all(|f| f.refused.is_none()));
+        let uout = crate::elf::Elf::parse(&ur.bytes).unwrap();
+        let ucode = &uout.sections[uout.section(".text.k_uimad_wide_hi").unwrap()].data;
+        let umap = ur.map.unwrap();
+        let (_, w_off, _, w_what) = umap
+            .iter()
+            .find(|(f, _, old, w)| f == "k_uimad_wide_hi" && *old == 0x60 && !w.starts_with("mem: "))
+            .unwrap();
+        let wide_x = decoder
+            .decode(u128::from_le_bytes(
+                ucode[*w_off as usize..*w_off as usize + 16].try_into().unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(w_what, "ordinary registers");
+        assert_eq!(wide_x.name, "imad_wide_x__RRR_RRR");
+        assert_eq!(wide_x.op_or_name("Pp", 0), 7);
+        let rd = wide_x.op_or_name("Rd", 255);
+        assert_eq!(rd % 2, 0);
+        assert_eq!(wide_x.op_or_name("Rc", 255), rd);
+    }
+}
+
+#[test]
 fn graph_register_policy_only_rebudgets_an_entry_that_loses_a_legal_block() {
     let original = include_bytes!("../../../../tests/kernels/k_fit_test.135.sm75.cubin");
     let name = "k_fit_regs";
@@ -1441,26 +1613,65 @@ fn a_result_of_double_precision_is_read_no_earlier_than_volta_reads_one() {
     assert_eq!(through[0] + through[1], 15, "{through:?}");
 }
 
-/// A kernel whose translated register count crosses a GV100 warp occupancy cliff recovers a
-/// full warp tier via zero-spill level-2 borrowing without allocating a local frame.
+/// A stackless kernel whose translated register count crosses a GV100 warp occupancy cliff
+/// recovers a full warp tier via zero-spill borrowing without allocating a local frame, while
+/// a function with a local stack frame (`EIATTR_FRAME_SIZE > 0` / `LDL`/`STL`, such as
+/// `k_pairs::p_callee` with `STACK:128`) skips occupancy-cliff borrowing to avoid local-stack
+/// contention.
 #[test]
 fn occupancy_cliff_recovers_full_warp_tier_without_spills() {
-    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
-    let result = translate_with_options(original, true, &Options::default()).unwrap();
-    let report = result.report.iter().find(|r| r.name == "p_callee").unwrap();
-    assert_eq!(report.refused, None);
-    let out = crate::elf::Elf::parse(&result.bytes).unwrap();
-    let text = &out.sections[out.section(".text.p_callee").unwrap()];
-    let count = text.info >> 24;
-    assert!(
-        count <= 64,
-        "expected p_callee to recover <= 64 registers (8 warps/subpartition), got {count}"
-    );
-    let map = result.map.unwrap();
-    assert!(
-        !map.iter()
-            .any(|(f, _, _, what)| f == "p_callee" && what.starts_with("mem:")),
-        "occupancy recovery must stay zero-spill without local-memory frame ops"
+    let groups = include_bytes!("../../../../tests/kernels/k_groups.135.sm75.cubin");
+    let without_cliff = translate_with_options(
+        groups,
+        false,
+        &Options {
+            borrow: 6,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let with_cliff = translate_with_options(groups, true, &Options::default()).unwrap();
+    let out_b6 = crate::elf::Elf::parse(&without_cliff.bytes).unwrap();
+    let out_b7 = crate::elf::Elf::parse(&with_cliff.bytes).unwrap();
+    let map = with_cliff.map.unwrap();
+    for name in ["g_shared", "g_once"] {
+        let report = with_cliff.report.iter().find(|r| r.name == name).unwrap();
+        assert_eq!(report.refused, None);
+        let c6 = out_b6.sections[out_b6.section(&format!(".text.{name}")).unwrap()].info >> 24;
+        let c7 = out_b7.sections[out_b7.section(&format!(".text.{name}")).unwrap()].info >> 24;
+        assert_eq!(c6, 82, "expected {name} without cliff recovery to take 82 registers");
+        assert!(
+            c7 <= 80,
+            "expected {name} to recover <= 80 registers (6 warps/subpartition), got {c7}"
+        );
+        assert!(
+            !map.iter().any(|(f, _, _, what)| f == name && what.starts_with("mem:")),
+            "occupancy recovery must stay zero-spill without local-memory frame ops"
+        );
+    }
+
+    // A kernel with a local stack frame (`STACK:128`, `LDL`/`STL`) must NOT cross down for
+    // occupancy cliffs (staying at its level-0 count of 65 registers instead of borrowing into
+    // local-stack contention).
+    let pairs = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let pairs_b6 = translate_with_options(
+        pairs,
+        false,
+        &Options {
+            borrow: 6,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    let pairs_b7 = translate_with_options(pairs, false, &Options::default()).unwrap();
+    let p_b6 = crate::elf::Elf::parse(&pairs_b6.bytes).unwrap();
+    let p_b7 = crate::elf::Elf::parse(&pairs_b7.bytes).unwrap();
+    let r_b6 = p_b6.sections[p_b6.section(".text.p_callee").unwrap()].info >> 24;
+    let r_b7 = p_b7.sections[p_b7.section(".text.p_callee").unwrap()].info >> 24;
+    assert_eq!(r_b6, 65);
+    assert_eq!(
+        r_b7, r_b6,
+        "local-frame p_callee must stay un-lowered at {r_b6} registers under default borrow=7, got {r_b7}"
     );
 }
 
@@ -1817,10 +2028,14 @@ fn free_at_avoids_late_read_and_exceeding_highest() {
     // Once R4:R5 is busy, level 2 (!everything) must NOT jump above highest=5 (returns R2 instead of R6).
     regset_set(&mut b.busy[0], 4);
     assert_eq!(b.free_at(0, 2, &regset_empty()), Some(2));
-    // And in k_pairs::p_callee, dynamic pool borrowing must avoid heavily late-read R2:R3
-    // (keeping LDG/STG instructions reading R2 free of injected read scoreboards).
+    // And in k_pairs::p_callee, dynamic pool borrowing (under VF_BORROW=1) must avoid heavily
+    // late-read R2:R3 (keeping LDG/STG instructions reading R2 free of injected read scoreboards).
     let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
-    let result = translate_with_options(original, false, &Options::default()).unwrap();
+    let borrow1 = Options {
+        borrow: 1,
+        ..Options::default()
+    };
+    let result = translate_with_options(original, false, &borrow1).unwrap();
     let out = crate::elf::Elf::parse(&result.bytes).unwrap();
     let text = &out.sections[out.section(".text.p_callee").unwrap()];
     let mut dec70 = Decoder::new(70);
@@ -1898,7 +2113,11 @@ fn free_at_avoids_scoreboard_bound_registers() {
 #[test]
 fn borrowed_pool_wait_excludes_unrelated_scoreboards() {
     let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
-    let result = translate_with_options(original, false, &Options::default()).unwrap();
+    let borrow1 = Options {
+        borrow: 1,
+        ..Options::default()
+    };
+    let result = translate_with_options(original, false, &borrow1).unwrap();
     let out = crate::elf::Elf::parse(&result.bytes).unwrap();
     let text = &out.sections[out.section(".text.p_callee").unwrap()];
     let mut dec70 = Decoder::new(70);

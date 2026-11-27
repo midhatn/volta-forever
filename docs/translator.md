@@ -163,6 +163,16 @@ third register that is not `URZ`, a negated operand, a guard, the other forms of
 rules (`remap_uniform_operands_in_triton_kernels` in `crates/vf-sass/src/rule.rs`);
 a `USGXT` put into a test kernel goes through the whole translator
 (`a_uniform_sign_extension_becomes_sgxt` in `crates/vf-sass/src/translate/tests.rs`).
+`UIMAD` with an immediate addend (`UIMAD UR4, UR4, UR5, 0x240`, the form of
+issue #8) and the forms with a carry in, `UIMAD.X` and `UIMAD.WIDE.X`, map to
+`IMAD`, `IMAD.X` and `IMAD.WIDE.X` with the same operands (pull request #15).
+Seven words of these forms,
+each as nvdisasm reads it on both sides, are the unit test
+`remap_uimad_and_carry_variants` in `crates/vf-sass/src/rule.rs`;
+`tests/kernels/translate/k_uimad.cu` (the immediate form and `UIMAD.WIDE`) goes
+through the whole translator and runs on a V100, and a `UIMAD.X` and a
+`UIMAD.WIDE.X` put into test kernels go through the whole translator
+(`crates/vf-sass/src/translate/tests.rs`).
 
 An instruction with a uniform operand (a load at `[R4 + UR6 + 0x10]`, a
 comparison against UR2) is rewritten to the sm_70 form with an ordinary
@@ -441,7 +451,8 @@ allocation jumps to 72 and the maximum drops to 896. A kernel launched with
 occupancy tiers (such as 32 -> 40, 40 -> 48, 48 -> 56, 56 -> 64, 64 -> 72,
 or 96 -> 104 registers on GV100, which allocates registers in multiples of 8
 per warp out of a 16,384-register partitioned file); the translator recovers
-the original kernel's occupancy tier whenever borrowing (levels 1 and 2,
+the original kernel's occupancy tier for stackless kernels (no local stack
+frame or `LDL`/`STL` memory traffic) whenever borrowing (levels 1 and 2,
 without local-memory spills) can fit within it, using the exact liveness of
 internal `CALL.REL`/`RET.REL` subroutines when calls are traceable. With
 level 0 alone, 1,012 of PyTorch's 23,693 functions cross the 64-register

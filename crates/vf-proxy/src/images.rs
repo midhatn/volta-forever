@@ -1208,22 +1208,43 @@ fn finish(
 fn adapted(who: &dyn Display, image: &[u8], adapt: impl FnOnce() -> Adapted) -> Adapted {
     let key = crate::cache::enabled().then(|| crate::cache::key_for(image));
     let start = std::time::Instant::now();
-    if let Some(kept) = key.as_ref().and_then(crate::cache::load_translation) {
-        log::timing(format_args!(
-            "timing: {who}: translation from the cache {:.1} ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        ));
-        return kept;
+    if let Some(key) = &key {
+        if let Some(kept) = crate::cache::load_translation(key) {
+            log::timing(format_args!(
+                "timing: {who}: translation from the cache {:.1} ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            ));
+            return kept;
+        }
+        if let Some(kept) = crate::cache::load_retargeted(key) {
+            log::timing(format_args!(
+                "timing: {who}: retargeted from the cache {:.1} ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            ));
+            return kept;
+        }
     }
     let adapted = adapt();
-    if let Outcome::Translated { .. } = adapted.outcome {
-        log::timing(format_args!(
-            "timing: {who}: machine code translated in {:.1} ms",
-            start.elapsed().as_secs_f64() * 1000.0
-        ));
-        if let Some(key) = &key {
-            crate::cache::save_translation(key, &adapted);
+    match adapted.outcome {
+        Outcome::Translated { .. } => {
+            log::timing(format_args!(
+                "timing: {who}: machine code translated in {:.1} ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            ));
+            if let Some(key) = &key {
+                crate::cache::save_translation(key, &adapted);
+            }
         }
+        Outcome::Retargeted { .. } => {
+            log::timing(format_args!(
+                "timing: {who}: PTX retargeted in {:.1} ms",
+                start.elapsed().as_secs_f64() * 1000.0
+            ));
+            if let Some(key) = &key {
+                crate::cache::save_retargeted(key, &adapted);
+            }
+        }
+        _ => {}
     }
     adapted
 }
@@ -1592,7 +1613,8 @@ unsafe fn adapt_unguarded(who: &dyn Display, ptr: *const c_void, len: Option<usi
             None => unsafe { CStr::from_ptr(ptr.cast()) }.to_bytes(),
         };
         // Text given with a length is not zero-terminated; neither is its replacement.
-        return finish(who, "PTX text", policy.adapt_ptx(text), None, len.is_none(), None);
+        let result = adapted(who, text, || policy.adapt_ptx(text));
+        return finish(who, "PTX text", result, None, len.is_none(), None);
     }
     if magic == fatbin::WRAPPER_MAGIC {
         if len.is_some_and(|len| len < std::mem::size_of::<Wrapper>()) {
