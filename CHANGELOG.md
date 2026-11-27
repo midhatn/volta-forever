@@ -11,6 +11,11 @@
 
 - Under `VF_ALIGNED_ROWS=0`, a forward low-zero-bits dataflow pass over the PTX control-flow graph elides the per-load runtime 16-byte alignment check on `ldmatrix` instructions whose addresses are statically proven 16-byte aligned across all paths from function entry (`docs/emulations.md`).
 
+### Changed
+
+- The proxy cache now stores LZ4-compressed retargeted PTX/fatbin images (`.p`) so subsequent starts skip re-adapting cached modules and libraries materialized on fallback, validates bounded decompressed lengths, keys restored lazy libraries by each load's own policy, and tracks directory size incrementally instead of rescanning on every cache write.
+- Driver hook call counters (`COUNTS`) are incremented only when statistics are asked for (`VF_STATS`).
+
 ### Tests
 
 - The unit tests of `vf-proxy` open no driver unless `VF_REAL_LIBCUDA` names one (they opened the machine's `libcuda.so.1`), and the report of a fault asks the driver for the library and the name of a kernel only once `cuCtxGetCurrent` succeeds: on the contributor's machine, with driver 580.196.07, a unit test ended with SIGSEGV in `cuKernelGetLibrary`, given a handle of its own before `cuInit`; `fault.rs` has a test of the guard (pull request #14, by midhatn). A program whose kernel faulted has initialized the driver: what the report says of it is the same.
