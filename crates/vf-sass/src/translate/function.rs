@@ -39,6 +39,7 @@ pub(super) fn translate_function(
     q: Option<&crate::pairing::Plan>,
     rows_at: HashMap<u32, u32>,
     kept_rows: HashMap<&'static str, u32>,
+    comp_at: HashMap<u32, u32>,
     aligned_rows: bool,
     has_product_non_pair: bool,
     hold_at: &HashMap<u32, u32>,
@@ -72,6 +73,7 @@ pub(super) fn translate_function(
         q,
         rows_at,
         kept_rows,
+        comp_at,
         rows_n,
         aligned_rows,
         hold_at,
@@ -340,6 +342,7 @@ pub(super) fn translate_function(
             around.push(ctx.given_back(k, p, i)?);
         }
         // The accumulators of pairs brought to the state the instruction, or what follows it, takes them in.
+        // Then the companions of address registers, made where the plan has them.
         if let Some(plan) = ctx.q {
             let before = ctx.converted(i, &plan.before)?;
             let after = ctx.converted(i, &plan.after)?;
@@ -347,6 +350,12 @@ pub(super) fn translate_function(
                 around.splice(0..0, before);
             }
             around.extend(after);
+            let comp_before = ctx.accompanied(i, &plan.made_before)?;
+            let comp_after = ctx.accompanied(i, &plan.made_after)?;
+            if !comp_before.is_empty() {
+                around.splice(0..0, comp_before);
+            }
+            around.extend(comp_after);
         }
         // The lane read is the first item of instruction 0: offset 0 stays where it was (a return
         // within the section counts from there), and a branch to offset 0 reads the lane again.

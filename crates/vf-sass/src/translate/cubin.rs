@@ -33,6 +33,18 @@ pub fn translate_with_options(data: &[u8], want_map: bool, opts: &Options) -> Re
     translate_with_threads(data, want_map, opts, None)
 }
 
+/// Translate an sm_75 or supported sm_80 cubin with explicit options and companion-hoisting switch.
+pub fn translate_with_companions(
+    data: &[u8],
+    want_map: bool,
+    opts: &Options,
+    companions: bool,
+) -> Result<TranslateResult, String> {
+    let mut opts = opts.clone();
+    opts.companions = companions;
+    translate_with_threads(data, want_map, &opts, None)
+}
+
 pub(super) fn translate_with_threads(
     data: &[u8],
     want_map: bool,
@@ -375,6 +387,7 @@ pub(super) fn translate_with_threads(
             }
 
             let predicates: Result<Vec<Predicates>, Refused> = fs.iter().map(|f| stand_ins(f)).collect();
+            let dec70_cell = std::cell::RefCell::new(&mut *dec70);
             let attempt_result = predicates.and_then(|predicates| {
                 let saves = predicates.iter().map(|p| p.save_slots).max().unwrap_or(0);
                 // Lazily compute Flow once per function (shared between pairing and Borrowed).
@@ -393,16 +406,29 @@ pub(super) fn translate_with_threads(
                     })
                 };
 
-                let paired = std::cell::LazyCell::new(|| {
+                let paired_comp = std::cell::LazyCell::new(|| {
+                    let mut pdec70 = dec70_cell.borrow_mut();
                     fs.iter()
                         .enumerate()
                         .map(|(k, f)| {
                             if opts.pairs && f.needs_lane && !f.entered_inside {
-                                crate::pairing::plan_with_flow(&f.src, flow_of(k))
+                                crate::pairing::plan_with_flow_options(
+                                    &f.src,
+                                    flow_of(k),
+                                    opts.companions,
+                                    opts.companions,
+                                    Some(&mut *pdec70),
+                                )
                             } else {
                                 None
                             }
                         })
+                        .collect::<Vec<_>>()
+                });
+                let paired_nocomp = std::cell::LazyCell::new(|| {
+                    paired_comp
+                        .iter()
+                        .map(|p| p.as_ref().map(crate::pairing::Plan::without_companions))
                         .collect::<Vec<_>>()
                 });
                 let unpaired: Vec<Option<crate::pairing::Plan>> = fs.iter().map(|_| None).collect();
@@ -418,11 +444,18 @@ pub(super) fn translate_with_threads(
                 };
 
                 let mut attempt = |do_pairs: bool,
+                                   with_companions: bool,
                                    borrow_level: u32,
                                    top_override: Option<u32>,
                                    gave_up: &[String]|
                  -> Result<Vec<(usize, TransResult)>, Refused> {
-                    let plans = if do_pairs { &*paired } else { &unpaired };
+                    let plans = if !do_pairs {
+                        &unpaired
+                    } else if with_companions {
+                        &*paired_comp
+                    } else {
+                        &*paired_nocomp
+                    };
                     let has_product_flags: Vec<bool> = fs
                         .iter()
                         .zip(plans.iter())
@@ -519,13 +552,14 @@ pub(super) fn translate_with_threads(
                             false,
                             None,
                             &[],
+                            None,
                             &[],
                         )?;
                         let slot = gslots[0];
                         let si = indices[0];
                         let place_map: HashMap<u32, u32> = b.homes.clone();
                         match translate_function(
-                            dec70,
+                            &mut dec70_cell.borrow_mut(),
                             fs[0],
                             &predicates[0],
                             &place_map,
@@ -537,6 +571,7 @@ pub(super) fn translate_with_threads(
                             None,
                             placed.7,
                             None,
+                            HashMap::new(),
                             HashMap::new(),
                             HashMap::new(),
                             opts.aligned_rows,
@@ -588,6 +623,13 @@ pub(super) fn translate_with_threads(
                         all.dedup();
                         all.into_iter().filter(|u| !homed_set.contains(u)).collect()
                     };
+                    let mut beside: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+                    for plan in plans.iter().flatten() {
+                        for (root, count) in plan.companion_registers() {
+                            let entry = beside.entry(root).or_insert(0);
+                            *entry = (*entry).max(count);
+                        }
+                    }
                     let placed = placement(
                         fs.iter().map(|f| f.highest).max().unwrap() + 1,
                         &uniform_for_placement,
@@ -599,6 +641,7 @@ pub(super) fn translate_with_threads(
                         fs.iter().zip(has_product_flags.iter()).any(|(_, &hp)| hp),
                         if rows.is_empty() { None } else { Some(&rows) },
                         &row_kept,
+                        if beside.is_empty() { None } else { Some(&beside) },
                         &held_preds,
                     )?;
                     let (
@@ -612,6 +655,7 @@ pub(super) fn translate_with_threads(
                         free,
                         rows_at_base,
                         kept_rows_base,
+                        comp_at,
                         hold_at,
                     ) = placed;
                     for (&u, &r) in &homes {
@@ -630,7 +674,7 @@ pub(super) fn translate_with_threads(
                             }
                         }
                         let tr = translate_function(
-                            dec70,
+                            &mut dec70_cell.borrow_mut(),
                             fs[k],
                             predicates,
                             &place,
@@ -644,6 +688,7 @@ pub(super) fn translate_with_threads(
                             plan.as_ref(),
                             func_rows_at,
                             kept_rows_base.clone(),
+                            comp_at.clone(),
                             opts.aligned_rows,
                             has_product_flags[k],
                             &hold_at,
@@ -680,33 +725,58 @@ pub(super) fn translate_with_threads(
                 };
 
                 let alone = fs.len() == 1 && indices.iter().any(|si| entry_secs.contains(si));
-                let has_pairs_to_drop = || paired.iter().any(Option::is_some);
+                let has_pairs_to_drop = || paired_comp.iter().any(Option::is_some);
+                let has_companions_to_drop = || {
+                    opts.companions
+                        && paired_comp
+                            .iter()
+                            .any(|p| p.as_ref().is_some_and(|q| !q.roots.is_empty()))
+                };
                 type Tried = Result<Vec<(usize, TransResult)>, Refused>;
-                type AttemptFn<'a> = dyn FnMut(bool, u32, Option<u32>, &[String]) -> Tried + 'a;
+                type AttemptFn<'a> = dyn FnMut(bool, bool, u32, Option<u32>, &[String]) -> Tried + 'a;
                 let empty_gave_up: Vec<String> = Vec::new();
-                let usual = |attempt: &mut AttemptFn<'_>| {
-                    let r = if opts.borrow > 0 && alone {
-                        attempt(true, 2, None, &[])
-                            .or_else(|_| attempt(true, 1, None, &[]))
-                            .or_else(|_| attempt(true, 0, None, &[]))
-                    } else {
-                        attempt(true, 0, None, &[])
-                    };
-                    r.or_else(|refused| {
-                        if has_pairs_to_drop() {
-                            attempt(false, 0, None, &[])
+                // Try pairs at `level` with companions first, then without companions if any
+                // companions were planned (so companion registers never cost a kernel its pairs).
+                let paired_at = |attempt: &mut AttemptFn<'_>, level: u32, gave_up: &[String]| {
+                    attempt(true, true, level, None, gave_up).or_else(|refused| {
+                        if has_companions_to_drop() {
+                            attempt(true, false, level, None, gave_up)
                         } else {
                             Err(refused)
                         }
                     })
                 };
-                let plain = |attempt: &mut AttemptFn<'_>, gave_up: &[String]| {
-                    attempt(true, 0, None, gave_up).or_else(|refused| {
-                        if has_pairs_to_drop() {
-                            attempt(false, 0, None, gave_up)
-                        } else {
-                            Err(refused)
+                let usual = |attempt: &mut AttemptFn<'_>| {
+                    let r = if opts.borrow > 0 && alone {
+                        paired_at(attempt, 2, &[])
+                            .or_else(|_| paired_at(attempt, 1, &[]))
+                            .or_else(|_| attempt(true, true, 0, None, &[]))
+                    } else {
+                        attempt(true, true, 0, None, &[])
+                    };
+                    r.or_else(|refused| {
+                        if !has_pairs_to_drop() {
+                            return Err(refused);
                         }
+                        if has_companions_to_drop()
+                            && let Ok(res) = attempt(true, false, 0, None, &[])
+                        {
+                            return Ok(res);
+                        }
+                        attempt(false, false, 0, None, &[])
+                    })
+                };
+                let plain = |attempt: &mut AttemptFn<'_>, gave_up: &[String]| {
+                    attempt(true, true, 0, None, gave_up).or_else(|refused| {
+                        if !has_pairs_to_drop() {
+                            return Err(refused);
+                        }
+                        if has_companions_to_drop()
+                            && let Ok(res) = attempt(true, false, 0, None, gave_up)
+                        {
+                            return Ok(res);
+                        }
+                        attempt(false, false, 0, None, gave_up)
                     })
                 };
 
@@ -715,7 +785,7 @@ pub(super) fn translate_with_threads(
                         let f = &fs[0];
                         let extra: u32 = if f.product_count > 0 { 16 } else { 0 };
                         let top_for_8 = if extra > 0 { Some(f.highest + extra) } else { None };
-                        match attempt(false, 3, top_for_8, &empty_gave_up) {
+                        match attempt(false, false, 3, top_for_8, &empty_gave_up) {
                             Ok(d) => Ok(d),
                             Err(ref err) => {
                                 logs.borrow_mut().push(format!("level 3 failed for {}: {}", fs[0].name, err.0));
@@ -731,8 +801,17 @@ pub(super) fn translate_with_threads(
                                 gave_up.push(original_why.0.clone());
                                 let original_msg = original_why.0.clone();
                                 let mut done = None;
-                                for (do_p, bl) in [(true, 1u32), (true, 2), (false, 3)] {
-                                    match attempt(do_p, bl, None, &gave_up) {
+                                for (do_p, do_c, bl) in [
+                                    (true, true, 1u32),
+                                    (true, false, 1),
+                                    (true, true, 2),
+                                    (true, false, 2),
+                                    (false, false, 3),
+                                ] {
+                                    if do_p && !do_c && !has_companions_to_drop() {
+                                        continue;
+                                    }
+                                    match attempt(do_p, do_c, bl, None, &gave_up) {
                                         Ok(d) => {
                                             done = Some(d);
                                             break;
@@ -765,8 +844,18 @@ pub(super) fn translate_with_threads(
                             let limit = super::block_registers::budget(f.registers, info);
                             if normal[0].1.count > limit && !relocations.contains_key(&indices[0]) && f.tables.is_empty() {
                                 let top = limit.saturating_sub(3).saturating_sub(saves);
-                                for (pairs, level, bound) in [(true, 1, None), (true, 2, None), (false, 3, Some(top))] {
-                                    if let Ok(candidate) = attempt(pairs, level, bound, &gave_up)
+                                for (pairs, do_c, level, bound) in [
+                                    (true, false, 0, None),
+                                    (true, true, 1, None),
+                                    (true, false, 1, None),
+                                    (true, true, 2, None),
+                                    (true, false, 2, None),
+                                    (false, false, 3, Some(top)),
+                                ] {
+                                    if pairs && !do_c && !has_companions_to_drop() {
+                                        continue;
+                                    }
+                                    if let Ok(candidate) = attempt(pairs, do_c, level, bound, &gave_up)
                                         && candidate[0].1.count <= limit
                                     {
                                         let old = &normal[0].1.new_of;
@@ -788,31 +877,39 @@ pub(super) fn translate_with_threads(
                             Err(original_why) if original_why.0 == "more registers than there are" => {
                                 gave_up.push(original_why.0.clone());
                                 let original_msg = original_why.0.clone();
-                                match attempt(true, 1, None, &gave_up) {
-                                    Ok(d) => Ok(d),
-                                    Err(e1) => {
-                                        gave_up.push(e1.0);
-                                        match attempt(true, 2, None, &gave_up) {
-                                            Ok(d) => Ok(d),
-                                            Err(e2) => {
-                                                gave_up.push(e2.0);
-                                                match attempt(false, 3, None, &gave_up) {
-                                                    Ok(d) => Ok(d),
-                                                    Err(e3) => {
-                                                        gave_up.push(e3.0);
-                                                        if say_borrows {
-                                                            logs.borrow_mut().push(format!(
-                                                                "  refused\t{}\t{}\tand with borrowed registers: {}",
-                                                                fs[0].name,
-                                                                original_msg,
-                                                                gave_up[1..].join("; ")
-                                                            ));
-                                                        }
-                                                        Err(Refused(original_msg))
-                                                    }
-                                                }
-                                            }
+                                let mut done = None;
+                                for (do_p, do_c, bl) in [
+                                    (true, true, 1u32),
+                                    (true, false, 1),
+                                    (true, true, 2),
+                                    (true, false, 2),
+                                    (false, false, 3),
+                                ] {
+                                    if do_p && !do_c && !has_companions_to_drop() {
+                                        continue;
+                                    }
+                                    match attempt(do_p, do_c, bl, None, &gave_up) {
+                                        Ok(d) => {
+                                            done = Some(d);
+                                            break;
                                         }
+                                        Err(err) => {
+                                            gave_up.push(err.0);
+                                        }
+                                    }
+                                }
+                                match done {
+                                    Some(d) => Ok(d),
+                                    None => {
+                                        if say_borrows {
+                                            logs.borrow_mut().push(format!(
+                                                "  refused\t{}\t{}\tand with borrowed registers: {}",
+                                                fs[0].name,
+                                                original_msg,
+                                                gave_up[1..].join("; ")
+                                            ));
+                                        }
+                                        Err(Refused(original_msg))
                                     }
                                 }
                             }
@@ -825,98 +922,50 @@ pub(super) fn translate_with_threads(
                         struct Best {
                             count: u32,
                             level: u32,
+                            with_comp: bool,
                             result: Vec<(usize, TransResult)>,
                             within: bool,
                         }
                         let mut best: Option<Best> = None;
                         let mut first_why: Option<Refused> = None;
                         let mut gave_up: Vec<String> = Vec::new();
-                        match plain(&mut attempt, &gave_up) {
-                            Ok(d) => {
-                                let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
-                                best = Some(Best {
-                                    count,
-                                    level: 0,
-                                    result: d,
-                                    within: count <= budget,
-                                });
+                        for (level, with_comp) in [
+                            (0u32, true),
+                            (0, false),
+                            (1, true),
+                            (1, false),
+                            (2, true),
+                            (2, false),
+                            (3, false),
+                        ] {
+                            if level < 3 && !with_comp && !has_companions_to_drop() {
+                                continue;
                             }
-                            Err(refused) => {
-                                gave_up.push(refused.0.clone());
-                                first_why = Some(refused);
-                            }
-                        }
-                        if !best.as_ref().is_some_and(|b| b.within) {
-                            match attempt(true, 1, None, &gave_up) {
+                            let tried = match (level, with_comp) {
+                                (0, true) => plain(&mut attempt, &gave_up),
+                                (0, false) => attempt(true, false, 0, None, &gave_up),
+                                (1, c) => attempt(true, c, 1, None, &gave_up),
+                                (2, c) => attempt(true, c, 2, None, &gave_up),
+                                (3, _) => attempt(false, false, 3, top_for_l3, &gave_up),
+                                _ => unreachable!(),
+                            };
+                            match tried {
                                 Ok(d) => {
                                     let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
                                     if count <= budget {
                                         best = Some(Best {
                                             count,
-                                            level: 1,
+                                            level,
+                                            with_comp,
                                             result: d,
                                             within: true,
                                         });
+                                        break;
                                     } else if best.is_none() || count < best.as_ref().unwrap().count {
                                         best = Some(Best {
                                             count,
-                                            level: 1,
-                                            result: d,
-                                            within: false,
-                                        });
-                                    }
-                                }
-                                Err(refused) => {
-                                    gave_up.push(refused.0.clone());
-                                    if first_why.is_none() {
-                                        first_why = Some(refused);
-                                    }
-                                }
-                            }
-                        }
-                        if !best.as_ref().is_some_and(|b| b.within) {
-                            match attempt(true, 2, None, &gave_up) {
-                                Ok(d) => {
-                                    let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
-                                    if count <= budget {
-                                        best = Some(Best {
-                                            count,
-                                            level: 2,
-                                            result: d,
-                                            within: true,
-                                        });
-                                    } else if best.is_none() || count < best.as_ref().unwrap().count {
-                                        best = Some(Best {
-                                            count,
-                                            level: 2,
-                                            result: d,
-                                            within: false,
-                                        });
-                                    }
-                                }
-                                Err(refused) => {
-                                    gave_up.push(refused.0.clone());
-                                    if first_why.is_none() {
-                                        first_why = Some(refused);
-                                    }
-                                }
-                            }
-                        }
-                        if !best.as_ref().is_some_and(|b| b.within) {
-                            match attempt(false, 3, top_for_l3, &gave_up) {
-                                Ok(d) => {
-                                    let count = d.iter().map(|(_, tr)| tr.count).max().unwrap_or(0);
-                                    if count <= budget {
-                                        best = Some(Best {
-                                            count,
-                                            level: 3,
-                                            result: d,
-                                            within: true,
-                                        });
-                                    } else if best.is_none() || count < best.as_ref().unwrap().count {
-                                        best = Some(Best {
-                                            count,
-                                            level: 3,
+                                            level,
+                                            with_comp,
                                             result: d,
                                             within: false,
                                         });
@@ -934,11 +983,12 @@ pub(super) fn translate_with_threads(
                             None => Err(first_why.unwrap()),
                             Some(mut b) => {
                                 if !b.within && say_borrows {
-                                    b.result = match b.level {
-                                        0 => plain(&mut attempt, &gave_up)?,
-                                        1 => attempt(true, 1, None, &gave_up)?,
-                                        2 => attempt(true, 2, None, &gave_up)?,
-                                        3 => attempt(false, 3, top_for_l3, &gave_up)?,
+                                    b.result = match (b.level, b.with_comp) {
+                                        (0, true) => plain(&mut attempt, &gave_up)?,
+                                        (0, false) => attempt(true, false, 0, None, &gave_up)?,
+                                        (1, c) => attempt(true, c, 1, None, &gave_up)?,
+                                        (2, c) => attempt(true, c, 2, None, &gave_up)?,
+                                        (3, _) => attempt(false, false, 3, top_for_l3, &gave_up)?,
                                         _ => unreachable!(),
                                     };
                                 }
@@ -957,7 +1007,7 @@ pub(super) fn translate_with_threads(
                             }
                         }
                     } else if opts.borrow >= 3 && alone {
-                        match attempt(false, 3, None, &empty_gave_up) {
+                        match attempt(false, false, 3, None, &empty_gave_up) {
                             Ok(d) => Ok(d),
                             Err(ref err) => {
                                 logs.borrow_mut().push(format!("level 3 failed for {}: {}", fs[0].name, err.0));
@@ -967,7 +1017,7 @@ pub(super) fn translate_with_threads(
                     } else if opts.borrow >= 2 && alone {
                         match usual(&mut attempt) {
                             Ok(d) => Ok(d),
-                            Err(original_why) => match attempt(false, 3, None, &empty_gave_up) {
+                            Err(original_why) => match attempt(false, false, 3, None, &empty_gave_up) {
                                 Ok(d) => Ok(d),
                                 Err(also) => {
                                     if say_borrows {
@@ -993,10 +1043,25 @@ pub(super) fn translate_with_threads(
                 if count(&chosen) <= limit {
                     return Ok(chosen);
                 }
+                if has_companions_to_drop()
+                    && let Ok(candidate) = attempt(true, false, 0, None, &empty_gave_up)
+                    && count(&candidate) <= limit
+                {
+                    return Ok(candidate);
+                }
                 if opts.borrow > 0 && alone {
                     let top = limit.saturating_sub(3).saturating_sub(saves);
-                    for (pairs, level, bound) in [(true, 1, None), (true, 2, None), (false, 3, Some(top))] {
-                        if let Ok(candidate) = attempt(pairs, level, bound, &empty_gave_up)
+                    for (pairs, do_c, level, bound) in [
+                        (true, true, 1, None),
+                        (true, false, 1, None),
+                        (true, true, 2, None),
+                        (true, false, 2, None),
+                        (false, false, 3, Some(top)),
+                    ] {
+                        if pairs && !do_c && !has_companions_to_drop() {
+                            continue;
+                        }
+                        if let Ok(candidate) = attempt(pairs, do_c, level, bound, &empty_gave_up)
                             && count(&candidate) <= limit
                         {
                             return Ok(candidate);

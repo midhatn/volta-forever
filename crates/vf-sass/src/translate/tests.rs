@@ -44,8 +44,21 @@ fn a_batch_does_not_become_marks_of_reuse() {
 #[test]
 fn a_product_has_seventeen_registers() {
     for base in [10u32, 11] {
-        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _) =
-            placement(base, &[], &[], false, 0, true, MATRIX_SCRATCH, true, None, &[], &[]).unwrap();
+        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _, _) = placement(
+            base,
+            &[],
+            &[],
+            false,
+            0,
+            true,
+            MATRIX_SCRATCH,
+            true,
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .unwrap();
         let (lane, kept, gathered, scratch) = (lane.unwrap(), kept.unwrap(), gathered.unwrap(), scratch.unwrap());
         assert_eq!(free - base, 1 + KEPT + GATHERED + MATRIX_SCRATCH);
         assert!(gathered % 2 == 0 && scratch % 2 == 0);
@@ -242,8 +255,21 @@ fn the_schedule_goes_on_through_a_label() {
 #[test]
 fn loads_alone_keep_nothing() {
     for base in [10u32, 11] {
-        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _) =
-            placement(base, &[], &[], false, 0, true, MATRIX_SCRATCH, false, None, &[], &[]).unwrap();
+        let (_, _, _, lane, kept, gathered, scratch, free, _, _, _, _) = placement(
+            base,
+            &[],
+            &[],
+            false,
+            0,
+            true,
+            MATRIX_SCRATCH,
+            false,
+            None,
+            &[],
+            None,
+            &[],
+        )
+        .unwrap();
         assert_eq!(free - base, 1 + MATRIX_SCRATCH);
         assert!(lane.is_some() && kept.is_none() && gathered.is_none() && scratch.unwrap() % 2 == 0);
     }
@@ -1873,5 +1899,271 @@ fn unmodified_triton_dot_reads_lane_at_level_3() {
             lane_pcs.contains(&pc),
             "nothing reads the lane for matrix instruction at 0x{pc:x}"
         );
+    }
+}
+/// Companions and per-group HMMA scheduling are opt-in (`VF_COMPANIONS=1`, default off).
+/// By default, paired HMMA keeps the SEQUENCE scoreboard, stall 2 without NO_YIELD, no `.reuse`,
+/// and no companion registers; with `companions: true`, paired HMMA uses disjoint scoreboards in
+/// 0..4, `usched=18` with `.reuse` on STEP0..2, and hoists loop-invariant load addresses.
+#[test]
+fn companions_are_opt_in_and_default_keeps_sequence_scoreboard() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let default_opts = Options::default();
+    assert!(!default_opts.companions);
+    let comp_opts = Options {
+        companions: true,
+        ..default_opts
+    };
+
+    let default_res = translate_with_options(original, true, &default_opts).unwrap();
+    let no_comp_res = translate_with_companions(original, true, &default_opts, false).unwrap();
+    let comp_res = translate_with_options(original, true, &comp_opts).unwrap();
+    let with_comp_res = translate_with_companions(original, true, &default_opts, true).unwrap();
+    assert_eq!(default_res.bytes, no_comp_res.bytes);
+    assert_eq!(comp_res.bytes, with_comp_res.bytes);
+    assert_ne!(default_res.bytes, comp_res.bytes);
+
+    let added = |res: &TranslateResult| {
+        let r = res.report.iter().find(|f| f.name == "p_basic").unwrap();
+        r.after - r.before
+    };
+    assert_eq!(added(&default_res), 91);
+    assert_eq!(added(&comp_res), 93);
+
+    // Default: 0 companions, SEQUENCE scoreboard, usched=2 (no NO_YIELD), no .reuse.
+    let count_comp = |res: &TranslateResult| {
+        res.map
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, _, what)| what == "companion")
+            .count()
+    };
+    assert_eq!(count_comp(&default_res), 0);
+    assert!(count_comp(&comp_res) > 0);
+
+    let check_halves = |res: &TranslateResult, expect_optin: bool| {
+        let elf = crate::elf::Elf::parse(&res.bytes).unwrap();
+        let code = &elf.sections[elf.section(".text.p_basic").unwrap()].data;
+        let map = res.map.as_ref().unwrap();
+        let half_offsets: Vec<usize> = map
+            .iter()
+            .filter(|(name, _, _, what)| name == "p_basic" && what == "half of a pair")
+            .map(|(_, new, _, _)| *new as usize)
+            .collect();
+        assert!(!half_offsets.is_empty());
+        assert_eq!(half_offsets.len() % 4, 0);
+        let word_at = |off: usize| u128::from_le_bytes(code[off..off + 16].try_into().unwrap());
+        let mut boards = HashSet::new();
+        for steps in half_offsets.as_chunks::<4>().0 {
+            let w0 = word_at(steps[0]);
+            let w3 = word_at(steps[3]);
+            let sb = ((w3 >> WRITE_BARRIER) & 7) as u32;
+            let wait0 = ((w0 >> WAIT) & 63) as u32;
+            boards.insert(sb);
+            if expect_optin {
+                for &off in &steps[..3] {
+                    let w = word_at(off);
+                    assert_eq!((w >> USCHED) & 31, 18, "STEP0..2 must set NO_YIELD + stall 2");
+                    assert_ne!(w & REUSE, 0, "STEP0..2 must mark Ra/Rb .reuse");
+                }
+                assert_eq!(w3 & REUSE, 0, "STEP3 must not mark .reuse");
+                assert!(sb < 4, "disjoint accumulator scoreboard expected in 0..4, got {sb}");
+                assert_ne!(wait0 & (1 << sb), 0, "STEP0 must wait on its own pair scoreboard {sb}");
+            } else {
+                for &off in &steps[..3] {
+                    let w = word_at(off);
+                    assert_eq!((w >> USCHED) & 31, 2, "default STEP0..2 must keep stall 2");
+                    assert_eq!(w & REUSE, 0, "default STEP0..2 must not mark .reuse");
+                }
+                assert_eq!(sb, SEQUENCE, "default STEP3 must write SEQUENCE");
+                assert_ne!(wait0 & (1 << SEQUENCE), 0, "default STEP0 must wait on SEQUENCE");
+            }
+        }
+        if expect_optin {
+            assert!(boards.len() > 1, "expected > 1 disjoint scoreboard, got {boards:?}");
+        }
+    };
+    check_halves(&default_res, false);
+    check_halves(&comp_res, true);
+}
+
+/// With `VF_PAIRS=0` (and therefore `VF_SAFE=1`), `VF_COMPANIONS=1` must change nothing,
+/// including `usched` and `.reuse` on standalone `HMMA.884` steps.
+#[test]
+fn companions_with_pairs_off_changes_nothing_including_standalone_hmma() {
+    for cubin in [
+        include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin").as_slice(),
+        include_bytes!("../../../../tests/kernels/k_tensor.135.sm75.cubin").as_slice(),
+    ] {
+        let unpaired = Options {
+            pairs: false,
+            companions: false,
+            ..Options::default()
+        };
+        let unpaired_comp = Options {
+            pairs: false,
+            companions: true,
+            ..Options::default()
+        };
+        let a = translate_with_options(cubin, true, &unpaired).unwrap();
+        let b = translate_with_options(cubin, true, &unpaired_comp).unwrap();
+        assert_eq!(a.bytes, b.bytes);
+        assert_eq!(a.map, b.map);
+        assert_eq!(a.lives, b.lives);
+    }
+    // Verify standalone HMMA.884 steps in k_tensor keep usched == 2 and REUSE == 0 even with companions: true.
+    let tensor = include_bytes!("../../../../tests/kernels/k_tensor.135.sm75.cubin");
+    let opts = Options {
+        companions: true,
+        ..Options::default()
+    };
+    let res = translate_with_options(tensor, true, &opts).unwrap();
+    let elf = crate::elf::Elf::parse(&res.bytes).unwrap();
+    let code = &elf.sections[elf.section(".text.t_mma_f32").unwrap()].data;
+    let mut dec70 = Decoder::new(70);
+    let mut hmma_steps = 0;
+    for chunk in code.as_chunks::<16>().0 {
+        let w = u128::from_le_bytes(*chunk);
+        let d = dec70.decode(w).unwrap();
+        if d.mnemonic == "HMMA" {
+            assert_eq!(w & REUSE, 0, "standalone HMMA must not set REUSE");
+            assert_eq!((w >> USCHED) & 16, 0, "standalone HMMA must not set NO_YIELD");
+            hmma_steps += 1;
+        }
+    }
+    assert_eq!(hmma_steps, 8);
+}
+
+/// When a paired kernel with companions does not fit at level 0 and at level 1 or 2 fits
+/// without companions but not with them, the fallback drops companions at that level instead
+/// of falling straight to level 3 and losing pairs (or being refused at VF_BORROW=6).
+#[test]
+fn level_1_and_2_drop_companions_before_losing_pairs() {
+    let original = include_bytes!("../../../../tests/kernels/k_pairs.135.sm75.cubin");
+    let name = "p_call";
+    let mut dec75 = Decoder::new(75);
+    let mut dec70 = Decoder::new(70);
+    let elf_orig = crate::elf::Elf::parse(original).unwrap();
+    let sec_orig = &elf_orig.sections[elf_orig.section(&format!(".text.{name}")).unwrap()];
+    let fd = parse_function(&mut dec75, name, &sec_orig.data, 255, vec![]).unwrap();
+    let ent = entries(&fd);
+    let plan_comp = crate::pairing::plan_with_companions(&fd.src, &fd.tables, &ent, true, &mut dec70).unwrap();
+    let comp_regs: u32 = plan_comp.companion_registers().values().sum();
+    assert!(comp_regs > 0, "p_call must have companion registers");
+    let nops: Vec<usize> = fd
+        .src
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| (d.name == "nop_").then_some(i))
+        .collect();
+    assert!(nops.len() >= 7, "p_call needs 7 NOPs for 6 ULDC.64 + 1 MOV");
+
+    // ULDC.64 UR4, c[0x0][0x170] (from k_uniform.sm75.cubin): each writes an even UR pair that
+    // can be homed at level 1, pushing level 0 (even unpaired) past 253 registers while level 1
+    // and level 2 fit once companions are dropped.
+    let uldc64_base: u128 = 0x000fe40000000a00_00005c0000047ab9;
+    let build_with_high = |high: u32| -> Vec<u8> {
+        let mut input = crate::elf::Elf::parse(original).unwrap();
+        let sidx = input.section(&format!(".text.{name}")).unwrap();
+        for (k, &nop_i) in nops[..6].iter().enumerate() {
+            let ur = (4 + 2 * k) as u128;
+            let w = (uldc64_base & !(0x3fu128 << 16)) | (ur << 16);
+            input.sections[sidx].data[16 * nop_i..16 * (nop_i + 1)].copy_from_slice(&w.to_le_bytes());
+        }
+        let mov = assemble::assemble_int("mov__RCR_RC", &[("Rd", high)]).unwrap();
+        let last_nop = nops[6];
+        input.sections[sidx].data[16 * last_nop..16 * (last_nop + 1)].copy_from_slice(&mov.to_le_bytes());
+        let info = input.sections[sidx].info;
+        input.sections[sidx].info = (255 << 24) | (info & 0x00ff_ffff);
+        input.write()
+    };
+
+    // Find a high register where level 0 fails (even without companions/pairs), level 1 without
+    // companions fits <= 255 declared registers, and adding comp_regs pushes level 1 over 255;
+    // then high + 2 exercises the same fallback at level 2 (borrowing the 2-register pool).
+    let mut found_l1 = None;
+    let mut found_l2 = None;
+    for high in (200u32..=245).rev() {
+        let bytes = build_with_high(high);
+        let l0 = translate_with_options(
+            &bytes,
+            false,
+            &Options {
+                borrow: 0,
+                companions: false,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        if l0.report.iter().find(|f| f.name == name).unwrap().refused.is_none() {
+            continue;
+        }
+        let b6_nocomp = translate_with_options(
+            &bytes,
+            true,
+            &Options {
+                borrow: 6,
+                companions: false,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let rep = b6_nocomp.report.iter().find(|f| f.name == name).unwrap();
+        if rep.refused.is_some() || !rep.paired {
+            continue;
+        }
+        let uses_pool_borrow = b6_nocomp
+            .lives
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|(f, _, _, kind, _)| f == name && *kind == "pool");
+        let out_elf = crate::elf::Elf::parse(&b6_nocomp.bytes).unwrap();
+        let regs = out_elf.sections[out_elf.section(&format!(".text.{name}")).unwrap()].info >> 24;
+        if regs + comp_regs > 255 {
+            if uses_pool_borrow && found_l2.is_none() {
+                found_l2 = Some((high, bytes));
+            } else if !uses_pool_borrow && found_l1.is_none() {
+                found_l1 = Some((high, bytes));
+            }
+        }
+        if found_l1.is_some() && found_l2.is_some() {
+            break;
+        }
+    }
+    let (l1_high, l1_bytes) = found_l1.expect("expected level-1 companion-drop threshold");
+    let (l2_high, l2_bytes) = found_l2.expect("expected level-2 companion-drop threshold");
+
+    for (label, high, bytes) in [("level 1", l1_high, &l1_bytes), ("level 2", l2_high, &l2_bytes)] {
+        for borrow in [6u32, 7] {
+            let res = translate_with_options(
+                bytes,
+                true,
+                &Options {
+                    borrow,
+                    companions: true,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            let rep = res.report.iter().find(|f| f.name == name).unwrap();
+            assert_eq!(
+                rep.refused, None,
+                "{label} (R{high}) at VF_BORROW={borrow}: refused instead of dropping companions"
+            );
+            assert!(
+                rep.paired,
+                "{label} (R{high}) at VF_BORROW={borrow}: lost pairs instead of dropping companions"
+            );
+            let comp_items = res
+                .map
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|(f, _, _, what)| f == name && what == "companion")
+                .count();
+            assert_eq!(comp_items, 0, "{label} should have dropped companions");
+        }
     }
 }

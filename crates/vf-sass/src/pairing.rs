@@ -6,12 +6,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::decode::{Decoded, LETTER_P, LETTER_R};
+use crate::decode::{Decoded, Decoder, LETTER_P, LETTER_R};
 use crate::fast::{
     FastSet, RegSet, regset_intersects, regset_is_empty, regset_set, regset_sub, regset_test, regset_union,
 };
 use crate::field;
 use crate::generated::fields::*;
+use crate::generated::special::{READ_BARRIER, WRITE_BARRIER};
 
 const LOADS: &[&str] = &["ldsm__sImmOffset", "ldsm__URsIR"];
 const PRODUCT: &str = "hmma_x8_";
@@ -50,12 +51,25 @@ pub struct LoadEntry {
     pub also: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LoadRole {
     A,
     B,
     BT,
 }
+
+impl LoadRole {
+    /// How many rows a load of this role takes (one companion for each).
+    pub fn rows(self) -> u32 {
+        match self {
+            Self::A | Self::B => 2,
+            Self::BT => 4,
+        }
+    }
+}
+
+const ROLES: [LoadRole; 3] = [LoadRole::A, LoadRole::B, LoadRole::BT];
+const MIRRORED: &[&str] = &["LOP3", "IMAD", "LEA", "IADD3", "SHF", "MOV"];
 
 /// A product-of-a-pair entry in the plan.
 #[derive(Debug, Clone)]
@@ -79,13 +93,19 @@ pub struct SiteEntry {
 pub type Conversion = (u32, State);
 
 /// The plan for a function.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Plan {
     pub loads: BTreeMap<usize, LoadEntry>,
     pub sites: BTreeMap<usize, SiteEntry>,
     pub share: BTreeMap<u32, u32>,
     pub before: BTreeMap<usize, Vec<Conversion>>,
     pub after: BTreeMap<usize, Vec<Conversion>>,
+    pub roots: BTreeMap<u32, Vec<LoadRole>>,
+    pub through: BTreeMap<usize, (u32, Option<usize>)>,
+    pub made_before: BTreeMap<usize, Vec<u32>>,
+    pub made_after: BTreeMap<usize, Vec<u32>>,
+    pub site_sb: BTreeMap<usize, u32>,
+    pub site_seq_wait: BTreeSet<usize>,
 }
 
 impl Plan {
@@ -96,7 +116,32 @@ impl Plan {
             share: BTreeMap::new(),
             before: BTreeMap::new(),
             after: BTreeMap::new(),
+            roots: BTreeMap::new(),
+            through: BTreeMap::new(),
+            made_before: BTreeMap::new(),
+            made_after: BTreeMap::new(),
+            site_sb: BTreeMap::new(),
+            site_seq_wait: BTreeSet::new(),
         }
+    }
+
+    /// {root: how many registers of the translation its companions take}.
+    pub fn companion_registers(&self) -> BTreeMap<u32, u32> {
+        self.roots
+            .iter()
+            .map(|(&root, roles)| (root, roles.iter().map(|r| r.rows()).sum()))
+            .collect()
+    }
+
+    /// Return a copy of this plan without companion register hoisting (keeping per-group
+    /// scoreboards when enabled).
+    pub fn without_companions(&self) -> Self {
+        let mut copy = self.clone();
+        copy.roots.clear();
+        copy.through.clear();
+        copy.made_before.clear();
+        copy.made_after.clear();
+        copy
     }
 
     /// {destination of whole-row loads: how many registers of the translation its rows take}.
@@ -1132,6 +1177,291 @@ impl Flow {
         }
         out
     }
+
+    /// For each `(instruction, register)` query in `queries`, return the single reaching non-call
+    /// definition of `register` at `instruction`, when there is exactly one (and entry / calls do
+    /// not reach). Uses the same basic-block RPO bitset dataflow as `reaching_for_forms`.
+    fn reaching_unique_defs(&self, queries: &[(usize, u32)]) -> HashMap<usize, usize> {
+        let mut out = HashMap::new();
+        if self.n == 0 || queries.is_empty() {
+            return out;
+        }
+        let mut watch_mask = [0u64; 4];
+        for &(i, r) in queries {
+            if r < 255 && self.bb_reachable[self.block_of[i]] {
+                regset_set(&mut watch_mask, r);
+            }
+        }
+        if regset_is_empty(&watch_mask) {
+            return out;
+        }
+        let mut watch = Vec::new();
+        crate::fast::regset_for_each(&watch_mask, |r| watch.push(r));
+        let nw = watch.len();
+        let nb = self.blocks.len();
+        let mut watch_idx = [u16::MAX; 256];
+        for (wi, &r) in watch.iter().enumerate() {
+            watch_idx[r as usize] = wi as u16;
+        }
+        let mut queries_by_reg: Vec<Vec<usize>> = vec![Vec::new(); nw];
+        for &(i, r) in queries {
+            if r < 255 && self.bb_reachable[self.block_of[i]] {
+                let wi = watch_idx[r as usize];
+                if wi != u16::MAX {
+                    queries_by_reg[wi as usize].push(i);
+                }
+            }
+        }
+        let mut events_by_reg: Vec<Vec<usize>> = vec![Vec::new(); nw];
+        for (i, writes) in self.writes_r.iter().enumerate() {
+            let mut masked = *writes;
+            for w in 0..4 {
+                masked[w] &= watch_mask[w];
+            }
+            if regset_is_empty(&masked) {
+                continue;
+            }
+            let code = (i << 1) | usize::from(self.kind[i] == "call");
+            crate::fast::regset_for_each(&masked, |r| {
+                let wi = watch_idx[r as usize] as usize;
+                events_by_reg[wi].push(code);
+            });
+        }
+
+        let mut bb_in_u64 = vec![0u64; nb];
+        let mut bb_out_u64 = vec![0u64; nb];
+        let mut bb_gen_u64 = vec![0u64; nb];
+        let mut bb_kill = vec![false; nb];
+        let mut touched_blocks: Vec<usize> = Vec::new();
+        let mut ev_range = vec![(0u32, 0u32); nb];
+
+        for wi in 0..nw {
+            let qs = &queries_by_reg[wi];
+            if qs.is_empty() {
+                continue;
+            }
+            let evs = &events_by_reg[wi];
+            let mut writers: Vec<usize> = Vec::new();
+            let mut ev_ordinals: Vec<usize> = Vec::with_capacity(evs.len());
+            for &code in evs {
+                if code & 1 != 0 {
+                    ev_ordinals.push(0);
+                } else {
+                    let i = code >> 1;
+                    let bit = 1 + writers.len();
+                    writers.push(i);
+                    ev_ordinals.push(bit);
+                }
+            }
+            touched_blocks.clear();
+            let mut pos = 0usize;
+            while pos < evs.len() {
+                let b = self.block_of[evs[pos] >> 1];
+                let start = pos;
+                pos += 1;
+                while pos < evs.len() && self.block_of[evs[pos] >> 1] == b {
+                    pos += 1;
+                }
+                touched_blocks.push(b);
+                ev_range[b] = (start as u32, pos as u32);
+            }
+
+            if writers.len() <= 63 {
+                for &b in &touched_blocks {
+                    let (s, e) = ev_range[b];
+                    let mut b_gen = 0u64;
+                    let mut kill = false;
+                    for p in s as usize..e as usize {
+                        let code = evs[p];
+                        let bit = ev_ordinals[p];
+                        if code & 1 != 0 {
+                            b_gen |= 1u64;
+                        } else {
+                            let i = code >> 1;
+                            if self.unguarded[i] {
+                                kill = true;
+                                b_gen = 1u64 << bit;
+                            } else {
+                                b_gen |= 1u64 << bit;
+                            }
+                        }
+                    }
+                    bb_gen_u64[b] = b_gen;
+                    bb_kill[b] = kill;
+                }
+                for &b in &self.bb_rpo {
+                    let init_in = if b == 0 { 1u64 } else { 0u64 };
+                    bb_in_u64[b] = init_in;
+                    bb_out_u64[b] = (if bb_kill[b] { 0 } else { init_in }) | bb_gen_u64[b];
+                }
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for &b in &self.bb_rpo {
+                        let mut new_in = if b == 0 { 1u64 } else { 0u64 };
+                        for &pb in &self.bb_pred[b] {
+                            if self.bb_reachable[pb] {
+                                new_in |= bb_out_u64[pb];
+                            }
+                        }
+                        if new_in != bb_in_u64[b] {
+                            bb_in_u64[b] = new_in;
+                            let new_out = (if bb_kill[b] { 0 } else { new_in }) | bb_gen_u64[b];
+                            if new_out != bb_out_u64[b] {
+                                bb_out_u64[b] = new_out;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                for &q_i in qs {
+                    let b = self.block_of[q_i];
+                    let mut state = bb_in_u64[b];
+                    if bb_gen_u64[b] != 0 || bb_kill[b] {
+                        let (s, e) = ev_range[b];
+                        for p in s as usize..e as usize {
+                            let code = evs[p];
+                            let ev_i = code >> 1;
+                            if ev_i >= q_i {
+                                break;
+                            }
+                            if code & 1 != 0 {
+                                state |= 1u64;
+                            } else if self.unguarded[ev_i] {
+                                state = 1u64 << ev_ordinals[p];
+                            } else {
+                                state |= 1u64 << ev_ordinals[p];
+                            }
+                        }
+                    }
+                    if (state & 1) == 0 && state.count_ones() == 1 {
+                        let bit = state.trailing_zeros() as usize;
+                        out.insert(q_i, writers[bit - 1]);
+                    }
+                }
+                for &b in &touched_blocks {
+                    bb_gen_u64[b] = 0;
+                    bb_kill[b] = false;
+                }
+            } else {
+                let words = (1 + writers.len()).div_ceil(64);
+                let mut gen_words = vec![0u64; nb * words];
+                for &b in &touched_blocks {
+                    let (s, e) = ev_range[b];
+                    let off = b * words;
+                    let mut kill = false;
+                    for p in s as usize..e as usize {
+                        let code = evs[p];
+                        let bit = ev_ordinals[p];
+                        if code & 1 != 0 {
+                            gen_words[off] |= 1u64;
+                        } else {
+                            let i = code >> 1;
+                            if self.unguarded[i] {
+                                kill = true;
+                                gen_words[off..off + words].fill(0);
+                            }
+                            gen_words[off + (bit >> 6)] |= 1u64 << (bit & 63);
+                        }
+                    }
+                    bb_kill[b] = kill;
+                }
+                let mut in_words = vec![0u64; nb * words];
+                let mut out_words = vec![0u64; nb * words];
+                for &b in &self.bb_rpo {
+                    let off = b * words;
+                    if b == 0 {
+                        in_words[off] = 1;
+                    }
+                    out_words[off..off + words].copy_from_slice(&gen_words[off..off + words]);
+                    if b == 0 && !bb_kill[b] {
+                        out_words[off] |= 1;
+                    }
+                }
+                let mut new_in = vec![0u64; words];
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for &b in &self.bb_rpo {
+                        new_in.fill(0);
+                        if b == 0 {
+                            new_in[0] = 1;
+                        }
+                        for &pb in &self.bb_pred[b] {
+                            if self.bb_reachable[pb] {
+                                let poff = pb * words;
+                                for w in 0..words {
+                                    new_in[w] |= out_words[poff + w];
+                                }
+                            }
+                        }
+                        let off = b * words;
+                        if new_in != in_words[off..off + words] {
+                            in_words[off..off + words].copy_from_slice(&new_in);
+                            let kill = bb_kill[b];
+                            let mut out_changed = false;
+                            for w in 0..words {
+                                let nv = (if kill { 0 } else { new_in[w] }) | gen_words[off + w];
+                                if nv != out_words[off + w] {
+                                    out_words[off + w] = nv;
+                                    out_changed = true;
+                                }
+                            }
+                            if out_changed {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                let mut state = vec![0u64; words];
+                for &q_i in qs {
+                    let b = self.block_of[q_i];
+                    let off = b * words;
+                    state.copy_from_slice(&in_words[off..off + words]);
+                    if bb_kill[b] || gen_words[off..off + words].iter().any(|&v| v != 0) {
+                        let (s, e) = ev_range[b];
+                        for p in s as usize..e as usize {
+                            let code = evs[p];
+                            let ev_i = code >> 1;
+                            if ev_i >= q_i {
+                                break;
+                            }
+                            let bit = ev_ordinals[p];
+                            if code & 1 != 0 {
+                                state[0] |= 1;
+                            } else if self.unguarded[ev_i] {
+                                state.fill(0);
+                                state[bit >> 6] |= 1u64 << (bit & 63);
+                            } else {
+                                state[bit >> 6] |= 1u64 << (bit & 63);
+                            }
+                        }
+                    }
+                    if (state[0] & 1) == 0 {
+                        let mut found = None;
+                        let mut unique = true;
+                        for (w, &bits) in state.iter().enumerate() {
+                            if bits == 0 {
+                                continue;
+                            }
+                            if bits.count_ones() != 1 || found.is_some() {
+                                unique = false;
+                                break;
+                            }
+                            found = Some((w << 6) + bits.trailing_zeros() as usize);
+                        }
+                        if unique && let Some(bit) = found {
+                            out.insert(q_i, writers[bit - 1]);
+                        }
+                    }
+                }
+                for &b in &touched_blocks {
+                    bb_kill[b] = false;
+                }
+            }
+        }
+        out
+    }
 }
 
 // ---- The plan ----
@@ -1145,7 +1475,33 @@ pub fn plan(src: &[Decoded], tables: &[(u64, Vec<u64>)], entries: &Option<HashSe
     plan_with_flow(src, &flow)
 }
 
+/// Compute the plan for a function, optionally enabling companion hoisting and per-group pair
+/// scheduling (`VF_COMPANIONS=1`).
+pub fn plan_with_companions(
+    src: &[Decoded],
+    tables: &[(u64, Vec<u64>)],
+    entries: &Option<HashSet<usize>>,
+    with_companions: bool,
+    dec70: &mut Decoder,
+) -> Option<Plan> {
+    if !src.iter().any(|d| d.name == PRODUCT) {
+        return None;
+    }
+    let flow = Flow::new(src, tables, entries);
+    plan_with_flow_options(src, &flow, with_companions, with_companions, Some(dec70))
+}
+
 pub(crate) fn plan_with_flow(src: &[Decoded], flow: &Flow) -> Option<Plan> {
+    plan_with_flow_options(src, flow, false, false, None)
+}
+
+pub(crate) fn plan_with_flow_options(
+    src: &[Decoded],
+    flow: &Flow,
+    new_schedule: bool,
+    with_companions: bool,
+    dec70: Option<&mut Decoder>,
+) -> Option<Plan> {
     if !flow.known || !src.iter().any(|d| d.name == PRODUCT) {
         return None;
     }
@@ -1184,6 +1540,14 @@ pub(crate) fn plan_with_flow(src: &[Decoded], flow: &Flow) -> Option<Plan> {
                 return None;
             }
             sharing(&mut p, flow);
+            if new_schedule {
+                assign_scoreboards(&mut p, src);
+            } else {
+                p.site_seq_wait.clear();
+            }
+            if with_companions && let Some(dec70) = dec70 {
+                companions(&mut p, flow, src, dec70);
+            }
             return Some(p);
         }
         excluded.extend(r.bad.unwrap());
@@ -1544,6 +1908,21 @@ fn attempt(
 
     if out.sites.is_empty() {
         return PlanWithBad { plan: out, bad: None };
+    }
+
+    for (&i, s) in &out.sites {
+        let ra_base = s.ra + 2 * s.a;
+        let rb_base = s.rb + 2 * s.p;
+        let needs_seq = [ra_base, ra_base + 1, rb_base, rb_base + 1].iter().any(|&k| {
+            find_reg_defs(reach, i, ra_base, rb_base, k).is_some_and(|defs| {
+                defs.locs
+                    .iter()
+                    .any(|&j| out.loads.contains_key(&j) && ((src[j].word >> WRITE_BARRIER) & 7) == 7)
+            })
+        });
+        if needs_seq {
+            out.site_seq_wait.insert(i);
+        }
     }
 
     // ---- The accumulator registers: sparse basic-block state analysis and conversions ----
@@ -2116,6 +2495,433 @@ fn sharing(plan: &mut Plan, flow: &Flow) {
     }
 }
 
+/// Assign hardware scoreboards from `{0..=3}` per interfering accumulator group (preferring
+/// scoreboards unused by the function or whole-row loads), keeping `ARRIVES (4)` and `SEQUENCE (5)`
+/// for whole-row address shuffles, un-barriered loads, conversions, and companions.
+fn assign_scoreboards(plan: &mut Plan, src: &[Decoded]) {
+    let sites: Vec<usize> = plan.sites.keys().copied().collect();
+    if sites.is_empty() {
+        return;
+    }
+    let mut parent: Vec<usize> = (0..sites.len()).collect();
+    fn find(parent: &mut [usize], mut a: usize) -> usize {
+        while parent[a] != a {
+            parent[a] = parent[parent[a]];
+            a = parent[a];
+        }
+        a
+    }
+    let union = |parent: &mut [usize], a: usize, b: usize| {
+        let mut ra = find(parent, a);
+        let mut rb = find(parent, b);
+        if ra != rb {
+            if ra > rb {
+                std::mem::swap(&mut ra, &mut rb);
+            }
+            parent[rb] = ra;
+        }
+    };
+    let mut wr_regs: Vec<RegSet> = Vec::with_capacity(sites.len());
+    let mut acc_regs: Vec<RegSet> = Vec::with_capacity(sites.len());
+    let mut src_regs: Vec<RegSet> = Vec::with_capacity(sites.len());
+    for &i in &sites {
+        let s = &plan.sites[&i];
+        let mut wr = regset_4(s.x);
+        regset_union(&mut wr, &regset_4(s.y));
+        let mut acc = wr;
+        if let Some(cx) = s.cx {
+            regset_union(&mut acc, &regset_4(cx));
+        }
+        if let Some(cy) = s.cy {
+            regset_union(&mut acc, &regset_4(cy));
+        }
+        let mut sr = [0u64; 4];
+        let a_base = s.ra + 2 * s.a;
+        let b_base = s.rb + 2 * s.p;
+        regset_set(&mut sr, a_base);
+        regset_set(&mut sr, a_base + 1);
+        regset_set(&mut sr, b_base);
+        regset_set(&mut sr, b_base + 1);
+        wr_regs.push(wr);
+        acc_regs.push(acc);
+        src_regs.push(sr);
+    }
+    for idx in 0..sites.len() {
+        for jdx in (idx + 1)..sites.len() {
+            if regset_intersects(&acc_regs[idx], &acc_regs[jdx])
+                || regset_intersects(&src_regs[idx], &wr_regs[jdx])
+                || regset_intersects(&src_regs[jdx], &wr_regs[idx])
+            {
+                union(&mut parent, idx, jdx);
+            }
+        }
+    }
+    let mut lds_used = 0u8;
+    for &j in plan.loads.keys() {
+        let wb = ((src[j].word >> WRITE_BARRIER) & 7) as u32;
+        if wb != 7 {
+            lds_used |= 1u8 << wb;
+        }
+    }
+    let mut prog_used = 0u8;
+    for d in src {
+        let wb = ((d.word >> WRITE_BARRIER) & 7) as u32;
+        let rb = ((d.word >> READ_BARRIER) & 7) as u32;
+        if wb != 7 {
+            prog_used |= 1u8 << wb;
+        }
+        if rb != 7 {
+            prog_used |= 1u8 << rb;
+        }
+    }
+    let mut avail = Vec::with_capacity(4);
+    for tier in 0..3 {
+        for sb in [3u32, 2, 1, 0] {
+            let p = (prog_used >> sb) & 1 != 0;
+            let l = (lds_used >> sb) & 1 != 0;
+            let match_tier = match tier {
+                0 => !p,
+                1 => p && !l,
+                _ => p && l,
+            };
+            if match_tier {
+                avail.push(sb);
+            }
+        }
+    }
+    // Because `union` keeps the smallest site index as each component's representative,
+    // first appearance in sorted `sites` order and sorted representative order are identical.
+    let mut comp_idx = 0usize;
+    let mut rep_sb: HashMap<usize, u32> = HashMap::new();
+    for (idx, &site_i) in sites.iter().enumerate() {
+        let rep = find(&mut parent, idx);
+        let sb = *rep_sb.entry(rep).or_insert_with(|| {
+            let s = avail[comp_idx % avail.len()];
+            comp_idx += 1;
+            s
+        });
+        plan.site_sb.insert(site_i, sb);
+    }
+}
+
+struct CompanionScratch {
+    seen_a: Vec<u32>,
+    seen_b: Vec<u32>,
+    epoch: u32,
+    work: Vec<usize>,
+    want: Vec<bool>,
+    bare_init: Vec<bool>,
+    bare: Vec<bool>,
+}
+
+impl CompanionScratch {
+    fn new(flow: &Flow) -> Self {
+        let n = flow.n;
+        let bare_init = (0..n).map(|i| i == 0 || flow.pred[i].is_empty()).collect();
+        Self {
+            seen_a: vec![0; n],
+            seen_b: vec![0; n],
+            epoch: 0,
+            work: Vec::new(),
+            want: vec![false; n],
+            bare_init,
+            bare: vec![false; n],
+        }
+    }
+
+    fn turns(&mut self, flow: &Flow, load: usize, stop: &[bool]) -> bool {
+        if stop[load] {
+            return false;
+        }
+        self.epoch += 1;
+        let ep = self.epoch;
+        self.work.clear();
+        self.work.extend_from_slice(&flow.succ[load]);
+        while let Some(k) = self.work.pop() {
+            if k == load {
+                return true;
+            }
+            if self.seen_a[k] == ep || stop[k] {
+                continue;
+            }
+            self.seen_a[k] = ep;
+            self.work.extend_from_slice(&flow.succ[k]);
+        }
+        false
+    }
+
+    fn round_without(&mut self, flow: &Flow, load: usize, place: usize) -> bool {
+        self.epoch += 1;
+        let ep = self.epoch;
+        self.work.clear();
+        self.work.extend_from_slice(&flow.succ[load]);
+        while let Some(k) = self.work.pop() {
+            if k == load {
+                return true;
+            }
+            if self.seen_a[k] == ep || k == place {
+                continue;
+            }
+            self.seen_a[k] = ep;
+            self.work.extend_from_slice(&flow.succ[k]);
+        }
+        false
+    }
+
+    fn between(&mut self, flow: &Flow, made: usize, load: usize, stop: &[bool]) -> bool {
+        self.epoch += 1;
+        let ep = self.epoch;
+        self.work.clear();
+        self.work.extend_from_slice(&flow.succ[made]);
+        while let Some(k) = self.work.pop() {
+            if self.seen_a[k] == ep || k == made {
+                continue;
+            }
+            self.seen_a[k] = ep;
+            self.work.extend_from_slice(&flow.succ[k]);
+        }
+        self.work.clear();
+        self.work.extend_from_slice(&flow.pred[load]);
+        while let Some(k) = self.work.pop() {
+            if self.seen_b[k] == ep || k == made {
+                continue;
+            }
+            self.seen_b[k] = ep;
+            if stop[k] && self.seen_a[k] == ep {
+                return true;
+            }
+            self.work.extend_from_slice(&flow.pred[k]);
+        }
+        false
+    }
+
+    fn places(
+        &mut self,
+        flow: &Flow,
+        src: &[Decoded],
+        stop: &[bool],
+        users: &BTreeSet<usize>,
+        before: &mut Vec<usize>,
+        after: &mut Vec<usize>,
+    ) {
+        let n = flow.n;
+        self.want.fill(false);
+        self.work.clear();
+        for &u in users {
+            self.want[u] = true;
+            self.work.push(u);
+        }
+        while let Some(t) = self.work.pop() {
+            for &p in &flow.pred[t] {
+                if !self.want[p] && !stop[p] {
+                    self.want[p] = true;
+                    self.work.push(p);
+                }
+            }
+        }
+        self.bare.copy_from_slice(&self.bare_init);
+        let first = |i: usize, want: &[bool]| want[i] && flow.whole[i];
+        let leaves_bare = |q: usize, bare: &[bool], want: &[bool]| stop[q] || (bare[q] && !first(q, want));
+        self.work.clear();
+        for i in 0..n {
+            if self.bare[i] || stop[i] {
+                self.work.push(i);
+            }
+        }
+        while let Some(q) = self.work.pop() {
+            if !leaves_bare(q, &self.bare, &self.want) {
+                continue;
+            }
+            for &t in &flow.succ[q] {
+                if !self.bare[t] {
+                    self.bare[t] = true;
+                    self.work.push(t);
+                }
+            }
+        }
+        before.clear();
+        after.clear();
+        for i in 0..n {
+            if !(first(i, &self.want) && self.bare[i]) {
+                continue;
+            }
+            let mut single_bad = None;
+            let mut many_bad = false;
+            for &q in &flow.pred[i] {
+                if leaves_bare(q, &self.bare, &self.want) {
+                    if single_bad.is_some() {
+                        many_bad = true;
+                        break;
+                    }
+                    single_bad = Some(q);
+                }
+            }
+            if i != 0
+                && flow.pred[i].len() >= 2
+                && !many_bad
+                && single_bad == Some(i - 1)
+                && flow.kind[i - 1] == "plain"
+                && flow.goes_whole(src, i - 1)
+            {
+                after.push(i - 1);
+            } else {
+                before.push(i);
+            }
+        }
+    }
+}
+
+fn written_set<'a>(writers: &'a mut HashMap<u32, Vec<bool>>, flow: &Flow, n: usize, x: u32) -> &'a [bool] {
+    writers
+        .entry(x)
+        .or_insert_with(|| (0..n).map(|i| flow.writes_reg(i, x)).collect())
+}
+
+/// Which whole-row loads take their rows' addresses from companions, of which registers, and
+/// where the companions are made (`docs/pairs.md`, section 12).
+fn companions(plan: &mut Plan, flow: &Flow, src: &[Decoded], dec70: &mut Decoder) {
+    let n = flow.n;
+    let loads: Vec<usize> = plan.loads.keys().copied().collect();
+    if loads.is_empty() {
+        return;
+    }
+    let mut address: BTreeMap<usize, u32> = BTreeMap::new();
+    let mut queries: Vec<(usize, u32)> = Vec::with_capacity(loads.len());
+    for &i in &loads {
+        let ra = src[i].op_or(OP_RA, 255);
+        address.insert(i, ra);
+        queries.push((i, ra));
+    }
+    let mut accumulators = [0u64; 4];
+    for s in plan.sites.values() {
+        for base in [Some(s.x), Some(s.y), s.cx, s.cy].into_iter().flatten() {
+            regset_union(&mut accumulators, &regset_4(base));
+        }
+    }
+    let mut writers: HashMap<u32, Vec<bool>> = HashMap::new();
+    let mut scratch = CompanionScratch::new(flow);
+    let usable = |x: u32| x < 255 && !regset_test(&accumulators, x);
+    let unique_defs = flow.reaching_unique_defs(&queries);
+    let mut candidates: BTreeMap<usize, Vec<(u32, Option<usize>)>> = BTreeMap::new();
+    for &i in &loads {
+        let ra = address[&i];
+        let mut found = Vec::new();
+        if usable(ra) {
+            let stop_ra = written_set(&mut writers, flow, n, ra);
+            if scratch.turns(flow, i, stop_ra) {
+                found.push((ra, None));
+            }
+        }
+        if let Some(&made) = unique_defs.get(&i) {
+            let d = &src[made];
+            let mut single_read: Option<(u8, u32)> = None;
+            let mut one_read = true;
+            for &(l, x, _) in &d.reads {
+                match single_read {
+                    None => single_read = Some((l, x)),
+                    Some(prev) if prev == (l, x) => {}
+                    Some(_) => {
+                        one_read = false;
+                        break;
+                    }
+                }
+            }
+            if one_read
+                && let Some((letter, x)) = single_read
+                && MIRRORED.contains(&d.mnemonic)
+                && flow.unguarded[made]
+                && flow.kind[made] == "plain"
+                && d.writes == [(LETTER_R, ra)]
+                && letter == LETTER_R
+                && x != ra
+                && usable(x)
+                && dec70.is_valid(d.word)
+            {
+                let stop_x = written_set(&mut writers, flow, n, x);
+                if scratch.turns(flow, i, stop_x) && !scratch.between(flow, made, i, stop_x) {
+                    found.push((x, Some(made)));
+                }
+            }
+        }
+        if !found.is_empty() {
+            candidates.insert(i, found);
+        }
+    }
+    let mut left = candidates;
+    while !left.is_empty() {
+        let mut serves: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (&i, found) in &left {
+            for &(x, _) in found {
+                serves.entry(x).or_default().push(i);
+            }
+        }
+        let root = *serves
+            .iter()
+            .min_by_key(|&(&x, list)| (std::cmp::Reverse(list.len()), x))
+            .unwrap()
+            .0;
+        let load_list = serves.remove(&root).unwrap();
+        for &i in &load_list {
+            let entries = left.remove(&i).unwrap();
+            let chosen = entries.into_iter().find(|&(x, _)| x == root).unwrap();
+            plan.through.insert(i, chosen);
+        }
+        let roles: Vec<LoadRole> = ROLES
+            .iter()
+            .copied()
+            .filter(|&r| load_list.iter().any(|i| plan.loads[i].role == r))
+            .collect();
+        plan.roots.insert(root, roles);
+    }
+    let roots_sorted: Vec<u32> = plan.roots.keys().copied().collect();
+    let (mut before, mut after) = (Vec::new(), Vec::new());
+    let mut lost = Vec::new();
+    for root in roots_sorted {
+        let stop_root = written_set(&mut writers, flow, n, root);
+        let mut users: BTreeSet<usize> = plan
+            .through
+            .iter()
+            .filter_map(|(&i, &(x, _))| (x == root).then_some(i))
+            .collect();
+        while !users.is_empty() {
+            scratch.places(flow, src, stop_root, &users, &mut before, &mut after);
+            lost.clear();
+            for &i in &users {
+                if before
+                    .iter()
+                    .chain(after.iter())
+                    .any(|&q| i == q || !scratch.round_without(flow, i, q))
+                {
+                    lost.push(i);
+                }
+            }
+            if lost.is_empty() {
+                break;
+            }
+            for &i in &lost {
+                users.remove(&i);
+            }
+        }
+        plan.through.retain(|&i, &mut (x, _)| x != root || users.contains(&i));
+        if users.is_empty() {
+            plan.roots.remove(&root);
+            continue;
+        }
+        let roles: Vec<LoadRole> = ROLES
+            .iter()
+            .copied()
+            .filter(|&r| users.iter().any(|i| plan.loads[i].role == r))
+            .collect();
+        plan.roots.insert(root, roles);
+        for &i in &before {
+            plan.made_before.entry(i).or_default().push(root);
+        }
+        for &i in &after {
+            plan.made_after.entry(i).or_default().push(root);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2382,5 +3188,67 @@ mod tests {
         assert!(p.sites.contains_key(&hmma_idx1));
         assert!(p.sites.contains_key(&hmma_idx2));
         assert!(p.loads.contains_key(&ldsm_idx));
+    }
+
+    fn make_site(x: u32, y: u32, ra: u32, a: u32, rb: u32, p: u32) -> SiteEntry {
+        SiteEntry {
+            half: 0,
+            partner: 99,
+            x,
+            y,
+            cx: Some(x),
+            cy: Some(y),
+            ra,
+            a,
+            rb,
+            p,
+            transposed: false,
+        }
+    }
+
+    /// A pair with `p == 1` reads B from `rb + 2, rb + 3` (`half_row(rb, p, 0)`), not `rb, rb + 1`.
+    /// When another pair writes `rb + 2..rb + 5`, the two interfere and must share one scoreboard.
+    #[test]
+    fn scoreboard_interference_sees_b_sources_for_pair_one() {
+        let mut p = Plan::new();
+        // Site 0 reads B from R40 + 2*1 = {R42, R43}.
+        p.sites.insert(0, make_site(20, 24, 8, 0, 40, 1));
+        // Site 1 writes {R42..R45, R46..R49}, overlapping Site 0's B source {R42, R43}.
+        p.sites.insert(1, make_site(42, 46, 8, 0, 60, 0));
+        assign_scoreboards(&mut p, &[]);
+        assert_eq!(
+            p.site_sb[&0], p.site_sb[&1],
+            "pair reading B with p=1 (R42..R43) interferes with pair writing R42..R45"
+        );
+
+        // Control: with p == 0 (reads {R40, R41}), Site 1 writing R42..R49 does not interfere.
+        let mut disjoint = Plan::new();
+        disjoint.sites.insert(0, make_site(20, 24, 8, 0, 40, 0));
+        disjoint.sites.insert(1, make_site(42, 46, 8, 0, 60, 0));
+        assign_scoreboards(&mut disjoint, &[]);
+        assert_ne!(
+            disjoint.site_sb[&0], disjoint.site_sb[&1],
+            "disjoint pairs should receive distinct scoreboards"
+        );
+    }
+
+    /// Halves 0..5 with interferences (0, 4), (1, 2), (3, 4): union-find keeps the smallest site
+    /// index as each component's root and assigns scoreboards in ascending site order so Rust and
+    /// Python assign the same board to every group: {0, 3, 4} gets avail[0] (3) and {1, 2} gets
+    /// avail[1] (2).
+    #[test]
+    fn scoreboard_numbering_matches_python_on_non_monotone_union_graph() {
+        let mut p = Plan::new();
+        p.sites.insert(0, make_site(10, 14, 100, 0, 110, 0));
+        p.sites.insert(1, make_site(20, 24, 100, 0, 110, 0));
+        p.sites.insert(2, make_site(20, 36, 100, 0, 110, 0));
+        p.sites.insert(3, make_site(40, 44, 100, 0, 110, 0));
+        p.sites.insert(4, make_site(10, 40, 100, 0, 110, 0));
+        assign_scoreboards(&mut p, &[]);
+        assert_eq!(p.site_sb[&0], 3);
+        assert_eq!(p.site_sb[&3], 3);
+        assert_eq!(p.site_sb[&4], 3);
+        assert_eq!(p.site_sb[&1], 2);
+        assert_eq!(p.site_sb[&2], 2);
     }
 }

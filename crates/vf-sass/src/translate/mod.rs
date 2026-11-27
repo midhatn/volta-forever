@@ -33,7 +33,7 @@ use crate::generated::special::*;
 
 pub use self::util::find_relative_decoded;
 pub use ampere::{Word as AmpereWord, described as ampere_class, word as ampere_word};
-pub use cubin::{translate, translate_with_options};
+pub use cubin::{translate, translate_with_companions, translate_with_options};
 
 // ---- Error type ----
 #[derive(Debug)]
@@ -172,6 +172,8 @@ const AROUND: &[&str] = &[
     "settled",
     "to pairs",
     "from pairs",
+    "companion",
+    "companion: lane",
 ];
 /// The relocations that write the lower and the upper half of an address into the 32 bits of an
 /// immediate (R_CUDA_ABS32_LO_32, R_CUDA_ABS32_HI_32).
@@ -307,6 +309,9 @@ pub struct Options {
     pub pairs: bool,
     /// Whether the rows of a matrix load are taken to be aligned on 16 bytes (VF_ALIGNED_ROWS).
     pub aligned_rows: bool,
+    /// Opt-in companion registers for whole-row matrix load addresses and per-group pair
+    /// scheduling (`VF_COMPANIONS=1`; off by default, and unused when `pairs` is false).
+    pub companions: bool,
     /// Whether the translation looks for room in the program's own registers before it takes new
     /// ones. 0: off. 1: homes and pool (levels 2, 1, 0). 2: and, for a kernel refused even so,
     /// everything at the instruction (level 3). 3: level 3 first, for tests. 4: by a kernel's
@@ -332,13 +337,14 @@ impl Default for Options {
         Self {
             pairs: true,
             aligned_rows: true,
+            companions: false,
             borrow: BORROW_DEFAULT,
         }
     }
 }
 
 impl Options {
-    /// Read `VF_PAIRS`, `VF_ALIGNED_ROWS` and `VF_BORROW` from the environment.
+    /// Read `VF_PAIRS`, `VF_ALIGNED_ROWS`, `VF_COMPANIONS` and `VF_BORROW` from the environment.
     pub fn from_environment() -> Self {
         let mut opts = Self::default();
         if let Ok(v) = std::env::var("VF_PAIRS") {
@@ -346,6 +352,9 @@ impl Options {
         }
         if let Ok(v) = std::env::var("VF_ALIGNED_ROWS") {
             opts.aligned_rows = v != "0";
+        }
+        if let Ok(v) = std::env::var("VF_COMPANIONS") {
+            opts.companions = v == "1";
         }
         opts.borrow = borrow_from(std::env::var("VF_BORROW").ok().as_deref());
         opts

@@ -15,6 +15,7 @@
 - Driver hook call counters (`COUNTS`) are incremented only when statistics are asked for (`VF_STATS`).
 - The translation of machine code (sm_75 and sm_80 cubins) takes less time, and runs on worker threads (`vf-sass-N`) for a cubin of 64 KiB of code or more with two functions or more: as many as `VF_THREADS` allows (the CPUs the process may run on, 8 at most, the calling thread among them); where a thread cannot be started, the work left runs on the calling thread (pull request #16, by midhatn). The output is the same bytes at every number of threads, and the same as before the change at every `VF_BORROW` level and with `VF_PAIRS` 0 and 1.
 - `VF_THREADS` caps or disables the threads of the translation of machine code too (`0` or `1`: on the calling thread).
+- Opt-in `VF_COMPANIONS=1` (off by default; `0` or unset leaves translated output unchanged, and `VF_PAIRS=0` or `VF_SAFE=1` turns it off) enables companion register hoisting for loop-invariant whole-row matrix load addresses, per-group disjoint HMMA accumulator scoreboards (`0..3`), and `usched=18` with `.reuse` on `STEP0..2` of paired `HMMA.884` steps in both the Rust and Python translators (`docs/pairs.md`, sections 8 and 12), dropping companions at levels 0, 1, and 2 before giving up pairs.
 
 ### Tests
 
